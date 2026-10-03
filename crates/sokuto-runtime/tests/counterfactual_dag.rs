@@ -52,7 +52,6 @@ struct ContrastSetSuiteJson {
     pairs: Vec<ContrastPairJson>,
 }
 
-
 /// 対照セット JSON ファイルを読み込むヘルパー。
 fn load_contrast_suite(filename: &str) -> ContrastSetSuiteJson {
     let path = workspace_root()
@@ -60,21 +59,31 @@ fn load_contrast_suite(filename: &str) -> ContrastSetSuiteJson {
         .join("eval")
         .join("contrast_sets")
         .join(filename);
-    let content = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("対照セットファイルの読み込みに失敗しました: {:?}: {}", path, e));
+    let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "対照セットファイルの読み込みに失敗しました: {:?}: {}",
+            path, e
+        )
+    });
     serde_json::from_str(&content)
         .unwrap_or_else(|e| panic!("対照セット JSON のパースに失敗しました: {:?}: {}", path, e))
 }
 
 #[test]
 fn test_all_contrast_suites_dag_schema_validity() {
-    let filenames = ["banking_fee.json", "ecommerce_return.json", "security_triage.json"];
+    let filenames = [
+        "banking_fee.json",
+        "ecommerce_return.json",
+        "security_triage.json",
+    ];
     for name in &filenames {
         let suite = load_contrast_suite(name);
         assert!(!suite.pairs.is_empty(), "ペアリストが空です: {}", name);
         assert!(
             suite.dag_definition.dag_id.contains(&suite.domain)
-                || suite.domain.contains(&suite.dag_definition.dag_id.split('_').next().unwrap_or("")),
+                || suite
+                    .domain
+                    .contains(suite.dag_definition.dag_id.split('_').next().unwrap_or("")),
             "ドメイン名と dag_id が不一致です: {} vs {}",
             suite.domain,
             suite.dag_definition.dag_id
@@ -92,7 +101,11 @@ fn test_all_contrast_suites_dag_schema_validity() {
 
 #[test]
 fn test_counterfactual_minimal_edit_integrity() {
-    let filenames = ["banking_fee.json", "ecommerce_return.json", "security_triage.json"];
+    let filenames = [
+        "banking_fee.json",
+        "ecommerce_return.json",
+        "security_triage.json",
+    ];
     let mut total_pairs = 0;
 
     for name in &filenames {
@@ -133,7 +146,9 @@ async fn test_counterfactual_dag_execution_with_model_if_available() {
     let tokenizer_path = default_model_dir().join("tokenizer.json");
 
     if !model_path.exists() || !tokenizer_path.exists() {
-        eprintln!("スキップ: 実モデル (model.onnx) が存在しないため、推論実行テストをスキップします。");
+        eprintln!(
+            "スキップ: 実モデル (model.onnx) が存在しないため、推論実行テストをスキップします。"
+        );
         return;
     }
 
@@ -163,13 +178,17 @@ async fn test_counterfactual_dag_execution_with_model_if_available() {
 
     for pair in suite.pairs.iter().take(5) {
         let t0 = Instant::now();
-        let res_base = executor.execute(&pair.base_state, &suite.dag_definition).await;
+        let res_base = executor
+            .execute(&pair.base_state, &suite.dag_definition)
+            .await;
         let base_dt = t0.elapsed();
         total_latency_us += base_dt.as_micros();
         evaluated_count += 1;
 
         let t1 = Instant::now();
-        let res_cf = executor.execute(&pair.cf_state, &suite.dag_definition).await;
+        let res_cf = executor
+            .execute(&pair.cf_state, &suite.dag_definition)
+            .await;
         let cf_dt = t1.elapsed();
         total_latency_us += cf_dt.as_micros();
         evaluated_count += 1;

@@ -2130,9 +2130,12 @@ dependencies = [
 name = "sokuto-server"
 version = "0.3.6"
 dependencies = [
+ "aho-corasick",
  "aquamarine",
  "axum",
+ "bytes",
  "chrono",
+ "futures-util",
  "http-body-util",
  "indexmap",
  "metrics",

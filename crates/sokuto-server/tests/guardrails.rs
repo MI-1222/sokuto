@@ -87,6 +87,7 @@ async fn test_guardrail_oom_limits_fast_fail() {
             max_state_chars: 100,
             max_question_chars: 50,
             max_estimated_tokens: 200,
+            ..Default::default()
         },
         ..Default::default()
     };

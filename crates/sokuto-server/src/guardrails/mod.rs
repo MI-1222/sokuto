@@ -9,11 +9,18 @@
 //! - 算術・数え上げ事前集計 (Arithmetic Annotation)
 
 pub mod arithmetic;
+pub mod attention;
 pub mod bimodal;
 pub mod compactor;
+pub mod fast_fail;
 pub mod limits;
+pub mod multitask;
+pub mod nli;
+pub mod proxy;
 pub mod sanitization;
+pub mod streaming;
 pub mod temporal;
+pub mod window;
 
 use std::sync::Arc;
 
@@ -24,14 +31,37 @@ use sokuto_core::schema::{Answer, Criteria, Question, QuestionType, SystemOneReq
 
 use crate::error::ServerError;
 use crate::guardrails::arithmetic::{ArithmeticConfig, compute_arithmetic_summary};
+pub use crate::guardrails::attention::{
+    ATTN_MASK_ALLOW, ATTN_MASK_BLOCK, AttentionIsolationConfig, SegmentType,
+    build_flat_attention_mask, build_segment_isolated_attention_mask,
+};
 use crate::guardrails::bimodal::{BimodalConfig, BimodalDetector, verify_and_adjust_bimodal};
 use crate::guardrails::compactor::{CompactorConfig, compact_text};
+pub use crate::guardrails::fast_fail::{
+    FastFailConfig, FastFailScanner, GuardrailAction, GuardrailViolation,
+};
 use crate::guardrails::limits::{LimitsConfig, validate_limits};
+pub use crate::guardrails::multitask::{
+    MARKER_INJECTION, MARKER_PII, MARKER_TOXICITY, MultiTaskScanResult, MultiTaskScannerConfig,
+    build_multitask_prompt, compute_free_energy, evaluate_multitask_logits, sigmoid,
+};
+pub use crate::guardrails::nli::{
+    HallucinationVerificationResult, HallucinationVerifierConfig, NormalizedEntity,
+    check_entity_mismatch, compute_synonym_coverage, extract_normalized_entities, verify_claim_nli,
+};
+pub use crate::guardrails::proxy::{GuardrailEngine, inline_guardrail_middleware};
 use crate::guardrails::sanitization::{
     SanitizerConfig, normalize_noul_instruction, sanitize_score_criteria_text, sanitize_text,
 };
+pub use crate::guardrails::streaming::{
+    SENTENCE_DELIMITERS, SentenceChunkBuffer, SpeculativeStreamInterceptor,
+    StreamingVerifierConfig, extract_content_from_sse_line, intercept_sse_stream,
+};
 use crate::guardrails::temporal::{
     TemporalConfig, append_reference_time_metadata, normalize_temporal,
+};
+pub use crate::guardrails::window::{
+    WindowConfig, WindowExtractionResult, estimate_tokens, extract_head_tail_window,
 };
 
 /// ガードレール全体の統合設定構造体。
@@ -41,6 +71,18 @@ pub struct GuardrailConfig {
     pub enabled: bool,
     /// 物理リソース制限設定。
     pub limits: LimitsConfig,
+    /// 決定論的 Fast-Fail 禁止語設定。
+    pub fast_fail: FastFailConfig,
+    /// 境界縮約窓設定。
+    pub window: WindowConfig,
+    /// 構造的分離アテンション設定。
+    pub attention: AttentionIsolationConfig,
+    /// マルチタスク動的マーカー並列スキャン設定。
+    pub multitask: MultiTaskScannerConfig,
+    /// 出力ハルシネーション検証設定。
+    pub hallucination: HallucinationVerifierConfig,
+    /// 投機的ストリーミング検証設定。
+    pub streaming: StreamingVerifierConfig,
     /// サニタイズ設定。
     pub sanitizer: SanitizerConfig,
     /// コンテキスト縮約設定。
@@ -58,6 +100,12 @@ impl Default for GuardrailConfig {
         Self {
             enabled: true,
             limits: LimitsConfig::default(),
+            fast_fail: FastFailConfig::default(),
+            window: WindowConfig::default(),
+            attention: AttentionIsolationConfig::default(),
+            multitask: MultiTaskScannerConfig::default(),
+            hallucination: HallucinationVerifierConfig::default(),
+            streaming: StreamingVerifierConfig::default(),
             sanitizer: SanitizerConfig::default(),
             compactor: CompactorConfig::default(),
             temporal: TemporalConfig::default(),
@@ -76,6 +124,8 @@ pub struct PreprocessReport {
     pub added_arithmetic_summary: bool,
     /// 基準時刻メタデータが付加されたか。
     pub added_reference_time: bool,
+    /// 境界縮約窓が適用されたか。
+    pub window_truncated: bool,
 }
 
 /// 前処理および後処理ガードレールパイプライン。
@@ -83,15 +133,18 @@ pub struct PreprocessReport {
 pub struct GuardrailPipeline {
     config: Arc<GuardrailConfig>,
     bimodal_detector: BimodalDetector,
+    fast_fail_scanner: Arc<FastFailScanner>,
 }
 
 impl GuardrailPipeline {
     /// 新規 `GuardrailPipeline` を生成する。
     pub fn new(config: GuardrailConfig) -> Self {
         let bimodal_detector = BimodalDetector::new(config.bimodal.clone());
+        let fast_fail_scanner = Arc::new(FastFailScanner::new(config.fast_fail.clone()));
         Self {
             config: Arc::new(config),
             bimodal_detector,
+            fast_fail_scanner,
         }
     }
 
@@ -120,6 +173,18 @@ impl GuardrailPipeline {
         let now = ref_time.unwrap_or_else(Utc::now);
         let mut report = PreprocessReport::default();
 
+        // 0. 決定論的 Fast-Fail 走査 (Aho-Corasick, <0.1ms)
+        if let Value::String(ref s) = req.state
+            && let Err(violation) = self.fast_fail_scanner.scan(s)
+        {
+            return Err(ServerError::GuardrailViolation(violation.rule));
+        }
+        for question in req.questions.values() {
+            if let Err(violation) = self.fast_fail_scanner.scan(&question.instructions) {
+                return Err(ServerError::GuardrailViolation(violation.rule));
+            }
+        }
+
         // 1. 物理 OOM 防壁 (L1/L2 Fast-Fail)
         let (_, estimated_tokens) = validate_limits(req, &self.config.limits)?;
         report.estimated_tokens = estimated_tokens;
@@ -129,6 +194,13 @@ impl GuardrailPipeline {
             Value::String(s) => s.clone(),
             other => other.to_string(),
         };
+
+        // 境界縮約窓の適用 (長文に対する Early-Exit 窓走査)
+        let window_res = extract_head_tail_window(&raw_state, &self.config.window);
+        if window_res.was_truncated {
+            raw_state = window_res.window_text.into_owned();
+            report.window_truncated = true;
+        }
 
         // 算術集計サマリーの事前計算 (元の Value から集計)
         let arithmetic_summary = compute_arithmetic_summary(&req.state, &self.config.arithmetic);

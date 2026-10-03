@@ -68,6 +68,10 @@ pub enum ServerError {
     #[error("DAG 実行エラー: {0}")]
     Dag(#[from] sokuto_runtime::dag::DagError),
 
+    /// ガードレール違反 (プロンプトインジェクション、禁止語、ハルシネーション等)。
+    #[error("ガードレール違反: {0}")]
+    GuardrailViolation(String),
+
     /// サーバー内部の不整合・障害。
     #[error("サーバー内部エラー: {0}")]
     Internal(String),
@@ -165,6 +169,15 @@ impl IntoResponse for ServerError {
                         )
                     }
                 }
+            }
+            ServerError::GuardrailViolation(msg) => {
+                tracing::warn!("ガードレール違反によりリクエストを遮断しました: {}", msg);
+                (
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "guardrail_violation",
+                    msg,
+                )
             }
             ServerError::Internal(msg) => {
                 tracing::error!("サーバー内部エラーが発生しました: {}", msg);

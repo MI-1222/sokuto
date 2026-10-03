@@ -24,6 +24,9 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 regex = { workspace = true }
 mimalloc = { workspace = true }
+aho-corasick = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
 
 [features]
 default = ["swagger"]

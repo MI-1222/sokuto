@@ -16,7 +16,7 @@ import orjson
 import pytest
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from schema import (
+from sokuto.schema import (
     AsyncSokutoClient,
     DagSynthesisError,
     DagSynthesizer,

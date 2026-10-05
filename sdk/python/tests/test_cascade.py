@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from pydantic import BaseModel, Field
+
 from sokuto.cascade import (
     CascadeSource,
     CircuitBreaker,

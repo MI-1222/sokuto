@@ -206,8 +206,10 @@ class SchemaTranspiler:
         # json_schema_extra に各選択肢の説明文があるか探索
         extra = info.json_schema_extra
         desc_map: dict[str, str] = {}
-        if isinstance(extra, dict) and "descriptions" in extra:
-            desc_map = extra["descriptions"]
+        if isinstance(extra, dict):
+            descriptions = extra.get("descriptions")
+            if isinstance(descriptions, dict):
+                desc_map = {str(k): str(v) for k, v in descriptions.items()}
 
         criteria: dict[str, str] = {}
         for arg in args:

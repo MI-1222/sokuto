@@ -5,6 +5,7 @@
 .venv
 *.pyc
 __marimo__/
+*.egg-info/
 
 # mac
 .DS_Store

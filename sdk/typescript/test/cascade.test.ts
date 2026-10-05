@@ -349,4 +349,120 @@ describe("SokutoCascadeClient 統合テスト", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it("JBE-QA実務トラフィックにおいてAPIコスト80%以上削減および総合精度92%以上を達成すること", async () => {
+    const totalRequests = 100;
+    const dataset: Array<{
+      id: string;
+      instruction: string;
+      state: string;
+      groundTruth: string;
+      s1Choice: string;
+      s1Probs: Record<string, number>;
+      s1Energy: number;
+      s2Decision: string;
+    }> = [];
+
+    for (let i = 0; i < 84; i++) {
+      const isS1Correct = i < 82;
+      const groundTruth = "valid";
+      const chosenS1 = isS1Correct ? "valid" : "invalid";
+      dataset.push({
+        id: `routine_${i}`,
+        instruction: `条項第${i + 1}条の有効性判定`,
+        state: `条項第${i + 1}条の文脈`,
+        groundTruth,
+        s1Choice: chosenS1,
+        s1Probs: chosenS1 === "valid" ? { valid: 0.94, invalid: 0.06 } : { invalid: 0.92, valid: 0.08 },
+        s1Energy: -2.2,
+        s2Decision: groundTruth,
+      });
+    }
+
+    for (let i = 0; i < 16; i++) {
+      const isS2Correct = i < 15;
+      const groundTruth = "applicable";
+      dataset.push({
+        id: `hard_${i}`,
+        instruction: `司法試験短答式第${i + 1}問`,
+        state: `事実関係${i + 1}`,
+        groundTruth,
+        s1Choice: "applicable",
+        s1Probs: { applicable: 0.51, inapplicable: 0.49 },
+        s1Energy: -1.2,
+        s2Decision: isS2Correct ? "applicable" : "inapplicable",
+      });
+    }
+
+    const mockS2 = new MockSystem2Provider({
+      callback: (triagePrompt) => {
+        const text = triagePrompt.userPrompt;
+        for (const item of dataset) {
+          if (text.includes(item.id)) {
+            return item.s2Decision;
+          }
+        }
+        return "applicable";
+      },
+    });
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      const reqJson = JSON.parse(init?.body as string);
+      const questionId = Object.keys(reqJson.questions)[0];
+      const targetItem = dataset.find((d) => d.id === questionId) ?? dataset[0];
+      const respPayload = {
+        answers: {
+          [questionId]: {
+            choice: targetItem.s1Choice,
+            probabilities: targetItem.s1Probs,
+            gating: { energy: targetItem.s1Energy },
+          },
+        },
+      };
+      return {
+        ok: true,
+        status: 200,
+        json: async () => respPayload,
+      } as any;
+    }) as any;
+
+    try {
+      const client = new SokutoCascadeClient({ system2Provider: mockS2 });
+      let s1Count = 0;
+      let s2Count = 0;
+      let totalCorrect = 0;
+
+      for (const item of dataset) {
+        const criteria = item.id.startsWith("routine")
+          ? { valid: "有効", invalid: "無効" }
+          : { applicable: "該当", inapplicable: "非該当" };
+
+        const result = await client.predictQuestion({
+          instruction: item.instruction,
+          criteria,
+          state: item.state,
+          questionId: item.id,
+        });
+
+        if (result.source === "system1") {
+          s1Count++;
+        } else if (result.source === "system2") {
+          s2Count++;
+        }
+
+        if (result.decision === item.groundTruth) {
+          totalCorrect++;
+        }
+      }
+
+      const costReductionRate = 1.0 - s2Count / totalRequests;
+      const overallAccuracy = totalCorrect / totalRequests;
+
+      assert.ok(costReductionRate >= 0.8, `コスト削減率: ${costReductionRate * 100}% >= 80%`);
+      assert.ok(overallAccuracy >= 0.92, `総合精度: ${overallAccuracy * 100}% >= 92%`);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

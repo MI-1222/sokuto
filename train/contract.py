@@ -21,6 +21,18 @@ TENSOR_OP_INDICES: str = "op_indices"
 TENSOR_LOGITS: str = "logits"
 """決定ヘッド出力ロジットテンソル名。"""
 
+TENSOR_STATE_HIDDEN_STATES: str = "state_hidden_states"
+"""State エンコーダが出力し、Query 評価器が参照する最終層隠れ状態テンソル名。"""
+
+TENSOR_STATE_MASK: str = "state_mask"
+"""State 系列の有効トークンマスクテンソル名。"""
+
+TENSOR_QUERY_IDS: str = "query_ids"
+"""質問系列の入力トークンID列テンソル名。"""
+
+TENSOR_QUERY_MASK: str = "query_mask"
+"""質問系列のアテンションマスクテンソル名。"""
+
 TOKEN_OPTION_MARKER: str = "[OP]"
 """各候補の先頭に付与される決定アンカー特殊トークン。"""
 

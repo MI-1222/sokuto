@@ -448,3 +448,61 @@ def test_symmetry_regularization_loss() -> None:
     perm_logits_biased = torch.tensor([[2.0, 1.0, 0.0]], dtype=torch.float32)
     loss_biased = loss_fn(orig_logits, perm_logits_biased, perm_indices, op_mask)
     assert loss_biased > 0.0
+
+
+def test_jev_multitask_loss_with_insent() -> None:
+    """JevMultiTaskLoss に InSeNT 対照損失を統合した場合の複合損失計算を検証する。"""
+    loss_fn = JevMultiTaskLoss(
+        choice_weight=1.0,
+        insent_weight=0.15,
+        insent_temperature=0.05,
+        insent_lambda_seq=0.2,
+    )
+
+    batch_size = 2
+    max_options = 3
+    num_chunks = 4
+    hidden_size = 16
+
+    logits = torch.randn(batch_size, max_options)
+    labels = torch.tensor([0, 1], dtype=torch.long)
+    op_mask = torch.ones(batch_size, max_options, dtype=torch.bool)
+
+    query_embeddings = torch.randn(batch_size, hidden_size)
+    chunk_embeddings = torch.randn(batch_size, num_chunks, hidden_size)
+    target_chunk_indices = torch.tensor([1, 2], dtype=torch.long)
+    chunk_mask = torch.ones(batch_size, num_chunks, dtype=torch.bool)
+
+    # 質問表現未指定時は ValueError が発生することの検証 (ガード動作)
+    with pytest.raises(ValueError, match="質問側の表現"):
+        loss_fn(
+            logits=logits,
+            labels=labels,
+            op_mask=op_mask,
+            chunk_embeddings=chunk_embeddings,
+            target_chunk_indices=target_chunk_indices,
+            chunk_mask=chunk_mask,
+        )
+
+    # query_embeddings を指定して正常計算。
+    total_loss, loss_dict = loss_fn(
+        logits=logits,
+        labels=labels,
+        op_mask=op_mask,
+        query_embeddings=query_embeddings,
+        chunk_embeddings=chunk_embeddings,
+        target_chunk_indices=target_chunk_indices,
+        chunk_mask=chunk_mask,
+        return_dict=True,
+    )
+
+    assert total_loss.item() > 0.0
+    assert "loss_choice" in loss_dict
+    assert "loss_insent" in loss_dict
+    assert loss_dict["loss_insent"] > 0.0
+    # InSeNT 損失が 0.15 倍されて加算されていることを確認
+    assert torch.isclose(
+        total_loss,
+        torch.tensor(loss_dict["loss_choice"] + 0.15 * loss_dict["loss_insent"]),
+        atol=1e-4,
+    )

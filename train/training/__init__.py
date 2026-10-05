@@ -10,6 +10,9 @@ from training.hierarchical_loss import (
     HierarchicalMultiTaskLoss,
 )
 from training.hierarchical_trainer import HierarchicalSFTTrainer
+from training.insent_loss import InSeNTLoss
+from training.long_context_config import LongContextConfig
+from training.long_context_trainer import LongContextTrainer
 from training.loss import (
     AsymmetricBCELoss,
     EarthMoverDistanceLoss,
@@ -56,9 +59,12 @@ __all__ = [
     "HierarchicalMultiTaskLoss",
     "HierarchicalSFTConfig",
     "HierarchicalSFTTrainer",
+    "InSeNTLoss",
     "InfoNCEContrastiveLoss",
     "JevMultiTaskLoss",
     "LabelSmoothedFocalLoss",
+    "LongContextConfig",
+    "LongContextTrainer",
     "MaskedCrossEntropyLoss",
     "MetricsTracker",
     "ProperScoringEngine",

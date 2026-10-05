@@ -28,6 +28,13 @@ from .dual_seq import (
     SokutoQueryEvaluator,
     SokutoStateEncoder,
 )
+from .long_context import (
+    LateChunkingPooling,
+    ParallelClauseNoulScanner,
+    TopKChunkCrossAttention,
+    YaRNScaledRotaryEmbedding,
+    apply_yarn_to_modernbert,
+)
 
 __all__ = [
     "DEFAULT_BACKBONE_MODEL_ID",
@@ -43,11 +50,16 @@ __all__ = [
     "DecisionHead",
     "DualSeqDecisionModel",
     "JevDecisionModel",
+    "LateChunkingPooling",
     "NliNoulHead",
     "OptionGatherLayer",
+    "ParallelClauseNoulScanner",
     "SetAttentionBlock",
     "SokutoQueryEvaluator",
     "SokutoStateEncoder",
+    "TopKChunkCrossAttention",
+    "YaRNScaledRotaryEmbedding",
+    "apply_yarn_to_modernbert",
     "initialize_token_embedding_with_normalized_centroid",
     "prepare_backbone_and_tokenizer",
     "save_tokenizer_for_runtime",

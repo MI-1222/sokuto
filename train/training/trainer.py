@@ -37,6 +37,7 @@ from data.formatter import format_prompt, tokenize_sample
 from data.schema import QuestionType, UnifiedSample
 from models.backbone import prepare_backbone_and_tokenizer, save_tokenizer_for_runtime
 from models.decision_head import JevDecisionModel
+from models.long_context import apply_yarn_to_modernbert
 from training.config import SFTConfig
 from training.loss import JevMultiTaskLoss
 from training.metrics import MetricsTracker
@@ -334,6 +335,24 @@ class SFTTrainer:
             self.tokenizer = tokenizer
             self.op_token_id = op_token_id
 
+        # 長系列 YaRN RoPE スケーリングの適用 (局所窓層を保護し大域層のみ拡張)
+        if getattr(config, "use_yarn", False) and hasattr(self.model, "backbone"):
+            apply_yarn_to_modernbert(
+                self.model.backbone,
+                target_max_position=getattr(config, "target_max_position", 16384),
+                alpha=getattr(config, "yarn_alpha", 1.0),
+                beta=getattr(config, "yarn_beta", 32.0),
+            )
+
+        # 勾配チェックポインティングの適用 (長系列時の VRAM 節約)
+        if (
+            getattr(config, "gradient_checkpointing", False)
+            and hasattr(self.model, "backbone")
+            and hasattr(self.model.backbone, "gradient_checkpointing_enable")
+        ):
+            self.model.backbone.gradient_checkpointing_enable()
+            logger.info("バックボーンの勾配チェックポインティングを有効化しました。")
+
         self.loss_fn: nn.Module = JevMultiTaskLoss(
             label_smoothing=config.label_smoothing,
             focal_gamma=config.focal_gamma,
@@ -344,6 +363,9 @@ class SFTTrainer:
             choice_weight=config.choice_weight,
             score_weight=config.score_weight,
             noul_weight=config.noul_weight,
+            insent_weight=getattr(config, "insent_weight", 0.0),
+            insent_temperature=getattr(config, "insent_temperature", 0.05),
+            insent_lambda_seq=getattr(config, "insent_lambda_seq", 0.2),
         )
         self.metrics_tracker = MetricsTracker()
 
@@ -647,7 +669,7 @@ class SFTTrainer:
             model (nn.Module): 評価対象モデル。
             val_samples (list[UnifiedSample] | None): 検証サンプルリスト。未指定時は self.val_samples。
             max_samples (int): 評価に使用する最大サンプル数。
-            threshold (float): 位置バイアス許容変動閾値 (Phase 2 Exit Criteria: 0.03)。
+            threshold (float): 位置バイアス許容変動閾値。
 
         Returns:
             dict[str, Any]: 位置バイアス評価指標辞書。

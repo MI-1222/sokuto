@@ -1,0 +1,25 @@
+{
+  "name": "@sokuto/sdk",
+  "version": "0.3.6",
+  "description": "TypeSafe AI sokuto: Sub-millisecond schema-driven inference and System 1 / System 2 cascade SDK",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "keywords": [
+    "sokuto",
+    "typesafe-ai",
+    "system-1",
+    "cascade",
+    "inference"
+  ],
+  "author": "sokuto-team",
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}

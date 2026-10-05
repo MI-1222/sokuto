@@ -1,0 +1,26 @@
+[project]
+name = "sokuto-sdk"
+version = "0.3.6"
+description = "TypeSafe AI sokuto: Sub-millisecond schema-driven inference and System 1 / System 2 cascade SDK"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.27.0",
+    "orjson>=3.9.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.16.0",
+    "ty>=0.0.80",
+    "anyio>=4.0.0",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]

@@ -40,3 +40,5 @@ num_cpus = "1.16"
 mimalloc = { version = "0.1", default-features = false }
 crossbeam-queue = "0.3.14"
 futures-util = "0.3.34"
+aho-corasick = "1.1"
+bytes = "1.9"

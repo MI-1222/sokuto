@@ -20,6 +20,9 @@ pub const DEFAULT_MAX_QUESTION_CHARS: usize = 8_192;
 /// デフォルトの推定総トークン数上限 (約 16,384 トークン)。
 pub const DEFAULT_MAX_ESTIMATED_TOKENS: usize = 16_384;
 
+/// デフォルトのリクエストボディ最大許容バイト数 (2MB)。
+pub const DEFAULT_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
 /// リソース制限ガードレールの設定構造体。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LimitsConfig {
@@ -31,6 +34,8 @@ pub struct LimitsConfig {
     pub max_question_chars: usize,
     /// リクエスト全体の最大推定トークン数。
     pub max_estimated_tokens: usize,
+    /// リクエストボディ全体の最大許容バイト数。
+    pub max_body_bytes: usize,
 }
 
 impl Default for LimitsConfig {
@@ -40,6 +45,7 @@ impl Default for LimitsConfig {
             max_state_chars: DEFAULT_MAX_STATE_CHARS,
             max_question_chars: DEFAULT_MAX_QUESTION_CHARS,
             max_estimated_tokens: DEFAULT_MAX_ESTIMATED_TOKENS,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
         }
     }
 }

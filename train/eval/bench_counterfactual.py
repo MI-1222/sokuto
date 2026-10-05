@@ -126,7 +126,10 @@ class CounterfactualEvaluator:
         Returns:
             CounterfactualDomainResult: 評価結果。
         """
-        rng = np.random.default_rng(self.seed + hash(suite.domain) % 10000)
+        import zlib
+
+        domain_hash = zlib.crc32(suite.domain.encode("utf-8")) % 10000
+        rng = np.random.default_rng(self.seed + domain_hash)
         n = len(suite.pairs)
         if n == 0:
             raise ValueError(f"スイート `{suite.domain}` にペアが含まれていません。")

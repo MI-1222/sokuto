@@ -77,6 +77,21 @@ pub enum RuntimeError {
     #[error("Execution Provider の初期化に失敗しました: {0}。")]
     ExecutionProviderError(String),
 
+    /// キャッシュ未登録または期限切れ。
+    #[error("キャッシュキー {0} に対応する特徴量が存在しません。")]
+    CacheMiss(u64),
+
+    /// キャッシュと入力テンソルの次元不整合。
+    #[error(
+        "キャッシュ特徴量と入力テンソルの系列長が不一致です: 期待長={expected}, 実際={actual}。"
+    )]
+    CacheDimensionMismatch {
+        /// 期待される系列長。
+        expected: usize,
+        /// 実際の系列長。
+        actual: usize,
+    },
+
     /// コア数理・型スキーマクレート由来のエラー。
     #[error("コアエラー: {0}。")]
     Core(#[from] sokuto_core::error::CoreError),

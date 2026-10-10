@@ -18,6 +18,9 @@ num_cpus = { workspace = true }
 tokio = { workspace = true }
 crossbeam-queue = { workspace = true }
 futures-util = { workspace = true }
+moka = { workspace = true }
+xxhash-rust = { workspace = true }
+half = { workspace = true }
 
 [features]
 default = []

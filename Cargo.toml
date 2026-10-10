@@ -42,3 +42,6 @@ crossbeam-queue = "0.3.14"
 futures-util = "0.3.34"
 aho-corasick = "1.1"
 bytes = "1.9"
+moka = { version = "0.12", features = ["sync"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+half = { version = "2.4", features = ["num-traits"] }

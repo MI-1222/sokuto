@@ -17,6 +17,18 @@ pub const TENSOR_OP_INDICES: &str = "op_indices";
 /// 決定ヘッド出力ロジットテンソル名 (`float32[batch_size, num_options]`)。
 pub const TENSOR_LOGITS: &str = "logits";
 
+/// `State` エンコーダが出力し、`Query` 評価器が参照する最終層隠れ状態テンソル名 (`float32[batch_size, state_seq_len, hidden_size]`)。
+pub const TENSOR_STATE_HIDDEN_STATES: &str = "state_hidden_states";
+
+/// `State` 系列の有効トークンマスクテンソル名 (`int64[batch_size, state_seq_len]`)。
+pub const TENSOR_STATE_MASK: &str = "state_mask";
+
+/// 質問系列の入力トークンID列テンソル名 (`int64[batch_size, query_seq_len]`)。
+pub const TENSOR_QUERY_IDS: &str = "query_ids";
+
+/// 質問系列のアテンションマスクテンソル名 (`int64[batch_size, query_seq_len]`)。
+pub const TENSOR_QUERY_MASK: &str = "query_mask";
+
 /// 各候補の先頭に付与されるオプションマーカートークン文字列。
 pub const TOKEN_OPTION_MARKER: &str = "[OP]";
 

@@ -22,12 +22,13 @@ pub use dag::{
 };
 
 pub use engine::{
-    BatchScratchpad, CandidateEmbeddingCache, CoarseScorer, CoarseToFineConfig,
+    AlignedBuffer64, BatchScratchpad, CacheCompressionMode, CachedStateFeatures,
+    CachedTensorPayload, CandidateEmbeddingCache, CoarseScorer, CoarseToFineConfig,
     DEFAULT_COARSE_THRESHOLD, DEFAULT_MAX_BATCH_CHUNK_SIZE, DEFAULT_NEGATIVE_KEYS,
-    DEFAULT_TOP_M_CANDIDATES, EmbeddingCoarseScorer, ExecutionProvider, FilteredCandidates,
-    HierarchicalCoarseScorer, InferenceEngine, LexicalCoarseScorer, ModelDrivenCoarseScorer,
-    OptimizationLevel, SessionConfig, filter_top_candidates, is_negative_candidate,
-    reconstruct_probabilities,
+    DEFAULT_TOP_M_CANDIDATES, DualSessionEngine, EmbeddingCoarseScorer, ExecutionProvider,
+    FilteredCandidates, HierarchicalCoarseScorer, InferenceEngine, LexicalCoarseScorer,
+    ModelDrivenCoarseScorer, OptimizationLevel, SessionConfig, StateCacheManager,
+    filter_top_candidates, is_aligned_64, is_negative_candidate, reconstruct_probabilities,
 };
 pub use error::{Result, RuntimeError};
 pub use hierarchical::{

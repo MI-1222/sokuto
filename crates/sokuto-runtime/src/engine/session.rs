@@ -713,7 +713,7 @@ impl InferenceEngine {
 ///
 /// グラフ最適化レベル、メモリアリーナ、並列実行モード、物理コア数に応じた
 /// `intra_threads` 自動設定、および最適化済みモデルのキャッシュ設定を適用する。
-fn create_session_builder(
+pub(crate) fn create_session_builder(
     config: &SessionConfig,
     pool_size: usize,
 ) -> Result<(SessionBuilder, ExecutionProvider)> {

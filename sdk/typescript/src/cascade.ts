@@ -17,7 +17,10 @@ import type {
   GatingDecision,
   SokutoRequest,
   SokutoResponse,
+  StateBatchRequest,
+  StateBatchResponse,
 } from "./types.js";
+import { SokutoClient } from "./client.js";
 
 /**
  * System 1 / System 2 カスケード統合クライアント。
@@ -28,6 +31,7 @@ export class SokutoCascadeClient {
   public readonly gatingConfig: GatingConfig;
   public readonly timeoutMs: number;
   public readonly circuitBreaker: CircuitBreaker;
+  public readonly sokutoClient: SokutoClient;
 
   /**
    * カスケードクライアントを初期化する。
@@ -40,12 +44,16 @@ export class SokutoCascadeClient {
     gatingConfig?: GatingConfig;
     timeoutMs?: number;
     circuitBreaker?: CircuitBreaker;
+    sokutoClient?: SokutoClient;
   }) {
     this.baseUrl = (options?.baseUrl ?? "http://localhost:8080").replace(/\/+$/, "");
     this.system2Provider = options?.system2Provider ?? new MockSystem2Provider();
     this.gatingConfig = options?.gatingConfig ?? {};
     this.timeoutMs = options?.timeoutMs ?? 50;
     this.circuitBreaker = options?.circuitBreaker ?? new CircuitBreaker();
+    this.sokutoClient =
+      options?.sokutoClient ??
+      new SokutoClient({ baseUrl: this.baseUrl, timeoutMs: this.timeoutMs });
   }
 
   /**
@@ -401,5 +409,111 @@ export class SokutoCascadeClient {
       rawS1Response: params.rawS1Response,
       rawS2Response: s2Resp as unknown as Record<string, unknown>,
     };
+  }
+
+  /**
+   * 単一 State に対する複数質問を一括評価し、部分カスケード (Partial Cascade) を実行する。
+   *
+   * 高確信度な質問は System 1 で即時確定し、僅差・OOD の質問のみ System 2 へ選択的エスカレーションする。
+   *
+   * @param request StateBatchRequest パラメータ。
+   * @param options 最適化オプション (State-Offloading等)。
+   * @returns 各質問 ID に対応する CascadeResult の辞書。
+   */
+  async executeBatch(
+    request: StateBatchRequest,
+    options?: { enableStateOffloading?: boolean },
+  ): Promise<Record<string, CascadeResult<unknown>>> {
+    const startTime = performance.now();
+    const results: Record<string, CascadeResult<unknown>> = {};
+
+    // 1. サーキットブレーカー検査 (遮断時は全質問を System 2 直行)
+    if (!this.circuitBreaker.canExecute()) {
+      for (const [qid, q] of Object.entries(request.questions)) {
+        results[qid] = await this.escalateToSystem2<unknown>({
+          instruction: q.instructions,
+          criteria: q.criteria,
+          state: request.state,
+          gating: {
+            route: "fallback",
+            escalate: true,
+            confidence: 0.0,
+            isOod: false,
+            reason: "サーキットブレーカー遮断中 (Fail-Open 直行)。",
+            topCandidates: [],
+          },
+          startTime,
+          reason: "circuit_breaker_open",
+        });
+      }
+      return results;
+    }
+
+    // 2. System 1 へのバッチ問い合わせ
+    let batchResp: StateBatchResponse;
+    try {
+      batchResp = await this.sokutoClient.evaluateBatch(request, options);
+      this.circuitBreaker.recordSuccess();
+    } catch (err) {
+      this.circuitBreaker.recordFailure();
+      // 障害時は全質問を System 2 へフェイルオープン
+      for (const [qid, q] of Object.entries(request.questions)) {
+        results[qid] = await this.escalateToSystem2<unknown>({
+          instruction: q.instructions,
+          criteria: q.criteria,
+          state: request.state,
+          gating: {
+            route: "fallback",
+            escalate: true,
+            confidence: 0.0,
+            isOod: false,
+            reason: `System 1 呼び出し失敗: ${err instanceof Error ? err.message : String(err)}`,
+            topCandidates: [],
+          },
+          startTime,
+          reason: "s1_fetch_error",
+        });
+      }
+      return results;
+    }
+
+    // 3. 各質問の判定と部分エスカレーション (Partial Cascade)
+    for (const [qid, q] of Object.entries(request.questions)) {
+      const answer = batchResp.answers[qid];
+      if (!answer) {
+        continue;
+      }
+
+      const gating = evaluateGating({
+        probabilities: answer.probabilities,
+        questionType: q.type,
+        config: this.gatingConfig,
+        noulProbability: answer.noul,
+        serverGating: answer.gating,
+      });
+
+      if (gating.escalate) {
+        results[qid] = await this.escalateToSystem2<unknown>({
+          instruction: q.instructions,
+          criteria: q.criteria,
+          state: request.state,
+          gating,
+          startTime,
+          reason: gating.reason,
+          rawS1Response: { answer, batch_usage: batchResp.usage },
+        });
+      } else {
+        const decisionVal = answer.choice ?? answer.score ?? answer.noul;
+        results[qid] = {
+          decision: decisionVal,
+          source: "system1",
+          gating,
+          latencyMs: performance.now() - startTime,
+          rawS1Response: { answer, batch_usage: batchResp.usage },
+        };
+      }
+    }
+
+    return results;
   }
 }

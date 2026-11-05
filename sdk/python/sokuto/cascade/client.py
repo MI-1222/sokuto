@@ -72,6 +72,7 @@ class SokutoCascadeClient:
         self.gating_config = gating_config or GatingConfig()
         self.timeout = timeout
         self.circuit_breaker = circuit_breaker or CircuitBreaker()
+        self.last_state_hash: str | None = None
         self._owns_http_client = http_client is None
         self._client = (
             http_client
@@ -230,6 +231,168 @@ class SokutoCascadeClient:
             raw_s1_response=s1_result,
             context_reducer=context_reducer,
         )
+
+    async def predict_batch_questions(
+        self,
+        questions: dict[str, dict[str, Any]],
+        state: Any,
+        enable_state_offloading: bool = False,
+        state_hash: str | None = None,
+    ) -> dict[str, CascadeResult[Any]]:
+        """単一 State に対する複数質問を一括評価し、部分カスケード (Partial Cascade) を実行する。
+
+        サーキットブレーカー検査後、sokuto サーバーの `/v1/systemone/state-batch` へ一括送信し、
+        3 軸 Pareto 最適ゲーティングに基づき、高確信度な質問は System 1 で即時確定し、
+        僅差や OOD の質問のみ System 2 へ個別にエスカレーションする。
+
+        Args:
+            questions (dict[str, dict[str, Any]]): 質問識別子と質問定義辞書 (instruction, criteria, type) のマップ。
+            state (Any): 共通コンテキストデータ。
+            enable_state_offloading (bool): State 本文の省略 (キャッシュ再利用) 最適化。
+            state_hash (str | None): クライアント指定の State キャッシュキー。
+
+        Returns:
+            dict[str, CascadeResult[Any]]: 各質問識別子ごとの確定結果辞書。
+        """
+        start_time = time.perf_counter()
+        results: dict[str, CascadeResult[Any]] = {}
+
+        if not self.circuit_breaker.can_execute():
+            for q_id, q_spec in questions.items():
+                results[q_id] = await self._escalate_to_system2(
+                    instruction=q_spec.get("instruction") or q_spec.get("instructions", ""),
+                    criteria=q_spec.get("criteria", {}),
+                    state=state,
+                    gating=GatingDecision(
+                        route=DecisionRoute.FALLBACK,
+                        escalate=True,
+                        confidence=0.0,
+                        reason="サーキットブレーカー遮断中 (Fail-Open 直行)。",
+                        top_candidates=[],
+                    ),
+                    start_time=start_time,
+                    reason="circuit_breaker_open",
+                )
+            return results
+
+        effective_hash = state_hash or self.last_state_hash
+        headers = {"Content-Type": "application/json"}
+        if effective_hash:
+            headers["X-State-Hash"] = effective_hash
+
+        sent_state = "" if (enable_state_offloading and effective_hash) else state
+        normalized_questions: dict[str, Any] = {}
+        for q_id, q_spec in questions.items():
+            normalized_questions[q_id] = {
+                "instructions": q_spec.get("instruction") or q_spec.get("instructions", ""),
+                "criteria": q_spec.get("criteria"),
+                "type": q_spec.get("type") or q_spec.get("question_type", "choice"),
+            }
+
+        payload: dict[str, Any] = {
+            "state": sent_state,
+            "questions": normalized_questions,
+        }
+        if effective_hash:
+            payload["state_hash"] = effective_hash
+
+        s1_result: dict[str, Any] | None = None
+        try:
+            resp = await self._client.post(
+                "/v1/systemone/state-batch",
+                json=payload,
+                headers=headers,
+                timeout=self.timeout,
+            )
+            if (
+                resp.status_code == 400
+                and enable_state_offloading
+                and sent_state == ""
+                and state != ""
+            ):
+                payload["state"] = state
+                resp = await self._client.post(
+                    "/v1/systemone/state-batch",
+                    json=payload,
+                    headers=headers,
+                    timeout=self.timeout,
+                )
+
+            if resp.status_code == 200:
+                json_data = resp.json()
+                if inspect.iscoroutine(json_data):
+                    s1_result = await json_data
+                else:
+                    s1_result = json_data
+                self.circuit_breaker.record_success()
+                rec_hash = resp.headers.get("x-state-hash") or resp.headers.get("X-State-Hash")
+                if rec_hash:
+                    self.last_state_hash = rec_hash
+            else:
+                self.circuit_breaker.record_failure()
+        except Exception:
+            self.circuit_breaker.record_failure()
+
+        if s1_result is None:
+            for q_id, q_spec in questions.items():
+                results[q_id] = await self._escalate_to_system2(
+                    instruction=q_spec.get("instruction") or q_spec.get("instructions", ""),
+                    criteria=q_spec.get("criteria", {}),
+                    state=state,
+                    gating=GatingDecision(
+                        route=DecisionRoute.FALLBACK,
+                        escalate=True,
+                        confidence=0.0,
+                        reason="System 1 通信障害によるフェイルオープン。",
+                        top_candidates=[],
+                    ),
+                    start_time=start_time,
+                    reason="s1_network_failure",
+                )
+            return results
+
+        answers = s1_result.get("answers", {})
+
+        for q_id, q_spec in questions.items():
+            ans = answers.get(q_id, {})
+            q_type = q_spec.get("type") or q_spec.get("question_type", "choice")
+            g = evaluate_gating(
+                probabilities=ans.get("probabilities"),
+                question_type=q_type,
+                config=self.gating_config,
+                noul_probability=ans.get("noul"),
+                server_gating=ans.get("gating"),
+            )
+
+            if g.escalate:
+                results[q_id] = await self._escalate_to_system2(
+                    instruction=q_spec.get("instruction") or q_spec.get("instructions", ""),
+                    criteria=q_spec.get("criteria", {}),
+                    state=state,
+                    gating=g,
+                    start_time=start_time,
+                    reason=g.reason,
+                    raw_s1_response={"answer": ans, "batch_usage": s1_result.get("usage")},
+                )
+            else:
+                decision_val = (
+                    ans.get("choice")
+                    if ans.get("choice") is not None
+                    else ans.get("score")
+                    if ans.get("score") is not None
+                    else ans.get("noul")
+                )
+                elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+                results[q_id] = CascadeResult(
+                    decision=decision_val,
+                    source=CascadeSource.SYSTEM1,
+                    gating=g,
+                    latency_ms=elapsed_ms,
+                    model_name=s1_result.get("model_name"),
+                    raw_s1_response={"answer": ans, "batch_usage": s1_result.get("usage")},
+                )
+
+        return results
 
     async def execute_model(
         self,

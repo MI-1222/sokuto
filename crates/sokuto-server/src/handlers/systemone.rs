@@ -7,10 +7,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::extract::State;
+use axum::http::{HeaderMap, HeaderValue};
 use axum::response::IntoResponse;
 use serde_json::Value;
 use sokuto_core::gating::evaluate_response_routing;
 use sokuto_core::schema::{QuestionType, SystemOneRequest, SystemOneResponse, Usage};
+use sokuto_runtime::engine::StateCacheManager;
 use sokuto_runtime::hierarchical::CoarseToFineRouter;
 
 use crate::error::{ErrorResponse, ServerError};
@@ -39,22 +41,26 @@ use crate::state::AppState;
 )]
 pub async fn system_one_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Json(mut req): axum::Json<SystemOneRequest>,
 ) -> Result<impl IntoResponse, ServerError> {
     let start_time = Instant::now();
 
-    // 1. 高速スキーマ検証
     req.validate()?;
 
-    // クライアントがリクエストした元の質問仕様 (特に Criteria の元ラベル) を退避
+    let client_hash_str = headers
+        .get("x-state-hash")
+        .or_else(|| headers.get("X-State-Hash"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| req.state_hash.clone());
+
     let original_questions = req.questions.clone();
 
-    // 2. 前処理ガードレールパイプラインの実行 (物理OOM防壁、サニタイズ、縮約、相対日時、算術集計)
     state.guardrail_pipeline.process(&mut req, None)?;
 
     let question_count = req.questions.len();
 
-    // 質問タイプ別メトリクスカウント
     for question in req.questions.values() {
         match question.question_type {
             QuestionType::Choice => record_question_type("choice"),
@@ -63,14 +69,48 @@ pub async fn system_one_handler(
         }
     }
 
-    // 3. 正規化済み State の文字列取得
     let state_text = match &req.state {
         Value::String(s) => s.clone(),
+        Value::Null => String::new(),
         other => other.to_string(),
     };
 
-    // 4. CPU/GPU バウンドな推論処理およびゲーティング判定をブロッキングプールへオフロード
+    let is_state_empty = state_text.trim().is_empty();
+
+    let (state_key, _state_cache_hit_initial) = if is_state_empty {
+        if let Some(ref h_str) = client_hash_str {
+            let key = u64::from_str_radix(h_str.trim_start_matches("0x"), 16).map_err(|e| {
+                ServerError::BadRequest(format!("無効な State ハッシュです: {e}。"))
+            })?;
+            let has_cache = state
+                .cache_manager
+                .as_ref()
+                .map(|cm| cm.contains_key(key))
+                .unwrap_or(false);
+            if !has_cache {
+                return Err(ServerError::StateCacheMiss(
+                    "指定された State ハッシュのキャッシュが見つかりません。State 本文を含めて再送してください。".to_string(),
+                ));
+            }
+            (Some(key), true)
+        } else {
+            return Err(ServerError::BadRequest(
+                "State 本文が空で、有効な State ハッシュも指定されていません。".to_string(),
+            ));
+        }
+    } else {
+        let key = StateCacheManager::compute_key(&state_text);
+        let has_cache = state
+            .cache_manager
+            .as_ref()
+            .map(|cm| cm.contains_key(key))
+            .unwrap_or(false);
+        (Some(key), has_cache)
+    };
+
     let engine = Arc::clone(&state.engine);
+    let dual_engine = state.dual_engine.clone();
+    let cache_manager = state.cache_manager.clone();
     let tokenizer = Arc::clone(&state.tokenizer);
     let calib_config = Arc::clone(&state.calib_config);
     let coarse_config = state.coarse_config.clone();
@@ -83,13 +123,17 @@ pub async fn system_one_handler(
     let hierarchical_config = state.hierarchical_config.clone();
 
     let inference_start = Instant::now();
-    let (answers, prompt_tokens, routing_summary, route_records) =
+    let (answers, prompt_tokens, routing_summary, route_records, cache_status_str) =
         tokio::task::spawn_blocking(move || {
             // 正規化後ペイロードの正味トークン数を正確に算出
-            let state_tokens = tokenizer
-                .encode_state(&state_text)
-                .map(|toks| toks.len())
-                .unwrap_or(0);
+            let state_tokens = if !is_state_empty {
+                tokenizer
+                    .encode_state(&state_text)
+                    .map(|toks| toks.len())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
             let questions_tokens: usize = questions
                 .values()
                 .map(|q| {
@@ -128,7 +172,35 @@ pub async fn system_one_handler(
                 false
             };
 
-            let mut answers = if has_hierarchical_target {
+            let (mut answers, cache_status_str) = if let (Some(de), Some(cm), Some(key)) =
+                (&dual_engine, &cache_manager, state_key)
+            {
+                // デュアルセッションエンジンによる中間特徴量キャッシュ推論
+                let (cached_state, status_str) = if let Some(cached) = cm.get(key) {
+                    (cached, "HIT")
+                } else {
+                    let (s_ids, s_mask) = tokenizer.encode_state_tensor(&state_text)?;
+                    let cached =
+                        de.encode_and_cache_state(&state_text, &s_ids, &s_mask, [1, s_ids.len()])?;
+                    (cached, "MISS")
+                };
+
+                let ans = de.evaluate_batch_questions_with_cache(
+                    &tokenizer,
+                    &cached_state,
+                    if is_state_empty {
+                        None
+                    } else {
+                        Some(&state_text)
+                    },
+                    &questions,
+                    &calib_config,
+                    Some(&gating_config),
+                    chunk_size,
+                )?;
+
+                (ans, status_str)
+            } else if has_hierarchical_target {
                 let mapping = hierarchical_mapping
                     .as_ref()
                     .expect("マッピングが存在すること。");
@@ -190,10 +262,10 @@ pub async fn system_one_handler(
                     }
                 }
 
-                combined_answers
+                (combined_answers, "BYPASS")
             } else {
                 // 粗密 2 段階探索とマイクロバッチチャンキングを統合した通常推論を実行
-                engine.evaluate_batch_questions_coarse_to_fine_chunked_with_gating(
+                let ans = engine.evaluate_batch_questions_coarse_to_fine_chunked_with_gating(
                     &tokenizer,
                     &state_text,
                     &questions,
@@ -201,7 +273,8 @@ pub async fn system_one_handler(
                     &coarse_config,
                     chunk_size,
                     Some(&gating_config),
-                )?
+                )?;
+                (ans, "BYPASS")
             };
 
             // 後処理ガードレール (二峰性分布検出による安全弁降格、および元ラベルキー復元) の適用
@@ -237,7 +310,13 @@ pub async fn system_one_handler(
                 (None, Vec::new())
             };
 
-            Ok::<_, ServerError>((answers, total_prompt_tokens, routing_summary, route_records))
+            Ok::<_, ServerError>((
+                answers,
+                total_prompt_tokens,
+                routing_summary,
+                route_records,
+                cache_status_str,
+            ))
         })
         .await
         .map_err(|join_err| {
@@ -280,5 +359,21 @@ pub async fn system_one_handler(
     record_http_duration("/v1/systemone", total_duration);
     record_http_request("/v1/systemone", 200);
 
-    Ok(axum::Json(response))
+    // 7. レスポンスヘッダーの設定 (透過的キャッシュプロトコル)
+    let mut resp_headers = HeaderMap::new();
+    if let Some(key) = state_key
+        && let Ok(hv) = HeaderValue::from_str(&format!("{:016x}", key))
+    {
+        resp_headers.insert("X-State-Hash", hv);
+    }
+    let cache_status_val = HeaderValue::from_static(match cache_status_str {
+        "HIT" => "HIT",
+        "MISS" => "MISS",
+        _ => "BYPASS",
+    });
+    resp_headers.insert("X-Cache-Status", cache_status_val.clone());
+    resp_headers.insert("X-State-Cache", cache_status_val.clone());
+    resp_headers.insert("X-Cache", cache_status_val);
+
+    Ok((resp_headers, axum::Json(response)))
 }

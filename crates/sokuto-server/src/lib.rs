@@ -52,6 +52,10 @@ pub fn version() -> &'static str {
 pub fn create_router(state: Arc<AppState>, prometheus_handle: Option<PrometheusHandle>) -> Router {
     let api_routes = Router::new()
         .route("/v1/systemone", post(handlers::system_one_handler))
+        .route(
+            "/v1/systemone/state-batch",
+            post(handlers::state_batch_handler),
+        )
         .route("/v1/systemone/dag", post(handlers::dag_handler))
         .route("/health", get(handlers::health_handler))
         .route("/ready", get(handlers::ready_handler))

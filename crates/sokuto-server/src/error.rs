@@ -72,6 +72,10 @@ pub enum ServerError {
     #[error("ガードレール違反: {0}")]
     GuardrailViolation(String),
 
+    /// State キャッシュミス (State-Offloading で State が空だがキャッシュが存在しない)。
+    #[error("State キャッシュミス: {0}")]
+    StateCacheMiss(String),
+
     /// サーバー内部の不整合・障害。
     #[error("サーバー内部エラー: {0}")]
     Internal(String),
@@ -84,6 +88,12 @@ impl IntoResponse for ServerError {
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 "bad_request",
+                msg,
+            ),
+            ServerError::StateCacheMiss(msg) => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "state_cache_miss",
                 msg,
             ),
             ServerError::ValidationError(core_err) => {

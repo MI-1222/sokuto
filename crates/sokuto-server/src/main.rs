@@ -7,7 +7,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use sokuto_core::contract::calibration::CalibrationConfig;
-use sokuto_runtime::engine::{InferenceEngine, SessionConfig};
+use sokuto_runtime::engine::{
+    CacheCompressionMode, DualSessionEngine, InferenceEngine, SessionConfig, StateCacheManager,
+};
 use sokuto_runtime::tokenizer::JevTokenizer;
 use sokuto_server::metrics::setup_metrics_recorder;
 use sokuto_server::state::AppState;
@@ -74,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     tracing::info!("ONNX Runtime セッションプールを構築中 (プール数: {pool_size})...");
-    let engine = Arc::new(InferenceEngine::new(&onnx_path, session_config)?);
+    let engine = Arc::new(InferenceEngine::new(&onnx_path, session_config.clone())?);
 
     tracing::info!("高速トークナイザーを読み込み中...");
     let tokenizer = Arc::new(JevTokenizer::from_file(&tok_path)?);
@@ -88,7 +90,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Arc::new(CalibrationConfig::default())
     };
 
-    let state = Arc::new(AppState::new(engine, tokenizer, calib_config));
+    let mut state = AppState::new(engine, tokenizer, calib_config);
+
+    // デュアルセッションモデル (state_encoder.onnx, query_evaluator.onnx) の検出と初期化
+    let state_model_path = model_dir.join("state_encoder.onnx");
+    let query_model_path = model_dir.join("query_evaluator.onnx");
+    if state_model_path.exists() && query_model_path.exists() {
+        tracing::info!(
+            "2 セッション分割型モデルを検出しました: State={}, Query={}",
+            state_model_path.display(),
+            query_model_path.display()
+        );
+
+        let cache_max_bytes = std::env::var("SOKUTO_STATE_CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(512 * 1024 * 1024); // デフォルト 512MB
+
+        let cache_ttl_secs = std::env::var("SOKUTO_STATE_CACHE_TTL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(600); // デフォルト 10分
+
+        let compression_mode = match std::env::var("SOKUTO_STATE_CACHE_COMPRESSION")
+            .unwrap_or_else(|_| "fp16".to_string())
+            .to_lowercase()
+            .as_str()
+        {
+            "none" | "fp32" => CacheCompressionMode::None,
+            "int8" => CacheCompressionMode::Int8Symmetric,
+            _ => CacheCompressionMode::Fp16,
+        };
+
+        let cache_manager = Arc::new(StateCacheManager::new(
+            cache_max_bytes,
+            cache_ttl_secs,
+            compression_mode,
+        ));
+
+        match DualSessionEngine::new(
+            &state_model_path,
+            &query_model_path,
+            session_config,
+            Arc::clone(&cache_manager),
+        ) {
+            Ok(dual_engine) => {
+                tracing::info!(
+                    "DualSessionEngine を初期化しました (キャッシュ上限: {}MB, 圧縮: {:?})。",
+                    cache_max_bytes / (1024 * 1024),
+                    compression_mode
+                );
+                state = state.with_dual_engine(Arc::new(dual_engine), cache_manager);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "DualSessionEngine の構築に失敗したため、単一モデルモードで運用します: {err}"
+                );
+            }
+        }
+    }
+
+    let state = Arc::new(state);
 
     let host = std::env::var("SOKUTO_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     let port = std::env::var("SOKUTO_PORT")

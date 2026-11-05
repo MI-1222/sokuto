@@ -20,16 +20,22 @@ use moka::sync::Cache;
 use ort::memory::MemoryInfo;
 use ort::session::Session;
 use ort::value::Value;
+use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_core::contract::model_spec::{
     ModelInputDimensions, TENSOR_ATTENTION_MASK, TENSOR_INPUT_IDS, TENSOR_LOGITS,
     TENSOR_OP_INDICES, TENSOR_QUERY_IDS, TENSOR_QUERY_MASK, TENSOR_STATE_HIDDEN_STATES,
     TENSOR_STATE_MASK,
 };
+use sokuto_core::decision::evaluate_question_with_buf;
+use sokuto_core::gating::GatingConfig;
+use sokuto_core::schema::{Answer, Question};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::engine::config::{ExecutionProvider, SessionConfig};
+use crate::engine::gating::{apply_gating_to_answer_with_energy, calculate_choice_energy};
 use crate::engine::session::create_session_builder;
 use crate::error::{Result, RuntimeError};
+use crate::tokenizer::JevTokenizer;
 
 /// 64バイト境界メモリアライメント判定関数。
 ///
@@ -204,10 +210,7 @@ pub fn decompress_fp16_to_f32(src: &[f16], dst: &mut [f32]) {
 /// - `src`: 入力 `f32` スライス。
 /// - `hidden_size`: 隠れ層次元数。
 pub fn compress_f32_to_int8_symmetric(src: &[f32], hidden_size: usize) -> (Vec<i8>, Vec<f32>) {
-    assert!(
-        hidden_size > 0,
-        "hidden_sizeは1以上である必要があります。"
-    );
+    assert!(hidden_size > 0, "hidden_sizeは1以上である必要があります。");
     assert_eq!(
         src.len() % hidden_size,
         0,
@@ -426,6 +429,48 @@ impl CachedStateFeatures {
                 Ok(Arc::new(val.into()))
             }
         }
+    }
+
+    /// 指定されたバッチサイズに合わせてバインド可能な `Arc<Value>` を取得する。
+    ///
+    /// `target_batch == 1` かつ自身のバッチサイズが 1 の場合はゼロコピー返却する。
+    /// `target_batch > 1` の場合は、単一サンプルの特徴量データを `target_batch` 回リピートした
+    /// テンソル (`[target_batch, seq_len, hidden_size]`) を構築して返却する。
+    pub fn as_ort_value_for_batch(&self, target_batch: usize) -> Result<Arc<Value>> {
+        if target_batch == 1 && self.batch_size() == 1 {
+            return self.as_ort_value();
+        }
+
+        let seq_len = self.seq_len();
+        let hidden_size = self.hidden_size();
+        let single_len = seq_len * hidden_size;
+
+        // 単一サンプルの f32 データを取得
+        let single_f32: Vec<f32> = match &self.payload {
+            CachedTensorPayload::Raw(val) => {
+                let (_, data) = val.try_extract_tensor::<f32>().map_err(RuntimeError::Ort)?;
+                data.to_vec()
+            }
+            CachedTensorPayload::Fp16(compressed) => {
+                let mut aligned_buf = AlignedBuffer64::<f32>::with_capacity_zeroed(compressed.len());
+                decompress_fp16_to_f32(compressed, &mut aligned_buf);
+                aligned_buf.to_vec()
+            }
+            CachedTensorPayload::Int8Symmetric { quantized, scales } => {
+                let mut aligned_buf = AlignedBuffer64::<f32>::with_capacity_zeroed(quantized.len());
+                decompress_int8_symmetric_to_f32(quantized, scales, hidden_size, &mut aligned_buf);
+                aligned_buf.to_vec()
+            }
+        };
+
+        let mut repeated = Vec::with_capacity(target_batch * single_len);
+        for _ in 0..target_batch {
+            repeated.extend_from_slice(&single_f32);
+        }
+
+        let target_shape = vec![target_batch, seq_len, hidden_size];
+        let val = Value::from_array((target_shape, repeated)).map_err(RuntimeError::Ort)?;
+        Ok(Arc::new(val.into()))
     }
 
     /// バッチサイズを取得する。
@@ -876,8 +921,8 @@ impl DualSessionEngine {
         let mut binding = session.create_binding().map_err(RuntimeError::Ort)?;
         let mem_info = MemoryInfo::default();
 
-        // 3. キャッシュ特徴量のゼロコピーバインド。
-        let state_val = cached_state.as_ort_value()?;
+        // 3. キャッシュ特徴量のゼロコピー / バッチ適合バインド。
+        let state_val = cached_state.as_ort_value_for_batch(batch_size)?;
         binding
             .bind_input(TENSOR_STATE_HIDDEN_STATES, state_val.as_ref())
             .map_err(RuntimeError::Ort)?;
@@ -976,6 +1021,127 @@ impl DualSessionEngine {
                 query_dims,
             )
         })
+    }
+
+    /// キャッシュされた `State` 特徴量をゼロコピー参照し、複数の質問を一括またはマイクロバッチ評価する。
+    ///
+    /// 内部で各質問の `Query` 部分を事前トークナイズし、`chunk_size` 単位のマイクロバッチとして
+    /// `evaluate_query_with_cache` を実行することで、L3 キャッシュ保護と並列推論を両立する。
+    ///
+    /// # 引数
+    /// - `tokenizer`: 高速トークナイザー。
+    /// - `cached_state`: キャッシュされた `State` 特徴量。
+    /// - `state_text`: `State` テキスト (ゲーティングや OOD 判定用、任意)。
+    /// - `questions`: 評価対象質問群のマップ。
+    /// - `calib_config`: 事後較正設定。
+    /// - `gating_config`: 確信度ゲーティング設定 (任意)。
+    /// - `chunk_size`: マイクロバッチ分割サイズ (OOM 防止)。
+    ///
+    /// # 戻り値
+    /// 各質問 ID に対応する決定結果 (`IndexMap<String, Answer>`)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_batch_questions_with_cache(
+        &self,
+        tokenizer: &JevTokenizer,
+        cached_state: &CachedStateFeatures,
+        state_text: Option<&str>,
+        questions: &indexmap::IndexMap<String, Question>,
+        calib_config: &CalibrationConfig,
+        gating_config: Option<&GatingConfig>,
+        chunk_size: usize,
+    ) -> Result<indexmap::IndexMap<String, Answer>> {
+        if questions.is_empty() {
+            return Ok(indexmap::IndexMap::new());
+        }
+
+        let chunk_size = chunk_size.max(1);
+        let mut answers = indexmap::IndexMap::with_capacity(questions.len());
+        let pad_id = tokenizer.pad_token_id().unwrap_or(0) as i64;
+        let state_seq_len = cached_state.seq_len();
+
+        let mut tokenized_items = Vec::with_capacity(questions.len());
+        for (qid, q) in questions {
+            let t = tokenizer.encode_query(q)?;
+            tokenized_items.push((qid, q, t));
+        }
+
+        let mut scratch_probs = Vec::new();
+
+        for chunk in tokenized_items.chunks(chunk_size) {
+            let chunk_len = chunk.len();
+            let max_q_len = chunk
+                .iter()
+                .map(|(_, _, t)| t.input_ids.len())
+                .max()
+                .unwrap_or(1);
+            let max_opts = chunk
+                .iter()
+                .map(|(_, _, t)| t.op_indices.len())
+                .max()
+                .unwrap_or(1);
+
+            let mut batch_query_ids = vec![pad_id; chunk_len * max_q_len];
+            let mut batch_query_mask = vec![0i64; chunk_len * max_q_len];
+            let mut batch_op_indices = vec![-1i64; chunk_len * max_opts];
+            let batch_state_mask = vec![1i64; chunk_len * state_seq_len];
+
+            for (i, (_, _, t)) in chunk.iter().enumerate() {
+                let q_len = t.input_ids.len();
+                let q_start = i * max_q_len;
+                batch_query_ids[q_start..q_start + q_len].copy_from_slice(&t.input_ids);
+                batch_query_mask[q_start..q_start + q_len].copy_from_slice(&t.attention_mask);
+
+                let opt_len = t.op_indices.len();
+                let opt_start = i * max_opts;
+                batch_op_indices[opt_start..opt_start + opt_len].copy_from_slice(&t.op_indices);
+            }
+
+            let query_dims = ModelInputDimensions {
+                batch_size: chunk_len,
+                sequence_length: max_q_len,
+                num_options: max_opts,
+            };
+
+            let logits_per_sample = self.evaluate_query_with_cache(
+                cached_state,
+                &batch_state_mask,
+                &batch_query_ids,
+                &batch_query_mask,
+                &batch_op_indices,
+                query_dims,
+            )?;
+
+            for (i, (qid, q, t)) in chunk.iter().enumerate() {
+                let k_i = t.op_indices.len();
+                let sample_logits = &logits_per_sample[i][..k_i];
+
+                if scratch_probs.len() < k_i {
+                    scratch_probs.resize(k_i, 0.0);
+                }
+
+                let mut answer = evaluate_question_with_buf(
+                    q,
+                    sample_logits,
+                    calib_config,
+                    &mut scratch_probs[..k_i],
+                )?;
+
+                let energy = calculate_choice_energy(q, sample_logits, calib_config);
+                apply_gating_to_answer_with_energy(
+                    &mut answer,
+                    energy,
+                    state_text,
+                    Some(qid.as_str()),
+                    Some(q),
+                    gating_config,
+                    calib_config,
+                );
+
+                answers.insert((*qid).clone(), answer);
+            }
+        }
+
+        Ok(answers)
     }
 }
 
@@ -1102,5 +1268,52 @@ mod tests {
         manager.invalidate(key);
         manager.run_pending_tasks();
         assert!(!manager.contains_key(key));
+    }
+
+    #[test]
+    fn test_as_ort_value_for_batch_repeat() {
+        let text = "バッチリピートテスト用のStateテキスト。";
+        let key = StateCacheManager::compute_key(text);
+        let seq_len = 4;
+        let hidden_size = 8;
+        let shape = vec![1, seq_len, hidden_size];
+        let raw_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| i as f32).collect();
+
+        let features = CachedStateFeatures::new_compressed(
+            key,
+            shape,
+            &raw_data,
+            CacheCompressionMode::Fp16,
+        )
+        .expect("キャッシュエントリの作成に成功すること。");
+
+        // 単一バッチ時は [1, seq_len, hidden_size]
+        let val_b1 = features
+            .as_ort_value_for_batch(1)
+            .expect("単一バッチ取得成功。");
+        let (s1, d1) = val_b1
+            .try_extract_tensor::<f32>()
+            .expect("テンソル抽出成功。");
+        assert_eq!(s1.as_ref(), &[1, seq_len as i64, hidden_size as i64]);
+        assert_eq!(d1.len(), seq_len * hidden_size);
+
+        // 複数バッチ (例: batch=3) 時は [3, seq_len, hidden_size] へリピート展開
+        let val_b3 = features
+            .as_ort_value_for_batch(3)
+            .expect("3バッチ取得成功。");
+        let (s3, d3) = val_b3
+            .try_extract_tensor::<f32>()
+            .expect("テンソル抽出成功。");
+        assert_eq!(s3.as_ref(), &[3, seq_len as i64, hidden_size as i64]);
+        assert_eq!(d3.len(), 3 * seq_len * hidden_size);
+
+        // 1番目と2番目のスライスが元のデータと一致しているか検証
+        for b in 0..3 {
+            let offset = b * seq_len * hidden_size;
+            let slice = &d3[offset..offset + seq_len * hidden_size];
+            for (v_orig, v_rep) in d1.iter().zip(slice.iter()) {
+                assert!((v_orig - v_rep).abs() < 1e-3);
+            }
+        }
     }
 }

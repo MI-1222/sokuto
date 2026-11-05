@@ -442,6 +442,7 @@ impl CachedStateFeatures {
     /// `target_batch == 1` かつ自身のバッチサイズが 1 の場合はゼロコピー返却する。
     /// `target_batch > 1` の場合は、単一サンプルの特徴量データを `target_batch` 回リピートした
     /// テンソル (`[target_batch, seq_len, hidden_size]`) を構築して返却する。
+    /// 非圧縮キャッシュ時は中間ベクタを確保せず、スライス参照から直接展開先へコピーする。
     pub fn as_ort_value_for_batch(&self, target_batch: usize) -> Result<Arc<Value>> {
         if target_batch == 1 && self.batch_size() == 1 {
             return self.as_ort_value();
@@ -451,28 +452,27 @@ impl CachedStateFeatures {
         let hidden_size = self.hidden_size();
         let single_len = seq_len * hidden_size;
 
-        // 単一サンプルの f32 データを取得
-        let single_f32: Vec<f32> = match &self.payload {
+        let mut decompressed_buf;
+        let single_slice: &[f32] = match &self.payload {
             CachedTensorPayload::Raw(val) => {
                 let (_, data) = val.try_extract_tensor::<f32>().map_err(RuntimeError::Ort)?;
-                data.to_vec()
+                data
             }
             CachedTensorPayload::Fp16(compressed) => {
-                let mut aligned_buf =
-                    AlignedBuffer64::<f32>::with_capacity_zeroed(compressed.len());
-                decompress_fp16_to_f32(compressed, &mut aligned_buf);
-                aligned_buf.to_vec()
+                decompressed_buf = AlignedBuffer64::<f32>::with_capacity_zeroed(compressed.len());
+                decompress_fp16_to_f32(compressed, &mut decompressed_buf);
+                &decompressed_buf[..]
             }
             CachedTensorPayload::Int8Symmetric { quantized, scales } => {
-                let mut aligned_buf = AlignedBuffer64::<f32>::with_capacity_zeroed(quantized.len());
-                decompress_int8_symmetric_to_f32(quantized, scales, hidden_size, &mut aligned_buf);
-                aligned_buf.to_vec()
+                decompressed_buf = AlignedBuffer64::<f32>::with_capacity_zeroed(quantized.len());
+                decompress_int8_symmetric_to_f32(quantized, scales, hidden_size, &mut decompressed_buf);
+                &decompressed_buf[..]
             }
         };
 
         let mut repeated = Vec::with_capacity(target_batch * single_len);
         for _ in 0..target_batch {
-            repeated.extend_from_slice(&single_f32);
+            repeated.extend_from_slice(single_slice);
         }
 
         let target_shape = vec![target_batch, seq_len, hidden_size];
@@ -1329,5 +1329,27 @@ mod tests {
                 assert!((v_orig - v_rep).abs() < 1e-3);
             }
         }
+
+        // 非圧縮 (Raw) キャッシュ時の中間アロケーション回避とリピート展開の検証
+        let raw_shape = vec![1, seq_len, hidden_size];
+        let raw_val = Value::from_array((raw_shape.clone(), raw_data.clone()))
+            .expect("Value の作成に成功すること。");
+        let raw_features = CachedStateFeatures::new_raw(
+            key,
+            raw_shape,
+            raw_val.into(),
+            raw_data.len() * std::mem::size_of::<f32>(),
+        );
+
+        let raw_b2 = raw_features
+            .as_ort_value_for_batch(2)
+            .expect("Raw バッチ取得成功。");
+        let (s_raw, d_raw) = raw_b2
+            .try_extract_tensor::<f32>()
+            .expect("Raw テンソル抽出成功。");
+        assert_eq!(s_raw.as_ref(), &[2, seq_len as i64, hidden_size as i64]);
+        assert_eq!(d_raw.len(), 2 * seq_len * hidden_size);
+        assert_eq!(&d_raw[..seq_len * hidden_size], &raw_data[..]);
+        assert_eq!(&d_raw[seq_len * hidden_size..], &raw_data[..]);
     }
 }

@@ -85,10 +85,13 @@ export class SokutoClient {
         payload.state === "" &&
         request.state
       ) {
+        delete headers["X-State-Hash"];
+        const fallbackRequest = { ...request };
+        delete fallbackRequest.state_hash;
         resp = await fetch(url, {
           method: "POST",
           headers,
-          body: JSON.stringify(request),
+          body: JSON.stringify(fallbackRequest),
           signal: controller.signal,
         });
       }
@@ -162,10 +165,13 @@ export class SokutoClient {
         payload.state === "" &&
         request.state
       ) {
+        delete headers["X-State-Hash"];
+        const fallbackRequest = { ...request };
+        delete fallbackRequest.state_hash;
         resp = await fetch(url, {
           method: "POST",
           headers,
-          body: JSON.stringify(request),
+          body: JSON.stringify(fallbackRequest),
           signal: controller.signal,
         });
       }

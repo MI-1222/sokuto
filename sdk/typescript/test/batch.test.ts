@@ -76,6 +76,7 @@ describe("SokutoClient バッチ推論 & 透過キャッシュ", () => {
 
         // 2回目: 自動再送で本文が含まれる
         assert.equal(body.state, "巨大なState本文");
+        assert.equal(headers["X-State-Hash"], undefined);
         return new Response(
           JSON.stringify({
             answers: { q1: { choice: "OK", confidence: 0.99 } },

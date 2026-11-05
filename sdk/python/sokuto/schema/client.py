@@ -139,6 +139,7 @@ class SokutoClient:
                 and state != ""
             ):
                 fallback_bytes = template.build_request_bytes(state)
+                headers.pop("X-State-Hash", None)
                 response = self._client.post(
                     "/v1/systemone",
                     content=fallback_bytes,
@@ -218,6 +219,8 @@ class SokutoClient:
                 and state != ""
             ):
                 payload["state"] = state
+                payload.pop("state_hash", None)
+                headers.pop("X-State-Hash", None)
                 response = self._client.post(
                     "/v1/systemone/state-batch",
                     content=orjson.dumps(payload),
@@ -465,6 +468,7 @@ class AsyncSokutoClient:
                 and state != ""
             ):
                 fallback_bytes = template.build_request_bytes(state)
+                headers.pop("X-State-Hash", None)
                 response = await self._client.post(
                     "/v1/systemone",
                     content=fallback_bytes,
@@ -544,6 +548,8 @@ class AsyncSokutoClient:
                 and state != ""
             ):
                 payload["state"] = state
+                payload.pop("state_hash", None)
+                headers.pop("X-State-Hash", None)
                 response = await self._client.post(
                     "/v1/systemone/state-batch",
                     content=orjson.dumps(payload),

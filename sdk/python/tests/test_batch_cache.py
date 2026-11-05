@@ -135,12 +135,14 @@ def test_enable_state_offloading_fallback() -> None:
         data = orjson.loads(request.content)
         if call_count == 1:
             assert data["state"] == ""
+            assert request.headers.get("X-State-Hash") == "stale_hash"
             return httpx.Response(
                 status_code=400,
                 json={"error": {"code": "state_cache_miss", "message": "Cache Miss"}},
             )
 
         assert data["state"] == "復元すべきState本文"
+        assert "x-state-hash" not in request.headers and "X-State-Hash" not in request.headers
         return httpx.Response(
             status_code=200,
             json={

@@ -311,6 +311,8 @@ class SokutoCascadeClient:
                 and state != ""
             ):
                 payload["state"] = state
+                payload.pop("state_hash", None)
+                headers.pop("X-State-Hash", None)
                 resp = await self._client.post(
                     "/v1/systemone/state-batch",
                     json=payload,

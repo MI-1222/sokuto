@@ -67,6 +67,7 @@ pub async fn state_batch_handler(
     };
     state.guardrail_pipeline.process(&mut dummy_s1_req, None)?;
     req.questions = dummy_s1_req.questions;
+    req.state = dummy_s1_req.state;
 
     let question_count = req.questions.len();
 

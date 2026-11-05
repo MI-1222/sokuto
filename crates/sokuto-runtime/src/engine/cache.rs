@@ -880,10 +880,36 @@ impl DualSessionEngine {
         op_indices: &[i64],
         query_dims: ModelInputDimensions,
     ) -> Result<Vec<Vec<f64>>> {
+        let state_val = cached_state.as_ort_value_for_batch(query_dims.batch_size)?;
+        self.evaluate_query_with_state_value(
+            state_val.as_ref(),
+            cached_state.seq_len(),
+            state_mask,
+            query_ids,
+            query_mask,
+            op_indices,
+            query_dims,
+        )
+    }
+
+    /// 構築済みの `State` テンソル `Value` を直接バインドして質問を推論する。
+    ///
+    /// 複数チャンクのバッチ推論において、同一チャンク長の `state_val` を再利用して
+    /// リピートテンソルの再生成アロケーションをスキップするために使用する。
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_query_with_state_value(
+        &self,
+        state_val: &Value,
+        state_seq_len: usize,
+        state_mask: &[i64],
+        query_ids: &[i64],
+        query_mask: &[i64],
+        op_indices: &[i64],
+        query_dims: ModelInputDimensions,
+    ) -> Result<Vec<Vec<f64>>> {
         let batch_size = query_dims.batch_size;
         let query_seq_len = query_dims.sequence_length;
         let num_options = query_dims.num_options;
-        let state_seq_len = cached_state.seq_len();
 
         // 1. 動的軸の事前検証 (Fast-Fail)。
         if state_mask.len() != batch_size * state_seq_len {
@@ -929,9 +955,8 @@ impl DualSessionEngine {
         let mem_info = MemoryInfo::default();
 
         // 3. キャッシュ特徴量のゼロコピー / バッチ適合バインド。
-        let state_val = cached_state.as_ort_value_for_batch(batch_size)?;
         binding
-            .bind_input(TENSOR_STATE_HIDDEN_STATES, state_val.as_ref())
+            .bind_input(TENSOR_STATE_HIDDEN_STATES, state_val)
             .map_err(RuntimeError::Ort)?;
 
         // 4. `Query` 側入力テンソルのバインド。
@@ -1084,6 +1109,7 @@ impl DualSessionEngine {
         }
 
         let mut scratch_probs = Vec::new();
+        let mut reusable_state_val: Option<(usize, Arc<Value>)> = None;
 
         for chunk in tokenized_items.chunks(effective_chunk_size) {
             let chunk_len = chunk.len();
@@ -1120,8 +1146,18 @@ impl DualSessionEngine {
                 num_options: max_opts,
             };
 
-            let logits_per_sample = self.evaluate_query_with_cache(
-                cached_state,
+            let state_val = match &reusable_state_val {
+                Some((len, val)) if *len == chunk_len => Arc::clone(val),
+                _ => {
+                    let val = cached_state.as_ort_value_for_batch(chunk_len)?;
+                    reusable_state_val = Some((chunk_len, Arc::clone(&val)));
+                    val
+                }
+            };
+
+            let logits_per_sample = self.evaluate_query_with_state_value(
+                state_val.as_ref(),
+                state_seq_len,
                 &batch_state_mask,
                 &batch_query_ids,
                 &batch_query_mask,

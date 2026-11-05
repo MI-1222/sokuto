@@ -45,6 +45,12 @@ pub fn is_aligned_64<T>(ptr: *const T) -> bool {
     (ptr as usize).is_multiple_of(64)
 }
 
+/// デュアルセッション推論における推奨デフォルト最大チャンクサイズ。
+///
+/// 長文 `State` 特徴量のリピート展開による一時的なヒープメモリ確保スパイク(OOM Killer リスク) を抑制するため、
+/// 4 サンプル程度を推奨上限とする。
+pub const DEFAULT_DUAL_MAX_BATCH_CHUNK_SIZE: usize = 4;
+
 /// 64バイト境界にアライメントされた連続ヒープメモリバッファ。
 ///
 /// `SIMD` カーネルの高速演算要件（64バイトアライメント）を満たす安全な連続バッファを提供する。
@@ -452,7 +458,8 @@ impl CachedStateFeatures {
                 data.to_vec()
             }
             CachedTensorPayload::Fp16(compressed) => {
-                let mut aligned_buf = AlignedBuffer64::<f32>::with_capacity_zeroed(compressed.len());
+                let mut aligned_buf =
+                    AlignedBuffer64::<f32>::with_capacity_zeroed(compressed.len());
                 decompress_fp16_to_f32(compressed, &mut aligned_buf);
                 aligned_buf.to_vec()
             }
@@ -1054,10 +1061,21 @@ impl DualSessionEngine {
             return Ok(indexmap::IndexMap::new());
         }
 
-        let chunk_size = chunk_size.max(1);
+        let state_seq_len = cached_state.seq_len();
+        let single_sample_bytes =
+            state_seq_len * cached_state.hidden_size() * std::mem::size_of::<f32>();
+
+        let max_safe_chunk = if single_sample_bytes > 12 * 1024 * 1024 {
+            2
+        } else if single_sample_bytes > 4 * 1024 * 1024 {
+            DEFAULT_DUAL_MAX_BATCH_CHUNK_SIZE
+        } else {
+            DEFAULT_DUAL_MAX_BATCH_CHUNK_SIZE * 2
+        };
+
+        let effective_chunk_size = chunk_size.max(1).min(max_safe_chunk);
         let mut answers = indexmap::IndexMap::with_capacity(questions.len());
         let pad_id = tokenizer.pad_token_id().unwrap_or(0) as i64;
-        let state_seq_len = cached_state.seq_len();
 
         let mut tokenized_items = Vec::with_capacity(questions.len());
         for (qid, q) in questions {
@@ -1067,7 +1085,7 @@ impl DualSessionEngine {
 
         let mut scratch_probs = Vec::new();
 
-        for chunk in tokenized_items.chunks(chunk_size) {
+        for chunk in tokenized_items.chunks(effective_chunk_size) {
             let chunk_len = chunk.len();
             let max_q_len = chunk
                 .iter()
@@ -1279,13 +1297,9 @@ mod tests {
         let shape = vec![1, seq_len, hidden_size];
         let raw_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| i as f32).collect();
 
-        let features = CachedStateFeatures::new_compressed(
-            key,
-            shape,
-            &raw_data,
-            CacheCompressionMode::Fp16,
-        )
-        .expect("キャッシュエントリの作成に成功すること。");
+        let features =
+            CachedStateFeatures::new_compressed(key, shape, &raw_data, CacheCompressionMode::Fp16)
+                .expect("キャッシュエントリの作成に成功すること。");
 
         // 単一バッチ時は [1, seq_len, hidden_size]
         let val_b1 = features

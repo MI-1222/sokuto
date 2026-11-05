@@ -444,6 +444,12 @@ impl CachedStateFeatures {
     /// テンソル (`[target_batch, seq_len, hidden_size]`) を構築して返却する。
     /// 非圧縮キャッシュ時は中間ベクタを確保せず、スライス参照から直接展開先へコピーする。
     pub fn as_ort_value_for_batch(&self, target_batch: usize) -> Result<Arc<Value>> {
+        if target_batch == 0 {
+            return Err(RuntimeError::InvalidTensorData(
+                "target_batch は 1 以上である必要があります。".to_string(),
+            ));
+        }
+
         if target_batch == 1 && self.batch_size() == 1 {
             return self.as_ort_value();
         }
@@ -465,7 +471,12 @@ impl CachedStateFeatures {
             }
             CachedTensorPayload::Int8Symmetric { quantized, scales } => {
                 decompressed_buf = AlignedBuffer64::<f32>::with_capacity_zeroed(quantized.len());
-                decompress_int8_symmetric_to_f32(quantized, scales, hidden_size, &mut decompressed_buf);
+                decompress_int8_symmetric_to_f32(
+                    quantized,
+                    scales,
+                    hidden_size,
+                    &mut decompressed_buf,
+                );
                 &decompressed_buf[..]
             }
         };
@@ -1387,5 +1398,8 @@ mod tests {
         assert_eq!(d_raw.len(), 2 * seq_len * hidden_size);
         assert_eq!(&d_raw[..seq_len * hidden_size], &raw_data[..]);
         assert_eq!(&d_raw[seq_len * hidden_size..], &raw_data[..]);
+
+        // バッチサイズ 0 の不正指定時にエラーとなるゼロガードを検証。
+        assert!(features.as_ort_value_for_batch(0).is_err());
     }
 }

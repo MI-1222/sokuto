@@ -17,9 +17,9 @@ use std::time::Duration;
 
 use half::f16;
 use moka::sync::Cache;
-use ort::memory::MemoryInfo;
+use ort::memory::{Allocator, MemoryInfo};
 use ort::session::Session;
-use ort::value::Value;
+use ort::value::{Tensor, Value};
 use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_core::contract::model_spec::{
     ModelInputDimensions, TENSOR_ATTENTION_MASK, TENSOR_INPUT_IDS, TENSOR_LOGITS,
@@ -351,11 +351,10 @@ impl CachedStateFeatures {
         } else {
             0
         };
-        let final_mask = if state_mask.is_empty() && total_tokens > 0 {
-            vec![1i64; total_tokens]
-        } else {
-            state_mask
-        };
+        let mut state_mask = state_mask;
+        if state_mask.is_empty() && total_tokens > 0 {
+            state_mask.resize(total_tokens, 1i64);
+        }
 
         Self {
             hash_key,
@@ -363,7 +362,7 @@ impl CachedStateFeatures {
             payload: CachedTensorPayload::Raw(Arc::new(ort_value)),
             byte_size,
             compression_mode: CacheCompressionMode::None,
-            state_mask: final_mask,
+            state_mask,
         }
     }
 
@@ -395,24 +394,28 @@ impl CachedStateFeatures {
         } else {
             0
         };
-        let final_mask = if state_mask.is_empty() && total_tokens > 0 {
-            vec![1i64; total_tokens]
-        } else {
-            state_mask
-        };
+        let mut state_mask = state_mask;
+        if state_mask.is_empty() && total_tokens > 0 {
+            state_mask.resize(total_tokens, 1i64);
+        }
 
         match mode {
             CacheCompressionMode::None => {
-                let val = Value::from_array((shape.clone(), raw_slice.to_vec()))
+                let allocator = Allocator::default();
+                let mut tensor =
+                    Tensor::<f32>::new(&allocator, shape.clone()).map_err(RuntimeError::Ort)?;
+                let (_, dst) = tensor
+                    .try_extract_tensor_mut::<f32>()
                     .map_err(RuntimeError::Ort)?;
+                dst.copy_from_slice(raw_slice);
                 let byte_size = std::mem::size_of_val(raw_slice);
                 Ok(Self {
                     hash_key,
                     shape,
-                    payload: CachedTensorPayload::Raw(Arc::new(val.into())),
+                    payload: CachedTensorPayload::Raw(Arc::new(tensor.into_dyn())),
                     byte_size,
                     compression_mode: mode,
-                    state_mask: final_mask,
+                    state_mask,
                 })
             }
             CacheCompressionMode::Fp16 => {
@@ -424,7 +427,7 @@ impl CachedStateFeatures {
                     payload: CachedTensorPayload::Fp16(Arc::new(compressed)),
                     byte_size,
                     compression_mode: mode,
-                    state_mask: final_mask,
+                    state_mask,
                 })
             }
             CacheCompressionMode::Int8Symmetric => {
@@ -440,7 +443,7 @@ impl CachedStateFeatures {
                     },
                     byte_size,
                     compression_mode: mode,
-                    state_mask: final_mask,
+                    state_mask,
                 })
             }
         }
@@ -449,27 +452,30 @@ impl CachedStateFeatures {
     /// 推論入力としてバインド可能な `Arc<Value>` を取得する。
     ///
     /// 非圧縮時は保持している `Arc<Value>` をそのままゼロコピーで返却し、
-    /// 圧縮時はオンザフライで64バイト整列バッファへ展開して新しい `Value` を生成する。
+    /// 圧縮時はオンザフライで ONNX Runtime のアロケータメモリへ直接デコードを展開してテンソルを生成する。
     pub fn as_ort_value(&self) -> Result<Arc<Value>> {
         match &self.payload {
             CachedTensorPayload::Raw(val) => Ok(Arc::clone(val)),
             CachedTensorPayload::Fp16(compressed) => {
-                let mut aligned_buf =
-                    AlignedBuffer64::<f32>::with_capacity_zeroed(compressed.len());
-                decompress_fp16_to_f32(compressed, &mut aligned_buf);
-
-                let val = Value::from_array((self.shape.clone(), aligned_buf.to_vec()))
+                let allocator = Allocator::default();
+                let mut tensor = Tensor::<f32>::new(&allocator, self.shape.clone())
                     .map_err(RuntimeError::Ort)?;
-                Ok(Arc::new(val.into()))
+                let (_, dst) = tensor
+                    .try_extract_tensor_mut::<f32>()
+                    .map_err(RuntimeError::Ort)?;
+                decompress_fp16_to_f32(compressed, dst);
+                Ok(Arc::new(tensor.into_dyn()))
             }
             CachedTensorPayload::Int8Symmetric { quantized, scales } => {
                 let hidden_size = self.hidden_size();
-                let mut aligned_buf = AlignedBuffer64::<f32>::with_capacity_zeroed(quantized.len());
-                decompress_int8_symmetric_to_f32(quantized, scales, hidden_size, &mut aligned_buf);
-
-                let val = Value::from_array((self.shape.clone(), aligned_buf.to_vec()))
+                let allocator = Allocator::default();
+                let mut tensor = Tensor::<f32>::new(&allocator, self.shape.clone())
                     .map_err(RuntimeError::Ort)?;
-                Ok(Arc::new(val.into()))
+                let (_, dst) = tensor
+                    .try_extract_tensor_mut::<f32>()
+                    .map_err(RuntimeError::Ort)?;
+                decompress_int8_symmetric_to_f32(quantized, scales, hidden_size, dst);
+                Ok(Arc::new(tensor.into_dyn()))
             }
         }
     }
@@ -478,8 +484,8 @@ impl CachedStateFeatures {
     ///
     /// `target_batch == 1` かつ自身のバッチサイズが 1 の場合はゼロコピー返却する。
     /// `target_batch > 1` の場合は、単一サンプルの特徴量データを `target_batch` 回リピートした
-    /// テンソル (`[target_batch, seq_len, hidden_size]`) を構築して返却する。
-    /// 非圧縮キャッシュ時は中間ベクタを確保せず、スライス参照から直接展開先へコピーする。
+    /// テンソル (`[target_batch, seq_len, hidden_size]`) を ONNX Runtime アロケータメモリへ直接構築して返却する。
+    /// 中間ベクタのヒープ確保と再アロケーションを回避し、64バイトアライメントを維持する。
     pub fn as_ort_value_for_batch(&self, target_batch: usize) -> Result<Arc<Value>> {
         if target_batch == 0 {
             return Err(RuntimeError::InvalidTensorData(
@@ -494,38 +500,39 @@ impl CachedStateFeatures {
         let seq_len = self.seq_len();
         let hidden_size = self.hidden_size();
         let single_len = seq_len * hidden_size;
+        let target_shape = vec![target_batch, seq_len, hidden_size];
 
-        let mut decompressed_buf;
-        let single_slice: &[f32] = match &self.payload {
+        let allocator = Allocator::default();
+        let mut tensor = Tensor::<f32>::new(&allocator, target_shape).map_err(RuntimeError::Ort)?;
+        let (_, dst) = tensor
+            .try_extract_tensor_mut::<f32>()
+            .map_err(RuntimeError::Ort)?;
+
+        match &self.payload {
             CachedTensorPayload::Raw(val) => {
-                let (_, data) = val.try_extract_tensor::<f32>().map_err(RuntimeError::Ort)?;
-                data
+                let (_, single_slice) =
+                    val.try_extract_tensor::<f32>().map_err(RuntimeError::Ort)?;
+                for chunk in dst.chunks_exact_mut(single_len) {
+                    chunk.copy_from_slice(single_slice);
+                }
             }
             CachedTensorPayload::Fp16(compressed) => {
-                decompressed_buf = AlignedBuffer64::<f32>::with_capacity_zeroed(compressed.len());
-                decompress_fp16_to_f32(compressed, &mut decompressed_buf);
-                &decompressed_buf[..]
+                let (first_chunk, rest) = dst.split_at_mut(single_len);
+                decompress_fp16_to_f32(compressed, first_chunk);
+                for chunk in rest.chunks_exact_mut(single_len) {
+                    chunk.copy_from_slice(first_chunk);
+                }
             }
             CachedTensorPayload::Int8Symmetric { quantized, scales } => {
-                decompressed_buf = AlignedBuffer64::<f32>::with_capacity_zeroed(quantized.len());
-                decompress_int8_symmetric_to_f32(
-                    quantized,
-                    scales,
-                    hidden_size,
-                    &mut decompressed_buf,
-                );
-                &decompressed_buf[..]
+                let (first_chunk, rest) = dst.split_at_mut(single_len);
+                decompress_int8_symmetric_to_f32(quantized, scales, hidden_size, first_chunk);
+                for chunk in rest.chunks_exact_mut(single_len) {
+                    chunk.copy_from_slice(first_chunk);
+                }
             }
-        };
-
-        let mut repeated = Vec::with_capacity(target_batch * single_len);
-        for _ in 0..target_batch {
-            repeated.extend_from_slice(single_slice);
         }
 
-        let target_shape = vec![target_batch, seq_len, hidden_size];
-        let val = Value::from_array((target_shape, repeated)).map_err(RuntimeError::Ort)?;
-        Ok(Arc::new(val.into()))
+        Ok(Arc::new(tensor.into_dyn()))
     }
 
     /// バッチサイズを取得する。

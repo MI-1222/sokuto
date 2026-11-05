@@ -133,6 +133,12 @@ fn test_8_4_3_fp16_and_int8_compression_fidelity() {
         .try_extract_tensor::<f32>()
         .expect("テンソル抽出に失敗しました。");
 
+    // ort デフォルト CPU アロケータによる 64 バイト整列メモリ確保の検証。
+    assert!(
+        is_aligned_64(fp16_restored.as_ptr()),
+        "FP16 展開後のテンソルが 64 バイト整列していません。"
+    );
+
     let mut max_fp16_err = 0.0f32;
     for (&orig, &rest) in synthetic_data.iter().zip(fp16_restored.iter()) {
         let err = (orig - rest).abs();
@@ -166,6 +172,25 @@ fn test_8_4_3_fp16_and_int8_compression_fidelity() {
     let (_, int8_restored) = int8_val
         .try_extract_tensor::<f32>()
         .expect("テンソル抽出に失敗しました。");
+
+    // ort デフォルト CPU アロケータによる 64 バイト整列メモリ確保の検証。
+    assert!(
+        is_aligned_64(int8_restored.as_ptr()),
+        "INT8 展開後のテンソルが 64 バイト整列していません。"
+    );
+
+    // バッチ展開時 (as_ort_value_for_batch) の直接展開と 64 バイト整列メモリ確保の検証。
+    let b2_val = int8_entry
+        .as_ort_value_for_batch(2)
+        .expect("バッチ展開に失敗しました。");
+    let (_, b2_restored) = b2_val
+        .try_extract_tensor::<f32>()
+        .expect("バッチテンソル抽出に失敗しました。");
+    assert!(
+        is_aligned_64(b2_restored.as_ptr()),
+        "バッチ展開後のテンソルが 64 バイト整列していません。"
+    );
+    assert_eq!(b2_restored.len(), 2 * total_elements);
 
     let mut max_int8_err = 0.0f32;
     for (&orig, &rest) in synthetic_data.iter().zip(int8_restored.iter()) {

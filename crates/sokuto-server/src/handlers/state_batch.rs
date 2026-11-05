@@ -88,9 +88,10 @@ pub async fn state_batch_handler(
 
     let (state_key, _state_cache_hit_initial) = if is_state_empty {
         if let Some(ref h_str) = client_hash_str {
-            let key = u64::from_str_radix(h_str.trim_start_matches("0x"), 16).map_err(|e| {
-                ServerError::BadRequest(format!("無効な State ハッシュです: {e}。"))
-            })?;
+            let key =
+                u64::from_str_radix(h_str.trim().trim_start_matches("0x"), 16).map_err(|e| {
+                    ServerError::BadRequest(format!("無効な State ハッシュです: {e}。"))
+                })?;
             let has_cache = state
                 .cache_manager
                 .as_ref()

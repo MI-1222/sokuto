@@ -16,13 +16,21 @@ fn test_cached_state_features_dimensions() {
     let key = 0xABCD_1234;
     let shape = vec![2, 32, 128];
     let data = vec![0.0f32; 2 * 32 * 128];
-    let entry = CachedStateFeatures::new_compressed(key, shape, &data, CacheCompressionMode::None)
-        .expect("キャッシュエントリ作成に失敗しました。");
+    let mask = vec![1i64; 2 * 32];
+    let entry = CachedStateFeatures::new_compressed(
+        key,
+        shape,
+        &data,
+        CacheCompressionMode::None,
+        mask.clone(),
+    )
+    .expect("キャッシュエントリ作成に失敗しました。");
 
     assert_eq!(entry.batch_size(), 2);
     assert_eq!(entry.seq_len(), 32);
     assert_eq!(entry.hidden_size(), 128);
     assert_eq!(entry.compression_mode, CacheCompressionMode::None);
+    assert_eq!(entry.state_mask, mask);
 }
 
 #[test]
@@ -46,12 +54,14 @@ fn test_8_4_1_xxhash3_and_moka_cache_concurrency() {
     // 2. 特徴量エントリの作成と登録。
     let shape = vec![1, 16, 64];
     let raw_data = vec![0.5f32; 16 * 64];
+    let mask = vec![1i64; 16];
     let features = Arc::new(
         CachedStateFeatures::new_compressed(
             key,
             shape.clone(),
             &raw_data,
             CacheCompressionMode::None,
+            mask.clone(),
         )
         .expect("キャッシュエントリの作成に失敗しました。"),
     );
@@ -102,6 +112,7 @@ fn test_8_4_3_fp16_and_int8_compression_fidelity() {
 
     let key = 0x1234_5678_9ABC_DEF0;
     let shape = vec![1, seq_len, hidden_size];
+    let mask = vec![1i64; seq_len];
 
     // 1. `FP16` 圧縮保持と展開精度の検証 (目標: Atol <= 2e-3)。
     let fp16_entry = CachedStateFeatures::new_compressed(
@@ -109,6 +120,7 @@ fn test_8_4_3_fp16_and_int8_compression_fidelity() {
         shape.clone(),
         &synthetic_data,
         CacheCompressionMode::Fp16,
+        mask.clone(),
     )
     .expect("FP16 エントリの作成に失敗しました。");
 
@@ -139,6 +151,7 @@ fn test_8_4_3_fp16_and_int8_compression_fidelity() {
         shape.clone(),
         &synthetic_data,
         CacheCompressionMode::Int8Symmetric,
+        mask,
     )
     .expect("INT8 エントリの作成に失敗しました。");
 
@@ -244,4 +257,58 @@ fn test_op_indices_minus_one_padding_semantics() {
         let is_valid = idx == -1 || (idx >= 0 && idx < query_seq_len as i64);
         assert!(!is_valid, "無効なインデックスである必要があります: {idx}");
     }
+}
+
+#[test]
+fn test_state_mask_padding_preservation_and_batch_replication() {
+    let key = 0x5555_AAAA_1234_5678;
+    let seq_len = 6;
+    let hidden_size = 16;
+    let shape = vec![1, seq_len, hidden_size];
+    let data = vec![0.1f32; seq_len * hidden_size];
+
+    // 先頭4トークンが有効で末尾2トークンがパディング（0）のマスク。
+    let padded_mask = vec![1i64, 1, 1, 1, 0, 0];
+
+    let entry = CachedStateFeatures::new_compressed(
+        key,
+        shape,
+        &data,
+        CacheCompressionMode::None,
+        padded_mask.clone(),
+    )
+    .expect("キャッシュエントリ作成に成功すること。");
+
+    assert_eq!(entry.state_mask, padded_mask);
+
+    // バッチサイズ 1 への複製検証。
+    let mask_b1 = entry.state_mask_for_batch(1);
+    assert_eq!(mask_b1, vec![1i64, 1, 1, 1, 0, 0]);
+
+    // バッチサイズ 3 への複製検証。各サンプルでパディング位置が正確に維持されることを確認。
+    let mask_b3 = entry.state_mask_for_batch(3);
+    assert_eq!(
+        mask_b3,
+        vec![
+            1i64, 1, 1, 1, 0, 0, // サンプル 0
+            1, 1, 1, 1, 0, 0, // サンプル 1
+            1, 1, 1, 1, 0, 0, // サンプル 2
+        ]
+    );
+
+    // 空マスク指定時の全有効フォールバック検証。
+    let empty_mask_entry = CachedStateFeatures::new_compressed(
+        key,
+        vec![1, seq_len, hidden_size],
+        &data,
+        CacheCompressionMode::None,
+        vec![],
+    )
+    .expect("空マスク指定時でも自動補完されること。");
+
+    assert_eq!(empty_mask_entry.state_mask, vec![1i64; seq_len]);
+    assert_eq!(
+        empty_mask_entry.state_mask_for_batch(2),
+        vec![1i64; 2 * seq_len]
+    );
 }

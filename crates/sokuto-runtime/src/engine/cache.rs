@@ -326,6 +326,8 @@ pub struct CachedStateFeatures {
     pub byte_size: usize,
     /// 採用された圧縮モード。
     pub compression_mode: CacheCompressionMode,
+    /// `State` の有効トークンアテンションマスク列 (`[batch_size, seq_len]`)。
+    pub state_mask: Vec<i64>,
 }
 
 impl CachedStateFeatures {
@@ -336,13 +338,32 @@ impl CachedStateFeatures {
     /// - `shape`: テンソル形状。
     /// - `ort_value`: ONNX Runtimeの出力 `Value`。
     /// - `byte_size`: 占有バイト数。
-    pub fn new_raw(hash_key: u64, shape: Vec<usize>, ort_value: Value, byte_size: usize) -> Self {
+    /// - `state_mask`: `State` 有効トークンマスク列。空の場合は全トークン有効 (`1`) として補完される。
+    pub fn new_raw(
+        hash_key: u64,
+        shape: Vec<usize>,
+        ort_value: Value,
+        byte_size: usize,
+        state_mask: Vec<i64>,
+    ) -> Self {
+        let total_tokens = if shape.len() >= 2 {
+            shape[0] * shape[1]
+        } else {
+            0
+        };
+        let final_mask = if state_mask.is_empty() && total_tokens > 0 {
+            vec![1i64; total_tokens]
+        } else {
+            state_mask
+        };
+
         Self {
             hash_key,
             shape,
             payload: CachedTensorPayload::Raw(Arc::new(ort_value)),
             byte_size,
             compression_mode: CacheCompressionMode::None,
+            state_mask: final_mask,
         }
     }
 
@@ -353,11 +374,13 @@ impl CachedStateFeatures {
     /// - `shape`: テンソル形状 (`[batch_size, seq_len, hidden_size]`)。
     /// - `raw_slice`: 展開済み `f32` スライス。
     /// - `mode`: 圧縮モード。
+    /// - `state_mask`: `State` 有効トークンマスク列。空の場合は全トークン有効 (`1`) として補完される。
     pub fn new_compressed(
         hash_key: u64,
         shape: Vec<usize>,
         raw_slice: &[f32],
         mode: CacheCompressionMode,
+        state_mask: Vec<i64>,
     ) -> Result<Self> {
         let hidden_size = if shape.len() >= 3 {
             shape[2]
@@ -365,6 +388,17 @@ impl CachedStateFeatures {
             return Err(RuntimeError::ModelContractViolation(format!(
                 "State特徴量は3次元テンソルである必要があります: {shape:?}。"
             )));
+        };
+
+        let total_tokens = if shape.len() >= 2 {
+            shape[0] * shape[1]
+        } else {
+            0
+        };
+        let final_mask = if state_mask.is_empty() && total_tokens > 0 {
+            vec![1i64; total_tokens]
+        } else {
+            state_mask
         };
 
         match mode {
@@ -378,6 +412,7 @@ impl CachedStateFeatures {
                     payload: CachedTensorPayload::Raw(Arc::new(val.into())),
                     byte_size,
                     compression_mode: mode,
+                    state_mask: final_mask,
                 })
             }
             CacheCompressionMode::Fp16 => {
@@ -389,6 +424,7 @@ impl CachedStateFeatures {
                     payload: CachedTensorPayload::Fp16(Arc::new(compressed)),
                     byte_size,
                     compression_mode: mode,
+                    state_mask: final_mask,
                 })
             }
             CacheCompressionMode::Int8Symmetric => {
@@ -404,6 +440,7 @@ impl CachedStateFeatures {
                     },
                     byte_size,
                     compression_mode: mode,
+                    state_mask: final_mask,
                 })
             }
         }
@@ -512,6 +549,34 @@ impl CachedStateFeatures {
         } else {
             0
         }
+    }
+
+    /// 指定されたバッチサイズに合わせて複製された `state_mask` を取得する。
+    ///
+    /// キャッシュされた単一 `State` のマスク列 (`[state_seq_len]`) を `target_batch` 回リピートした
+    /// テンソル用フラットベクタ (`[target_batch * state_seq_len]`) を生成する。
+    pub fn state_mask_for_batch(&self, target_batch: usize) -> Vec<i64> {
+        let seq_len = self.seq_len();
+        let mut repeated = Vec::with_capacity(target_batch * seq_len);
+        let mask_slice = if self.state_mask.len() == seq_len {
+            &self.state_mask[..]
+        } else if self.state_mask.len() >= seq_len {
+            &self.state_mask[..seq_len]
+        } else {
+            &[]
+        };
+
+        if mask_slice.len() == seq_len {
+            for _ in 0..target_batch {
+                repeated.extend_from_slice(mask_slice);
+            }
+        } else {
+            let fallback = vec![1i64; seq_len];
+            for _ in 0..target_batch {
+                repeated.extend_from_slice(&fallback);
+            }
+        }
+        repeated
     }
 }
 
@@ -855,7 +920,11 @@ impl DualSessionEngine {
             let total_elements: usize = shape_vec.iter().product();
             let byte_size = total_elements * std::mem::size_of::<f32>();
             Arc::new(CachedStateFeatures::new_raw(
-                key, shape_vec, state_val, byte_size,
+                key,
+                shape_vec,
+                state_val,
+                byte_size,
+                attention_mask.to_vec(),
             ))
         } else {
             Arc::new(CachedStateFeatures::new_compressed(
@@ -863,6 +932,7 @@ impl DualSessionEngine {
                 shape_vec,
                 flat_data,
                 compression,
+                attention_mask.to_vec(),
             )?)
         };
 
@@ -1138,7 +1208,7 @@ impl DualSessionEngine {
             let mut batch_query_ids = vec![pad_id; chunk_len * max_q_len];
             let mut batch_query_mask = vec![0i64; chunk_len * max_q_len];
             let mut batch_op_indices = vec![-1i64; chunk_len * max_opts];
-            let batch_state_mask = vec![1i64; chunk_len * state_seq_len];
+            let batch_state_mask = cached_state.state_mask_for_batch(chunk_len);
 
             for (i, (_, _, t)) in chunk.iter().enumerate() {
                 let q_len = t.input_ids.len();
@@ -1315,9 +1385,16 @@ mod tests {
 
         let shape = vec![1, 8, 16];
         let raw_data = vec![0.1f32; 8 * 16];
+        let state_mask = vec![1i64; 8];
         let features = Arc::new(
-            CachedStateFeatures::new_compressed(key, shape, &raw_data, CacheCompressionMode::Fp16)
-                .unwrap(),
+            CachedStateFeatures::new_compressed(
+                key,
+                shape,
+                &raw_data,
+                CacheCompressionMode::Fp16,
+                state_mask,
+            )
+            .unwrap(),
         );
 
         manager.insert(key, Arc::clone(&features));
@@ -1328,6 +1405,7 @@ mod tests {
         assert_eq!(retrieved.hash_key, key);
         assert_eq!(retrieved.seq_len(), 8);
         assert_eq!(retrieved.hidden_size(), 16);
+        assert_eq!(retrieved.state_mask, vec![1i64; 8]);
         assert!(manager.weighted_size() > 0);
 
         manager.invalidate(key);
@@ -1343,10 +1421,17 @@ mod tests {
         let hidden_size = 8;
         let shape = vec![1, seq_len, hidden_size];
         let raw_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| i as f32).collect();
+        // パディングを含むマスク列 (先頭3トークン有効、4トークン目パディング)
+        let custom_state_mask = vec![1i64, 1, 1, 0];
 
-        let features =
-            CachedStateFeatures::new_compressed(key, shape, &raw_data, CacheCompressionMode::Fp16)
-                .expect("キャッシュエントリの作成に成功すること。");
+        let features = CachedStateFeatures::new_compressed(
+            key,
+            shape,
+            &raw_data,
+            CacheCompressionMode::Fp16,
+            custom_state_mask.clone(),
+        )
+        .expect("キャッシュエントリの作成に成功すること。");
 
         // 単一バッチ時は [1, seq_len, hidden_size]
         let val_b1 = features
@@ -1377,6 +1462,11 @@ mod tests {
             }
         }
 
+        // state_mask_for_batch のリピート展開とパディング維持の検証
+        let mask_b3 = features.state_mask_for_batch(3);
+        assert_eq!(mask_b3.len(), 3 * seq_len);
+        assert_eq!(mask_b3, vec![1i64, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0]);
+
         // 非圧縮 (Raw) キャッシュ時の中間アロケーション回避とリピート展開の検証
         let raw_shape = vec![1, seq_len, hidden_size];
         let raw_val = Value::from_array((raw_shape.clone(), raw_data.clone()))
@@ -1386,6 +1476,7 @@ mod tests {
             raw_shape,
             raw_val.into(),
             raw_data.len() * std::mem::size_of::<f32>(),
+            custom_state_mask,
         );
 
         let raw_b2 = raw_features

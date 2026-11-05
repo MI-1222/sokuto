@@ -35,7 +35,7 @@ pub use error::{Result, RuntimeError};
 pub use hierarchical::{
     CoarseToFineRouter, DEFAULT_BEAM_MARGIN_THRESHOLD, DEFAULT_CATCHALL_THRESHOLD,
     DEFAULT_COARSE_POWER_ALPHA, DEFAULT_ENTROPY_TEMP_GAMMA, DEFAULT_ESCALATE_CONFIDENCE_THRESHOLD,
-    DirichletCalibrator, HierarchicalExecutionTrace, HierarchicalMapping,
+    DirichletCalibrator, HierarchicalEngine, HierarchicalExecutionTrace, HierarchicalMapping,
     HierarchicalMappingBuilder, HierarchicalResult, HierarchicalRouterConfig,
     combine_and_reconstruct_probabilities, compute_fine_temperature, compute_normalized_entropy,
     softmax_f64, temperature_scaled_softmax,

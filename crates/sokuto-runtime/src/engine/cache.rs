@@ -26,7 +26,7 @@ use sokuto_core::contract::model_spec::{
     TENSOR_OP_INDICES, TENSOR_QUERY_IDS, TENSOR_QUERY_MASK, TENSOR_STATE_HIDDEN_STATES,
     TENSOR_STATE_MASK,
 };
-use sokuto_core::decision::evaluate_question_with_buf;
+use sokuto_core::decision::{evaluate_question, evaluate_question_with_buf};
 use sokuto_core::gating::GatingConfig;
 use sokuto_core::schema::{Answer, Question};
 use xxhash_rust::xxh3::xxh3_64;
@@ -35,7 +35,7 @@ use crate::engine::config::{ExecutionProvider, SessionConfig};
 use crate::engine::gating::{apply_gating_to_answer_with_energy, calculate_choice_energy};
 use crate::engine::session::create_session_builder;
 use crate::error::{Result, RuntimeError};
-use crate::tokenizer::JevTokenizer;
+use crate::tokenizer::{JevTokenizer, TokenizedQuestion};
 
 /// 64バイト境界メモリアライメント判定関数。
 ///
@@ -1284,6 +1284,95 @@ impl DualSessionEngine {
         }
 
         Ok(answers)
+    }
+
+    /// 単一の質問クエリに対する各選択肢の生ロジット列 (`Vec<f64>`) を抽出する。
+    ///
+    /// # 引数
+    /// - `cached_state`: エンコード済みの中間特徴量キャッシュ。
+    /// - `tokenized`: トークナイズ済みの質問クエリ。
+    ///
+    /// # 戻り値
+    /// 該当質問の各選択肢 (`[OP]`) に対応する生ロジット列。
+    pub fn forward_query_raw(
+        &self,
+        cached_state: &CachedStateFeatures,
+        tokenized: &TokenizedQuestion,
+    ) -> Result<Vec<f64>> {
+        let batch_state_mask = cached_state.state_mask_for_batch(1);
+        let query_dims = ModelInputDimensions {
+            batch_size: 1,
+            sequence_length: tokenized.input_ids.len(),
+            num_options: tokenized.op_indices.len(),
+        };
+        let mut logits = self.evaluate_query_with_cache(
+            cached_state,
+            &batch_state_mask,
+            &tokenized.input_ids,
+            &tokenized.attention_mask,
+            &tokenized.op_indices,
+            query_dims,
+        )?;
+        let sample_logits = logits.pop().unwrap_or_default();
+        let k = tokenized.op_indices.len();
+        Ok(sample_logits.into_iter().take(k).collect())
+    }
+
+    /// 単一の質問定義とキャッシュ済み `State` から各選択肢の未正規化生ロジット列 (`Vec<f64>`) を直接抽出する。
+    ///
+    /// # 引数
+    /// - `tokenizer`: Jev 高速トークナイザー。
+    /// - `cached_state`: エンコード済みの中間特徴量キャッシュ。
+    /// - `question`: 質問仕様。
+    ///
+    /// # 戻り値
+    /// 各選択肢の未正規化生ロジット列。
+    pub fn forward_question_raw(
+        &self,
+        tokenizer: &JevTokenizer,
+        cached_state: &CachedStateFeatures,
+        question: &Question,
+    ) -> Result<Vec<f64>> {
+        let tokenized = tokenizer.encode_query(question)?;
+        self.forward_query_raw(cached_state, &tokenized)
+    }
+
+    /// 単一の質問をキャッシュ済み `State` に対して推論し、決定結果 (`Answer`) を返却する。
+    ///
+    /// # 引数
+    /// - `tokenizer`: Jev 高速トークナイザー。
+    /// - `cached_state`: エンコード済みの中間特徴量キャッシュ。
+    /// - `state_text`: 任意で渡す文脈テキスト (ゲーティングメタデータ用)。
+    /// - `question`: 質問仕様。
+    /// - `calib_config`: 較正温度設定。
+    ///
+    /// # 戻り値
+    /// 確率較正済みの `Answer`。
+    pub fn predict_single_question(
+        &self,
+        tokenizer: &JevTokenizer,
+        cached_state: &CachedStateFeatures,
+        state_text: Option<&str>,
+        question: &Question,
+        calib_config: &CalibrationConfig,
+    ) -> Result<Answer> {
+        let tokenized = tokenizer.encode_query(question)?;
+        let logits = self.forward_query_raw(cached_state, &tokenized)?;
+        let mut answer =
+            evaluate_question(question, &logits, calib_config).map_err(RuntimeError::Core)?;
+
+        let energy = calculate_choice_energy(question, &logits, calib_config);
+        apply_gating_to_answer_with_energy(
+            &mut answer,
+            energy,
+            state_text,
+            None,
+            Some(question),
+            None,
+            calib_config,
+        );
+
+        Ok(answer)
     }
 }
 

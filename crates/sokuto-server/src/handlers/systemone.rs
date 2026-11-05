@@ -186,21 +186,91 @@ pub async fn system_one_handler(
                     (cached, "MISS")
                 };
 
-                let ans = de.evaluate_batch_questions_with_cache(
-                    &tokenizer,
-                    &cached_state,
-                    if is_state_empty {
-                        None
-                    } else {
-                        Some(&state_text)
-                    },
-                    &questions,
-                    &calib_config,
-                    Some(&gating_config),
-                    chunk_size,
-                )?;
+                if has_hierarchical_target {
+                    let mapping = hierarchical_mapping
+                        .as_ref()
+                        .expect("マッピングが存在すること。");
+                    let router = CoarseToFineRouter::new_dual(
+                        de,
+                        &cached_state,
+                        &tokenizer,
+                        mapping.as_ref(),
+                        &calib_config,
+                        hierarchical_config,
+                    )?;
 
-                (ans, status_str)
+                    let mut combined_answers = indexmap::IndexMap::with_capacity(questions.len());
+                    let mut fallback_questions = indexmap::IndexMap::new();
+
+                    for (qid, question) in &questions {
+                        let is_hierarchical = question.question_type == QuestionType::Choice
+                            && question
+                                .criteria
+                                .as_ref()
+                                .and_then(|c| c.as_map())
+                                .map(|m| {
+                                    let k = m.len();
+                                    (auto_hierarchical && k > 8 || k > 16)
+                                        && m.keys()
+                                            .any(|key| mapping.fine_to_coarse.contains_key(key))
+                                })
+                                .unwrap_or(false);
+
+                        if is_hierarchical {
+                            let res = router.route(
+                                &state_text,
+                                &question.instructions,
+                                Some(&gating_config),
+                            )?;
+                            if res.trace().soft_beam_triggered {
+                                record_hierarchical_soft_beam();
+                            }
+                            if res.trace().early_exit_triggered {
+                                record_hierarchical_early_exit();
+                            }
+                            combined_answers.insert(qid.clone(), res.into_answer());
+                        } else {
+                            fallback_questions.insert(qid.clone(), question.clone());
+                        }
+                    }
+
+                    if !fallback_questions.is_empty() {
+                        let fallback_answers = de.evaluate_batch_questions_with_cache(
+                            &tokenizer,
+                            &cached_state,
+                            if is_state_empty {
+                                None
+                            } else {
+                                Some(&state_text)
+                            },
+                            &fallback_questions,
+                            &calib_config,
+                            Some(&gating_config),
+                            chunk_size,
+                        )?;
+                        for (qid, answer) in fallback_answers {
+                            combined_answers.insert(qid, answer);
+                        }
+                    }
+
+                    (combined_answers, status_str)
+                } else {
+                    let ans = de.evaluate_batch_questions_with_cache(
+                        &tokenizer,
+                        &cached_state,
+                        if is_state_empty {
+                            None
+                        } else {
+                            Some(&state_text)
+                        },
+                        &questions,
+                        &calib_config,
+                        Some(&gating_config),
+                        chunk_size,
+                    )?;
+
+                    (ans, status_str)
+                }
             } else if has_hierarchical_target {
                 let mapping = hierarchical_mapping
                     .as_ref()

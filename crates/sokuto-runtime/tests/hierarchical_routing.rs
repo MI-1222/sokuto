@@ -298,3 +298,68 @@ fn test_evaluate_batch_questions_hierarchical() {
     assert!(batch_results.get("q1").unwrap().answer().choice.is_some());
     assert!(batch_results.get("q2").unwrap().answer().choice.is_some());
 }
+
+#[test]
+fn test_hierarchical_routing_new_dual_session_engine() {
+    let state_model_path = default_model_dir().join("state_encoder.onnx");
+    let query_model_path = default_model_dir().join("query_evaluator.onnx");
+    if !state_model_path.exists() || !query_model_path.exists() {
+        return;
+    }
+
+    let tokenizer = match init_default_tokenizer() {
+        Some(t) => t,
+        None => return,
+    };
+
+    let calib_config = init_default_calibration();
+    let session_config = SessionConfig::default();
+    let cache_manager = std::sync::Arc::new(sokuto_runtime::engine::StateCacheManager::new(
+        64 * 1024 * 1024,
+        600,
+        sokuto_runtime::engine::CacheCompressionMode::Fp16,
+    ));
+
+    let dual_engine = match sokuto_runtime::engine::DualSessionEngine::new(
+        &state_model_path,
+        &query_model_path,
+        session_config,
+        cache_manager,
+    ) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let state = "カードを落としたので止めてください。";
+    let (s_ids, s_mask) = tokenizer
+        .encode_state_tensor(state)
+        .expect("Stateのエンコードに成功すること。");
+    let cached_state = dual_engine
+        .encode_and_cache_state(state, &s_ids, &s_mask, [1, s_ids.len()])
+        .expect("Stateのキャッシュに成功すること。");
+
+    let mapping = HierarchicalMapping::banking77();
+    let config = HierarchicalRouterConfig::default();
+
+    let router = sokuto_runtime::hierarchical::CoarseToFineRouter::new_dual(
+        &dual_engine,
+        &cached_state,
+        &tokenizer,
+        &mapping,
+        &calib_config,
+        config,
+    )
+    .expect("デュアルエンジンのルーター初期化に成功すること。");
+
+    let result = router
+        .route(
+            state,
+            "カードの紛失手続きについてカテゴリを選んでください。",
+            None,
+        )
+        .expect("デュアルセッションによる階層推論に成功すること。");
+
+    let answer = result.answer();
+    assert!(answer.choice.is_some());
+    assert!(result.trace().evaluated_fine_count > 0);
+}

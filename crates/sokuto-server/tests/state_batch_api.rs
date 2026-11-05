@@ -19,6 +19,7 @@ use sokuto_core::schema::{
 use sokuto_runtime::engine::{
     CacheCompressionMode, CoarseToFineConfig, InferenceEngine, SessionConfig, StateCacheManager,
 };
+use sokuto_runtime::hierarchical::HierarchicalMapping;
 use sokuto_runtime::tokenizer::JevTokenizer;
 use sokuto_server::create_router;
 use sokuto_server::state::AppState;
@@ -80,6 +81,8 @@ fn init_test_app_state() -> Option<Arc<AppState>> {
         16,
     );
     state.cache_manager = Some(cache_manager);
+    state.hierarchical_mapping = Some(Arc::new(HierarchicalMapping::banking77()));
+    state.auto_hierarchical = true;
 
     Some(Arc::new(state))
 }
@@ -235,4 +238,109 @@ async fn test_state_batch_endpoint() {
     assert!(res.answers.contains_key("sentiment"));
     assert!(res.answers.contains_key("factual"));
     assert!(res.usage.prompt_tokens > 0);
+}
+
+#[tokio::test]
+async fn test_systemone_auto_hierarchical_routing() {
+    let state = match init_test_app_state() {
+        Some(s) => s,
+        None => {
+            eprintln!("スキップ: モデルまたはトークナイザーが存在しません。");
+            return;
+        }
+    };
+
+    let app = create_router(state, None);
+
+    let mapping = HierarchicalMapping::banking77();
+    let fine_map = mapping.fine_criteria.clone();
+
+    let mut questions = IndexMap::new();
+    questions.insert(
+        "banking_intent".to_string(),
+        Question::new_choice("お問い合わせの分類を選択してください。", fine_map),
+    );
+
+    let mut req_payload = SystemOneRequest::new(
+        "クレジットカードを路上で紛失してしまいました。悪用を防ぐため停止してください。",
+        questions,
+    );
+    req_payload.auto_hierarchical = Some(true);
+
+    let req_json = serde_json::to_vec(&req_payload).unwrap();
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/systemone")
+        .header("Content-Type", "application/json")
+        .body(Body::from(req_json))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let res: SystemOneResponse = serde_json::from_slice(&body_bytes).unwrap();
+
+    let ans = res
+        .answers
+        .get("banking_intent")
+        .expect("banking_intent の決定結果が存在すること。");
+    assert!(ans.choice.is_some());
+    assert!(ans.probabilities.as_ref().unwrap().len() >= 77);
+}
+
+#[tokio::test]
+async fn test_state_batch_auto_hierarchical_routing() {
+    let state = match init_test_app_state() {
+        Some(s) => s,
+        None => {
+            eprintln!("スキップ: モデルまたはトークナイザーが存在しません。");
+            return;
+        }
+    };
+
+    let app = create_router(state, None);
+
+    let mapping = HierarchicalMapping::banking77();
+    let fine_map = mapping.fine_criteria.clone();
+
+    let mut questions = IndexMap::new();
+    questions.insert(
+        "banking_intent".to_string(),
+        Question::new_choice("お問い合わせの分類を選択してください。", fine_map),
+    );
+    questions.insert(
+        "urgent".to_string(),
+        Question::new_noul("緊急対応が必要な案件ですか？"),
+    );
+
+    let mut batch_req = StateBatchRequest::new(
+        "カードを盗まれた可能性があります。即座に利用停止してください。",
+        questions,
+    );
+    batch_req.auto_hierarchical = Some(true);
+
+    let req_json = serde_json::to_vec(&batch_req).unwrap();
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/systemone/state-batch")
+        .header("Content-Type", "application/json")
+        .body(Body::from(req_json))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let res: StateBatchResponse = serde_json::from_slice(&body_bytes).unwrap();
+
+    let ans = res
+        .answers
+        .get("banking_intent")
+        .expect("banking_intent の決定結果が存在すること。");
+    assert!(ans.choice.is_some());
+    assert!(ans.probabilities.as_ref().unwrap().len() >= 77);
+    assert!(res.answers.contains_key("urgent"));
 }

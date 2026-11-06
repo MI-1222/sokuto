@@ -40,6 +40,17 @@ pub struct ServeArgs {
     /// ONNX Runtime セッション構成引数。
     #[command(flatten)]
     pub session: SessionArgs,
+
+    /// CPU メモリアリーナを無効化する (OS アロケータ mimalloc に都度返却)。
+    #[arg(long, env = "SOKUTO_NO_MEM_ARENA", default_value_t = false)]
+    pub no_mem_arena: bool,
+}
+
+impl ServeArgs {
+    /// CPU メモリアリーナが有効かどうかを判定する。
+    pub fn enable_mem_arena(&self) -> bool {
+        !self.no_mem_arena
+    }
 }
 
 /// HTTP サーバー起動処理を実行する。
@@ -51,7 +62,11 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
     validate_model_dir(&args.model_dir)?;
 
     // 2. セッション設定の構築
-    let session_config = args.session.build_config();
+    let session_config = args
+        .session
+        .to_builder()
+        .enable_mem_arena(args.enable_mem_arena())
+        .build();
 
     let artifact_paths = ModelArtifactPaths::resolve(&args.model_dir);
 
@@ -94,4 +109,48 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
         .map_err(|e| CliError::Server(e.to_string()))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_serve_args_enable_mem_arena() {
+        let args_default = ServeArgs {
+            host: "0.0.0.0".to_string(),
+            port: 3000,
+            model_dir: PathBuf::from("models/default"),
+            session: SessionArgs {
+                pool_size: 1,
+                provider: None,
+                intra_threads: None,
+                inter_threads: None,
+            },
+            no_mem_arena: false,
+        };
+        assert!(
+            args_default.enable_mem_arena(),
+            "デフォルトでメモリアリーナが有効であることの検証に成功。"
+        );
+
+        let args_no_arena = ServeArgs {
+            no_mem_arena: true,
+            ..args_default
+        };
+        assert!(
+            !args_no_arena.enable_mem_arena(),
+            "no_mem_arena 有効時にメモリアリーナが無効化されることの検証に成功。"
+        );
+
+        let session_config = args_no_arena
+            .session
+            .to_builder()
+            .enable_mem_arena(args_no_arena.enable_mem_arena())
+            .build();
+        assert!(
+            !session_config.enable_mem_arena,
+            "SessionConfig にメモリアリーナ無効化が正しく伝播することの検証に成功。"
+        );
+    }
 }

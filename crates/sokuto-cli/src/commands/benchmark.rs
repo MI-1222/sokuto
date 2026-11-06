@@ -80,7 +80,12 @@ pub struct BenchmarkArgs {
     pub model_dir: PathBuf,
 
     /// 測定反復回数。
-    #[arg(short = 'n', long, default_value_t = 50)]
+    #[arg(
+        short = 'n',
+        long,
+        default_value_t = 50,
+        value_parser = clap::builder::RangedI64ValueParser::<usize>::new().range(1..)
+    )]
     pub iterations: usize,
 
     /// ウォームアップ反復回数。
@@ -232,6 +237,13 @@ where
 
 /// ベンチマークコマンドを実行する。
 pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), CliError> {
+    // 引数の妥当性検証 (多層防御)
+    if args.iterations == 0 {
+        return Err(CliError::Config(
+            "測定反復回数 (iterations) には 1 以上の整数を指定してください。".to_string(),
+        ));
+    }
+
     // 1. モデルディレクトリ検証
     validate_model_dir(&args.model_dir)?;
 
@@ -566,4 +578,37 @@ fn render_table(results: &BenchmarkSuiteResult) {
         "================================================================================================================="
     );
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_run_benchmark_zero_iterations_guard() {
+        let args = BenchmarkArgs {
+            model_dir: PathBuf::from("models/default"),
+            iterations: 0,
+            warmup: 0,
+            provider: None,
+            scenario: BenchmarkScenario::Single,
+            pool_size: 1,
+            intra_threads: None,
+            inter_threads: None,
+            no_mem_arena: false,
+            json: false,
+        };
+
+        let result = run_benchmark(args);
+        assert!(result.is_err(), "反復回数 0 による実行失敗を期待。");
+        match result.unwrap_err() {
+            CliError::Config(msg) => {
+                assert!(
+                    msg.contains("1 以上の整数を指定してください"),
+                    "設定エラーメッセージの整合性検証に成功。"
+                );
+            }
+            err => panic!("想定外のエラー型が返却されました: {err:?}。"),
+        }
+    }
 }

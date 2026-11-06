@@ -16,7 +16,7 @@ use sokuto_runtime::engine::{BatchScratchpad, InferenceEngine};
 use sokuto_runtime::tokenizer::JevTokenizer;
 
 use crate::commands::model_dir::{ModelArtifactPaths, load_calibration_config, validate_model_dir};
-pub use crate::commands::session_config::{ExecutionProviderArg, SessionArgs, SessionConfigArgs};
+use crate::commands::session_config::SessionArgs;
 use crate::error::CliError;
 
 /// ベンチマーク実行対象シナリオ。

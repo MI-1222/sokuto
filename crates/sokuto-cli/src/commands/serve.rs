@@ -94,8 +94,10 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
     )?);
     let tokenizer = Arc::new(JevTokenizer::from_file(&artifact_paths.tokenizer_json)?);
     let calib_config = Arc::new(load_calibration_config(&args.model_dir)?);
+    let gating_config = calib_config.gating_config();
 
     let state = AppState::new(engine, tokenizer, calib_config)
+        .with_gating_config(gating_config)
         .load_hierarchical_mapping_from_dir(&args.model_dir)
         .init_dual_engine_from_dir(&args.model_dir, session_config);
 

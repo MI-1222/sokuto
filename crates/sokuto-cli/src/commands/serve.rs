@@ -9,8 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub use crate::commands::model_dir::{ModelDirError, validate_model_dir};
-use crate::commands::session_config::SessionConfigBuilder;
-pub use crate::commands::session_config::parse_provider;
+use crate::commands::session_config::{ExecutionProviderArg, SessionConfigBuilder};
 use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_runtime::engine::InferenceEngine;
 use sokuto_runtime::tokenizer::JevTokenizer;
@@ -41,9 +40,9 @@ pub struct ServeArgs {
     #[arg(long, env = "SOKUTO_POOL_SIZE", default_value_t = 2)]
     pub pool_size: usize,
 
-    /// 優先 Execution Provider (auto, coreml, cuda, tensorrt, cpu)。
+    /// 優先 Execution Provider。
     #[arg(long, env = "SOKUTO_PROVIDER")]
-    pub provider: Option<String>,
+    pub provider: Option<ExecutionProviderArg>,
 
     /// 単一オペレータ内の並列スレッド数 (intra-op)。
     #[arg(long, env = "SOKUTO_INTRA_THREADS")]
@@ -67,7 +66,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error 
         .pool_size(args.pool_size)
         .intra_threads(args.intra_threads)
         .inter_threads(args.inter_threads)
-        .provider_opt(args.provider.as_deref())
+        .provider_opt(args.provider)
         .build()?;
 
     let onnx_path = args.model_dir.join("model.onnx");

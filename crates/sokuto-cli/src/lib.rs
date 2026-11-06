@@ -8,6 +8,7 @@ pub use commands::benchmark::{BenchmarkArgs, BenchmarkScenario};
 pub use commands::healthcheck::HealthcheckArgs;
 pub use commands::quantize::QuantizeArgs;
 pub use commands::serve::ServeArgs;
+pub use commands::session_config::ExecutionProviderArg;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;

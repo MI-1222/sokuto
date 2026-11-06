@@ -74,6 +74,7 @@ pub fn interpolate_prompt(
             }
             cursor = close_idx + 1;
         } else {
+            cursor = open_idx;
             break;
         }
     }
@@ -170,6 +171,22 @@ mod tests {
         interpolate_prompt(template, &context, &mut output);
 
         assert_eq!(output, "未定義変数は {unknown.value} のままです。");
+    }
+
+    #[test]
+    fn test_interpolate_prompt_unclosed_brace() {
+        let mut context = IndexMap::new();
+        context.insert("node_a".to_string(), NodeContextValue::new("val", 1.0));
+
+        let template = "Hello {world";
+        let mut output = String::new();
+        interpolate_prompt(template, &context, &mut output);
+        assert_eq!(output, "Hello {world");
+
+        let template_mixed = "Prefix {node_a.value} mid {unclosed";
+        let mut output_mixed = String::new();
+        interpolate_prompt(template_mixed, &context, &mut output_mixed);
+        assert_eq!(output_mixed, "Prefix val mid {unclosed");
     }
 
     #[test]

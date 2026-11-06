@@ -27,6 +27,3 @@ default = []
 coreml = ["sokuto-runtime/coreml"]
 cuda = ["sokuto-runtime/cuda"]
 tensorrt = ["sokuto-runtime/tensorrt"]
-
-[dev-dependencies]
-serde_json = { workspace = true }

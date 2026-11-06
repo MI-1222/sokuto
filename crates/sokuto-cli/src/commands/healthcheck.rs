@@ -112,35 +112,9 @@ async fn resolve_socket_addrs(
     port: u16,
     deadline: Instant,
 ) -> Result<Vec<std::net::SocketAddr>, CliError> {
-    let ip_str = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-
-    if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
-        return Ok(vec![std::net::SocketAddr::new(ip, port)]);
-    }
-
-    let now = Instant::now();
-    let remaining = deadline
-        .checked_duration_since(now)
-        .ok_or_else(|| CliError::HealthcheckFailed("名前解決がタイムアウトしました。".into()))?;
-    if remaining.is_zero() {
-        return Err(CliError::HealthcheckFailed(
-            "名前解決がタイムアウトしました。".into(),
-        ));
-    }
-
-    let host_port = format!("{host}:{port}");
-    match tokio::time::timeout(remaining, tokio::net::lookup_host(&host_port)).await {
-        Ok(Ok(iter)) => Ok(iter.collect()),
-        Ok(Err(e)) => Err(CliError::HealthcheckFailed(format!(
-            "ホスト名 '{host}' の名前解決に失敗しました: {e}。"
-        ))),
-        Err(_) => Err(CliError::HealthcheckFailed(format!(
-            "ホスト名 '{host}' の名前解決がタイムアウトしました。"
-        ))),
-    }
+    crate::commands::net::resolve_host_port_with_deadline(host, port, Some(deadline))
+        .await
+        .map_err(|err| CliError::HealthcheckFailed(err.to_string()))
 }
 
 /// HTTP GET リクエストを送信し、ステータスコード 200 OK であるかを判定する。

@@ -120,20 +120,9 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
 /// - `host`: ホスト名または IP アドレス (例: "127.0.0.1", "localhost", "::1", "[::1]")。
 /// - `port`: ポート番号。
 pub async fn resolve_socket_addr(host: &str, port: u16) -> Result<SocketAddr, CliError> {
-    let normalized_host = host.trim_start_matches('[').trim_end_matches(']');
-    let mut addrs = tokio::net::lookup_host((normalized_host, port))
+    crate::commands::net::resolve_single_socket_addr(host, port)
         .await
-        .map_err(|err| {
-            CliError::Config(format!(
-                "ホスト名 '{host}:{port}' の名前解決に失敗しました: {err}。"
-            ))
-        })?;
-
-    addrs.next().ok_or_else(|| {
-        CliError::Config(format!(
-            "ホスト名 '{host}:{port}' に対応するソケットアドレスが見つかりませんでした。"
-        ))
-    })
+        .map_err(|err| CliError::Config(err.to_string()))
 }
 
 #[cfg(test)]

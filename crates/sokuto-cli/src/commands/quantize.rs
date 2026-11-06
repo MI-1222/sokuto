@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use sokuto_runtime::engine::{InferenceEngine, SessionConfig};
 use sokuto_runtime::tokenizer::JevTokenizer;
 
-use crate::commands::model_dir::validate_model_dir;
+use crate::commands::model_dir::{
+    MODEL_ONNX_FILENAME, TOKENIZER_JSON_FILENAME, validate_model_dir,
+};
 use crate::error::CliError;
 
 /// 量子化実行オプション構造体。
@@ -151,8 +153,8 @@ pub fn run_quantize(args: QuantizeArgs) -> Result<(), CliError> {
     }
 
     // 4. 出力先成果物バンドルの完全性検証
-    let quantized_onnx = output_dir_abs.join("model.onnx");
-    let quantized_tok = output_dir_abs.join("tokenizer.json");
+    let quantized_onnx = output_dir_abs.join(MODEL_ONNX_FILENAME);
+    let quantized_tok = output_dir_abs.join(TOKENIZER_JSON_FILENAME);
 
     if !quantized_onnx.exists() || !quantized_tok.exists() {
         return Err(CliError::Quantize(format!(

@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use indexmap::IndexMap;
-use sokuto_core::contract::CalibrationConfig;
+use sokuto_core::contract::{CalibrationConfig, OP_INDEX_PADDING};
 use sokuto_core::schema::Question;
 use sokuto_runtime::engine::{BatchScratchpad, InferenceEngine, SessionConfig};
 use sokuto_runtime::tokenizer::JevTokenizer;
@@ -84,27 +84,27 @@ fn test_batch_encoding_and_padding_integrity() {
     let l_max = batch.dims.sequence_length;
     let k_max = batch.dims.num_options;
 
-    // 質問 1 (sentiment): 2 択なので候補インデックスの後半 3 スロットは 0 (ダミー値)
+    // 質問 1 (sentiment): 2 択なので候補インデックスの後半 3 スロットは -1 (パディング値)
     let q1_op_slice = &batch.op_indices[0..k_max];
-    assert_ne!(q1_op_slice[0], 0);
-    assert_ne!(q1_op_slice[1], 0);
-    assert_eq!(q1_op_slice[2], 0);
-    assert_eq!(q1_op_slice[3], 0);
-    assert_eq!(q1_op_slice[4], 0);
+    assert_ne!(q1_op_slice[0], OP_INDEX_PADDING);
+    assert_ne!(q1_op_slice[1], OP_INDEX_PADDING);
+    assert_eq!(q1_op_slice[2], OP_INDEX_PADDING);
+    assert_eq!(q1_op_slice[3], OP_INDEX_PADDING);
+    assert_eq!(q1_op_slice[4], OP_INDEX_PADDING);
 
-    // 質問 2 (satisfaction): 5 択なので全スロット非ゼロ
+    // 質問 2 (satisfaction): 5 択なので全スロット非パディング
     let q2_op_slice = &batch.op_indices[k_max..k_max * 2];
     for &idx in q2_op_slice {
-        assert_ne!(idx, 0);
+        assert_ne!(idx, OP_INDEX_PADDING);
     }
 
-    // 質問 3 (is_urgent): Noul は真・偽の 2 択なので後半 3 スロットは 0
+    // 質問 3 (is_urgent): Noul は真・偽の 2 択なので後半 3 スロットは -1
     let q3_op_slice = &batch.op_indices[k_max * 2..k_max * 3];
-    assert_ne!(q3_op_slice[0], 0);
-    assert_ne!(q3_op_slice[1], 0);
-    assert_eq!(q3_op_slice[2], 0);
-    assert_eq!(q3_op_slice[3], 0);
-    assert_eq!(q3_op_slice[4], 0);
+    assert_ne!(q3_op_slice[0], OP_INDEX_PADDING);
+    assert_ne!(q3_op_slice[1], OP_INDEX_PADDING);
+    assert_eq!(q3_op_slice[2], OP_INDEX_PADDING);
+    assert_eq!(q3_op_slice[3], OP_INDEX_PADDING);
+    assert_eq!(q3_op_slice[4], OP_INDEX_PADDING);
 
     // 各行のアテンションマスク検証
     for i in 0..3 {

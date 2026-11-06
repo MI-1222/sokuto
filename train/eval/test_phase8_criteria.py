@@ -56,6 +56,7 @@ def test_verify_niah_accuracy() -> None:
     assert details["overall_accuracy"] >= 0.90
     assert details["ood_accuracy"] >= 0.90
     assert details["lost_in_the_middle_gap"] <= 0.15
+    assert details["passed_exit_criteria"] is True
 
 
 def test_verify_latency_reduction_real() -> None:
@@ -91,19 +92,38 @@ def test_verify_numerical_parity_real() -> None:
 
 
 def test_verify_niah_accuracy_real() -> None:
-    """実トークナイズおよびモデル推論による NIAH 精度検証 (`simulated=False`) をテストする。"""
+    """実トークナイズおよびモデル推論による NIAH パイプライン健全性検証 (`simulated=False`) をテストする。"""
     result, details = verify_niah_accuracy(
         target_char_length=1500,
         depth_steps=[0.0, 0.5, 1.0],
         accuracy_threshold=0.90,
         simulated=False,
-        is_smoke_test=True,
     )
     assert result.passed is True
     assert details["is_simulated"] is False
-    assert details["is_smoke_test"] is True
-    # テンソル形状不整合や NaN/Inf がなく、予測が決定論的に取得されたこと。
+    assert details["has_real_checkpoint"] is False
     assert details["total_samples"] > 0
+
+
+def test_verify_niah_accuracy_checkpoint_asserts_on_failure() -> None:
+    """本番チェックポイント指定時に精度未達であれば正当に AssertionError が発生することを検証する。"""
+    import pytest
+    import torch
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_ckpt = Path(tmp_dir)
+        dummy_model_file = tmp_ckpt / "model.pt"
+        torch.save({"state_dict": {}}, dummy_model_file)
+
+        # 未学習重みのチェックポイントでは 90% 未達となり正当に AssertionError が送出されること。
+        with pytest.raises(AssertionError, match="長文 NIAH.*基準未達"):
+            verify_niah_accuracy(
+                target_char_length=1500,
+                depth_steps=[0.0, 0.5, 1.0],
+                accuracy_threshold=0.90,
+                simulated=False,
+                checkpoint_dir=tmp_ckpt,
+            )
 
 
 def test_verify_memory_and_cache() -> None:

@@ -210,12 +210,14 @@ where
     E: Into<CliError>,
 {
     for _ in 0..warmup {
-        let _ = op().map_err(Into::into)?;
+        let res = std::hint::black_box(op().map_err(Into::into)?);
+        drop(res);
     }
     let mut durations = Vec::with_capacity(iterations);
     for _ in 0..iterations {
         let start = Instant::now();
-        let _ = op().map_err(Into::into)?;
+        let res = std::hint::black_box(op().map_err(Into::into)?);
+        drop(res);
         durations.push(start.elapsed().as_secs_f64() * 1000.0);
     }
     Ok(compute_stats(name, decisions_per_run, &mut durations))

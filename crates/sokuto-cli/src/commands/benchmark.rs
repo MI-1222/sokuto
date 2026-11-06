@@ -12,6 +12,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use sokuto_core::contract::calibration::CalibrationConfig;
+use sokuto_core::decision::evaluate_question;
 use sokuto_core::schema::Question;
 use sokuto_runtime::engine::coarse::CoarseToFineConfig;
 use sokuto_runtime::engine::{BatchScratchpad, ExecutionProvider, InferenceEngine, SessionConfig};
@@ -127,6 +128,29 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
+/// 指定されたシナリオ操作をウォームアップ実行および本測定し、統計量を算出する。
+fn measure_scenario<F, T>(
+    name: &str,
+    decisions_per_run: usize,
+    warmup: usize,
+    iterations: usize,
+    mut op: F,
+) -> Result<ScenarioStats, Box<dyn std::error::Error + Send + Sync>>
+where
+    F: FnMut() -> Result<T, Box<dyn std::error::Error + Send + Sync>>,
+{
+    for _ in 0..warmup {
+        let _ = op()?;
+    }
+    let mut durations = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = Instant::now();
+        let _ = op()?;
+        durations.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    Ok(compute_stats(name, decisions_per_run, &mut durations))
+}
+
 /// ベンチマークコマンドを実行する。
 pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 1. モデルディレクトリ検証
@@ -189,104 +213,125 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
     let should_run_coarse = scenario_filter == "all" || scenario_filter == "coarse";
     let should_run_scratch = scenario_filter == "all" || scenario_filter == "scratchpad";
 
-    // --- シナリオ 1: Single Choice (K=3) ---
+    // --- シナリオ 1〜3: Single Decision (Choice, Score, Noul) ---
     if should_run_single {
-        eprintln!("[1/6] Single Choice (K=3) を測定中...");
-        let state =
+        eprintln!("単一質問シナリオ (Single Choice, Score, Noul) を測定中...");
+
+        // 1. Single Choice (K=3)
+        let state_choice =
             "顧客から注文キャンセルのリクエストを受信しました。注文ステータスは発送準備中です。";
-        let mut criteria = IndexMap::new();
-        criteria.insert(
+        let mut criteria_choice = IndexMap::new();
+        criteria_choice.insert(
             "cancel_order".to_string(),
             "注文を直ちにキャンセルする".to_string(),
         );
-        criteria.insert(
+        criteria_choice.insert(
             "contact_support".to_string(),
             "サポート窓口へ転送する".to_string(),
         );
-        criteria.insert("ignore".to_string(), "特に対処せず保留する".to_string());
-        let question = Question::new_choice("適切な対応を選択してください。", criteria);
-        let tokenized = tokenizer.encode_question(state, &question)?;
+        criteria_choice.insert("ignore".to_string(), "特に対処せず保留する".to_string());
+        let question_choice =
+            Question::new_choice("適切な対応を選択してください。", criteria_choice);
+        let tokenized_choice = tokenizer.encode_question(state_choice, &question_choice)?;
 
-        // ウォームアップ
-        for _ in 0..args.warmup {
-            let _ = engine.forward_question(&tokenized)?;
-        }
+        // 生推論ループ (事前トークナイズ入力に対する純粋なフォワードパス)
+        suite_results.scenarios.push(measure_scenario(
+            "Single Choice (K=3, Raw)",
+            1,
+            args.warmup,
+            args.iterations,
+            || {
+                engine
+                    .forward_question(&tokenized_choice)
+                    .map_err(Into::into)
+            },
+        )?);
 
-        // 本測定
-        let mut durations = Vec::with_capacity(args.iterations);
-        for _ in 0..args.iterations {
-            let start = Instant::now();
-            let _ = engine.forward_question(&tokenized)?;
-            durations.push(start.elapsed().as_secs_f64() * 1000.0);
-        }
+        // E2E パイプライン (トークナイズ + 推論 + 決定プリミティブ数理解決)
+        suite_results.scenarios.push(measure_scenario(
+            "Single Choice (K=3, E2E)",
+            1,
+            args.warmup,
+            args.iterations,
+            || {
+                let tok = tokenizer.encode_question(state_choice, &question_choice)?;
+                let logits = engine.forward_question(&tok)?;
+                let _ = evaluate_question(&question_choice, &logits, &calib_config)?;
+                Ok(())
+            },
+        )?);
 
-        suite_results
-            .scenarios
-            .push(compute_stats("Single Choice (K=3)", 1, &mut durations));
-    }
-
-    // --- シナリオ 2: Single Score (K=5) ---
-    if should_run_single {
-        eprintln!("[2/6] Single Score (K=5) を測定中...");
-        let state =
+        // 2. Single Score (K=5)
+        let state_score =
             "過去 5 分間に不正なパスワード試行が同一 IP アドレスから 200 回検知されました。";
-        let criteria = vec![
+        let criteria_score = vec![
             "極めて安全 (影響なし)".to_string(),
             "低リスク (要注視)".to_string(),
             "中リスク (調査推奨)".to_string(),
             "高リスク (要即時対応)".to_string(),
             "致命的インシデント (全遮断)".to_string(),
         ];
-        let question =
-            Question::new_score("セキュリティ脅威の深刻度を段階評価してください。", criteria);
-        let tokenized = tokenizer.encode_question(state, &question)?;
+        let question_score = Question::new_score(
+            "セキュリティ脅威の深刻度を段階評価してください。",
+            criteria_score,
+        );
+        let tokenized_score = tokenizer.encode_question(state_score, &question_score)?;
 
-        // ウォームアップ
-        for _ in 0..args.warmup {
-            let _ = engine.forward_question(&tokenized)?;
-        }
+        suite_results.scenarios.push(measure_scenario(
+            "Single Score (K=5, Raw)",
+            1,
+            args.warmup,
+            args.iterations,
+            || {
+                engine
+                    .forward_question(&tokenized_score)
+                    .map_err(Into::into)
+            },
+        )?);
 
-        // 本測定
-        let mut durations = Vec::with_capacity(args.iterations);
-        for _ in 0..args.iterations {
-            let start = Instant::now();
-            let _ = engine.forward_question(&tokenized)?;
-            durations.push(start.elapsed().as_secs_f64() * 1000.0);
-        }
+        suite_results.scenarios.push(measure_scenario(
+            "Single Score (K=5, E2E)",
+            1,
+            args.warmup,
+            args.iterations,
+            || {
+                let tok = tokenizer.encode_question(state_score, &question_score)?;
+                let logits = engine.forward_question(&tok)?;
+                let _ = evaluate_question(&question_score, &logits, &calib_config)?;
+                Ok(())
+            },
+        )?);
 
-        suite_results
-            .scenarios
-            .push(compute_stats("Single Score (K=5)", 1, &mut durations));
-    }
+        // 3. Single Noul (真偽判定)
+        let state_noul = "サーバーの CPU 使用率が 98%、空きメモリが 50MB 未満です。";
+        let question_noul = Question::new_noul("直ちにアラートを発報すべき緊急事態ですか？");
+        let tokenized_noul = tokenizer.encode_question(state_noul, &question_noul)?;
 
-    // --- シナリオ 3: Single Noul (真偽判定) ---
-    if should_run_single {
-        eprintln!("[3/6] Single Noul (真偽判定) を測定中...");
-        let state = "サーバーの CPU 使用率が 98%、空きメモリが 50MB 未満です。";
-        let question = Question::new_noul("直ちにアラートを発報すべき緊急事態ですか？");
-        let tokenized = tokenizer.encode_question(state, &question)?;
+        suite_results.scenarios.push(measure_scenario(
+            "Single Noul (Binary, Raw)",
+            1,
+            args.warmup,
+            args.iterations,
+            || engine.forward_question(&tokenized_noul).map_err(Into::into),
+        )?);
 
-        // ウォームアップ
-        for _ in 0..args.warmup {
-            let _ = engine.forward_question(&tokenized)?;
-        }
-
-        // 本測定
-        let mut durations = Vec::with_capacity(args.iterations);
-        for _ in 0..args.iterations {
-            let start = Instant::now();
-            let _ = engine.forward_question(&tokenized)?;
-            durations.push(start.elapsed().as_secs_f64() * 1000.0);
-        }
-
-        suite_results
-            .scenarios
-            .push(compute_stats("Single Noul (Binary)", 1, &mut durations));
+        suite_results.scenarios.push(measure_scenario(
+            "Single Noul (Binary, E2E)",
+            1,
+            args.warmup,
+            args.iterations,
+            || {
+                let tok = tokenizer.encode_question(state_noul, &question_noul)?;
+                let logits = engine.forward_question(&tok)?;
+                let _ = evaluate_question(&question_noul, &logits, &calib_config)?;
+                Ok(())
+            },
+        )?);
     }
 
     // --- シナリオ 4: Batch Scaling (4, 8, 16 Questions) ---
     if should_run_batch {
-        eprintln!("[4/6] Batch Scaling (並列質問バッチ) を測定中...");
+        eprintln!("並列バッチシナリオ (Batch Scaling: Q=4, 8, 16) を測定中...");
         let state = "ユーザーが新規アカウント登録を行い、プロファイル情報を入力しました。";
 
         for &batch_size in &[4, 8, 16] {
@@ -303,30 +348,33 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
             }
             let batch = tokenizer.encode_batch_questions(state, &questions)?;
 
-            // ウォームアップ
-            for _ in 0..args.warmup {
-                let _ = engine.forward_batch_tokenized(&batch)?;
-            }
-
-            // 本測定
-            let mut durations = Vec::with_capacity(args.iterations);
-            for _ in 0..args.iterations {
-                let start = Instant::now();
-                let _ = engine.forward_batch_tokenized(&batch)?;
-                durations.push(start.elapsed().as_secs_f64() * 1000.0);
-            }
-
-            suite_results.scenarios.push(compute_stats(
-                &format!("Batch Scaling (Q={batch_size})"),
+            // 生推論ループ (事前トークナイズ入力に対する純粋なバッチフォワードパス)
+            suite_results.scenarios.push(measure_scenario(
+                &format!("Batch Scaling (Q={batch_size}, Raw)"),
                 batch_size,
-                &mut durations,
-            ));
+                args.warmup,
+                args.iterations,
+                || engine.forward_batch_tokenized(&batch).map_err(Into::into),
+            )?);
+
+            // E2E パイプライン (トークナイズ + バッチ推論 + 各質問の決定数理解決・ゲーティング)
+            suite_results.scenarios.push(measure_scenario(
+                &format!("Batch Scaling (Q={batch_size}, E2E)"),
+                batch_size,
+                args.warmup,
+                args.iterations,
+                || {
+                    engine
+                        .evaluate_batch_questions(&tokenizer, state, &questions, &calib_config)
+                        .map_err(Into::into)
+                },
+            )?);
         }
     }
 
-    // --- シナリオ 5: Coarse-to-Fine (K=77 大規模候補探索) ---
+    // --- シナリオ 5: Coarse-to-Fine (K=77 大規模候補探索対照) ---
     if should_run_coarse {
-        eprintln!("[5/6] Coarse-to-Fine (K=77 大規模候補) を測定中...");
+        eprintln!("高基数候補探索シナリオ (Flat vs Coarse-to-Fine: K=77) を測定中...");
         let state =
             "ATM から現金を引き出そうとしたところ、カードが取り込まれて返却されませんでした。";
         let mut large_criteria = IndexMap::with_capacity(77);
@@ -343,39 +391,43 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
             ..Default::default()
         };
 
-        // ウォームアップ
-        for _ in 0..args.warmup {
-            let _ = engine.evaluate_question_coarse_to_fine(
-                &tokenizer,
-                state,
-                &question,
-                &calib_config,
-                &coarse_config,
-            )?;
-        }
+        // 通常 Flat 評価 (K=77 の全候補に対する E2E パイプライン)
+        suite_results.scenarios.push(measure_scenario(
+            "Flat Choice (K=77, E2E)",
+            1,
+            args.warmup,
+            args.iterations,
+            || {
+                let tok = tokenizer.encode_question(state, &question)?;
+                let logits = engine.forward_question(&tok)?;
+                let _ = evaluate_question(&question, &logits, &calib_config)?;
+                Ok(())
+            },
+        )?);
 
-        // 本測定
-        let mut durations = Vec::with_capacity(args.iterations);
-        for _ in 0..args.iterations {
-            let start = Instant::now();
-            let _ = engine.evaluate_question_coarse_to_fine(
-                &tokenizer,
-                state,
-                &question,
-                &calib_config,
-                &coarse_config,
-            )?;
-            durations.push(start.elapsed().as_secs_f64() * 1000.0);
-        }
-
-        suite_results
-            .scenarios
-            .push(compute_stats("Coarse-to-Fine (K=77)", 1, &mut durations));
+        // Coarse-to-Fine 評価 (粗密2段階探索による枝刈り E2E パイプライン)
+        suite_results.scenarios.push(measure_scenario(
+            "Coarse-to-Fine (K=77, E2E)",
+            1,
+            args.warmup,
+            args.iterations,
+            || {
+                engine
+                    .evaluate_question_coarse_to_fine(
+                        &tokenizer,
+                        state,
+                        &question,
+                        &calib_config,
+                        &coarse_config,
+                    )
+                    .map_err(Into::into)
+            },
+        )?);
     }
 
-    // --- シナリオ 6: Scratchpad 再利用によるアロケーション抑制効果 ---
+    // --- シナリオ 6: Scratchpad 再利用によるアロケーション抑制効果対照 ---
     if should_run_scratch {
-        eprintln!("[6/6] Scratchpad 再利用効果を測定中 (Q=8)...");
+        eprintln!("スクラッチパッド再利用シナリオ (Standard vs Scratchpad: Q=8) を測定中...");
         let state = "注文履歴の確認と配送日時の変更手続きを受け付けました。";
         let mut questions = IndexMap::with_capacity(8);
         for i in 0..8 {
@@ -388,36 +440,38 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
             );
         }
 
+        // 通常バッチ評価 (毎回新規アロケーションを行う E2E パイプライン)
+        suite_results.scenarios.push(measure_scenario(
+            "Batch Standard (Q=8, E2E)",
+            8,
+            args.warmup,
+            args.iterations,
+            || {
+                engine
+                    .evaluate_batch_questions(&tokenizer, state, &questions, &calib_config)
+                    .map_err(Into::into)
+            },
+        )?);
+
+        // スクラッチパッド再利用バッチ評価 (アロケーションを抑える E2E パイプライン)
         let mut scratchpad = BatchScratchpad::default();
-
-        // ウォームアップ
-        for _ in 0..args.warmup {
-            let _ = engine.evaluate_batch_questions_with_scratchpad(
-                &tokenizer,
-                state,
-                &questions,
-                &calib_config,
-                &mut scratchpad,
-            )?;
-        }
-
-        // 本測定
-        let mut durations = Vec::with_capacity(args.iterations);
-        for _ in 0..args.iterations {
-            let start = Instant::now();
-            let _ = engine.evaluate_batch_questions_with_scratchpad(
-                &tokenizer,
-                state,
-                &questions,
-                &calib_config,
-                &mut scratchpad,
-            )?;
-            durations.push(start.elapsed().as_secs_f64() * 1000.0);
-        }
-
-        suite_results
-            .scenarios
-            .push(compute_stats("Scratchpad (Q=8)", 8, &mut durations));
+        suite_results.scenarios.push(measure_scenario(
+            "Batch Scratchpad (Q=8, E2E)",
+            8,
+            args.warmup,
+            args.iterations,
+            || {
+                engine
+                    .evaluate_batch_questions_with_scratchpad(
+                        &tokenizer,
+                        state,
+                        &questions,
+                        &calib_config,
+                        &mut scratchpad,
+                    )
+                    .map_err(Into::into)
+            },
+        )?);
     }
 
     // 4. 結果の出力
@@ -435,32 +489,32 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
 fn render_table(results: &BenchmarkSuiteResult) {
     println!();
     println!(
-        "========================================================================================================="
+        "================================================================================================================="
     );
     println!(
         " Sokuto 推論性能ベンチマーク (EP: {}, モデル: {})",
         results.active_provider, results.model_dir
     );
     println!(
-        "========================================================================================================="
+        "================================================================================================================="
     );
     println!(
-        "{:<28} | {:>6} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>14}",
+        "{:<32} | {:>6} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>14}",
         "シナリオ", "反復", "Min(ms)", "Mean(ms)", "P50(ms)", "P90(ms)", "P99(ms)", "Throughput"
     );
     println!(
-        "---------------------------------------------------------------------------------------------------------"
+        "-----------------------------------------------------------------------------------------------------------------"
     );
 
     for s in &results.scenarios {
         let throughput_str = format!("{:.1} dec/s", s.throughput_dps);
         println!(
-            "{:<28} | {:>6} | {:>8.2} | {:>8.2} | {:>8.2} | {:>8.2} | {:>8.2} | {:>14}",
+            "{:<32} | {:>6} | {:>8.2} | {:>8.2} | {:>8.2} | {:>8.2} | {:>8.2} | {:>14}",
             s.name, s.iterations, s.min_ms, s.mean_ms, s.p50_ms, s.p90_ms, s.p99_ms, throughput_str
         );
     }
     println!(
-        "========================================================================================================="
+        "================================================================================================================="
     );
     println!();
 }

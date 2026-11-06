@@ -67,13 +67,18 @@ impl<T: Copy> AlignedBuffer64<T> {
     /// # 引数
     /// - `len`: 要素数。
     pub fn with_capacity_zeroed(len: usize) -> Self {
+        assert!(
+            std::mem::size_of::<T>() > 0,
+            "ZST はサポートされていません。"
+        );
+
         if len == 0 {
-            let layout = Layout::from_size_align(0, 64).unwrap_or(Layout::new::<u8>());
             return Self {
                 ptr: NonNull::dangling(),
                 len: 0,
                 capacity: 0,
-                layout,
+                layout: Layout::from_size_align(0, 64)
+                    .expect("64バイトアライメントレイアウトの作成に失敗しました。"),
             };
         }
 
@@ -1459,6 +1464,25 @@ mod tests {
         assert_eq!(buf_from_slice.len(), 4);
         assert!(buf_from_slice.is_aligned_64());
         assert_eq!(&buf_from_slice[..], &slice[..]);
+    }
+
+    #[test]
+    fn test_aligned_buffer64_empty() {
+        let buf = AlignedBuffer64::<f32>::with_capacity_zeroed(0);
+        assert_eq!(buf.len(), 0);
+        assert!(buf.is_empty());
+        assert_eq!(&buf[..], &[] as &[f32]);
+
+        let empty_slice: [f32; 0] = [];
+        let buf_from_empty = AlignedBuffer64::from_slice(&empty_slice);
+        assert_eq!(buf_from_empty.len(), 0);
+        assert!(buf_from_empty.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "ZST はサポートされていません。")]
+    fn test_aligned_buffer64_zst_panic() {
+        let _ = AlignedBuffer64::<()>::with_capacity_zeroed(1);
     }
 
     #[test]

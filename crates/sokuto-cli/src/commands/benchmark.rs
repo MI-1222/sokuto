@@ -4,20 +4,18 @@
 //! 単一質問、並列バッチ、大規模候補探索 (Coarse-to-Fine)、およびスクラッチパッド再利用時の
 //! 純粋な計算レイテンシとスループットを精密に計測する。
 
-use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_core::schema::Question;
 use sokuto_runtime::engine::coarse::CoarseToFineConfig;
 use sokuto_runtime::engine::{BatchScratchpad, InferenceEngine};
 use sokuto_runtime::tokenizer::JevTokenizer;
 
-use crate::commands::model_dir::validate_model_dir;
+use crate::commands::model_dir::{ModelArtifactPaths, load_calibration_config, validate_model_dir};
 use crate::commands::session_config::{ExecutionProviderArg, SessionConfigBuilder};
 use crate::error::CliError;
 
@@ -256,24 +254,16 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), CliError> {
         .enable_mem_arena(args.enable_mem_arena())
         .build();
 
-    let onnx_path = args.model_dir.join("model.onnx");
-    let tok_path = args.model_dir.join("tokenizer.json");
-    let calib_path = args.model_dir.join("calibration.json");
+    let artifact_paths = ModelArtifactPaths::resolve(&args.model_dir);
 
     eprintln!(
         "推論エンジンおよびトークナイザーをロード中 (パス: {})...",
         args.model_dir.display()
     );
 
-    let engine = InferenceEngine::new(&onnx_path, session_config)?;
-    let tokenizer = JevTokenizer::from_file(&tok_path)?;
-
-    let calib_config = if calib_path.exists() {
-        let calib_json = fs::read_to_string(&calib_path)?;
-        CalibrationConfig::from_json_str(&calib_json)?
-    } else {
-        CalibrationConfig::default()
-    };
+    let engine = InferenceEngine::new(&artifact_paths.model_onnx, session_config)?;
+    let tokenizer = JevTokenizer::from_file(&artifact_paths.tokenizer_json)?;
+    let calib_config = load_calibration_config(&args.model_dir)?;
 
     let active_provider = engine.active_provider().name().to_string();
     eprintln!("アクティブ Execution Provider: {active_provider}");

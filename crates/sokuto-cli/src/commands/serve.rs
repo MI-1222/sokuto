@@ -3,15 +3,15 @@
 //! TypeSafe AI Jev 互換 HTTP API サーバーを初期化し、
 //! 指定されたモデルと Execution Provider でエンドポイントを提供する。
 
-use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub use crate::commands::model_dir::{ModelDirError, validate_model_dir};
+pub use crate::commands::model_dir::{
+    ModelArtifactPaths, ModelDirError, load_calibration_config, validate_model_dir,
+};
 use crate::commands::session_config::{ExecutionProviderArg, SessionConfigBuilder};
 use crate::error::CliError;
-use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_runtime::engine::InferenceEngine;
 use sokuto_runtime::tokenizer::JevTokenizer;
 use sokuto_server::metrics::setup_metrics_recorder;
@@ -70,9 +70,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
         .provider_opt(args.provider)
         .build();
 
-    let onnx_path = args.model_dir.join("model.onnx");
-    let tok_path = args.model_dir.join("tokenizer.json");
-    let calib_path = args.model_dir.join("calibration.json");
+    let artifact_paths = ModelArtifactPaths::resolve(&args.model_dir);
 
     tracing::info!(
         "sokuto サーバーを起動します (モデル: {}, アドレス: {}:{}, セッションプール数: {})...",
@@ -92,17 +90,12 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
     };
 
     // 4. 推論エンジンとトークナイザーのロード
-    let engine = Arc::new(InferenceEngine::new(&onnx_path, session_config.clone())?);
-    let tokenizer = Arc::new(JevTokenizer::from_file(&tok_path)?);
-
-    let calib_config = if calib_path.exists() {
-        let calib_json = fs::read_to_string(&calib_path)?;
-        tracing::info!("較正温度設定をロードしました: {}", calib_path.display());
-        Arc::new(CalibrationConfig::from_json_str(&calib_json)?)
-    } else {
-        tracing::info!("較正設定ファイルが存在しないため、デフォルト温度設定を使用します。");
-        Arc::new(CalibrationConfig::default())
-    };
+    let engine = Arc::new(InferenceEngine::new(
+        &artifact_paths.model_onnx,
+        session_config.clone(),
+    )?);
+    let tokenizer = Arc::new(JevTokenizer::from_file(&artifact_paths.tokenizer_json)?);
+    let calib_config = Arc::new(load_calibration_config(&args.model_dir)?);
 
     let state = AppState::new(engine, tokenizer, calib_config)
         .load_hierarchical_mapping_from_dir(&args.model_dir)

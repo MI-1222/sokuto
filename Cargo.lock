@@ -2129,7 +2129,7 @@ dependencies = [
 
 [[package]]
 name = "sokuto-cli"
-version = "0.3.6"
+version = "0.4.0-alpha"
 dependencies = [
  "aquamarine",
  "clap",
@@ -2147,7 +2147,7 @@ dependencies = [
 
 [[package]]
 name = "sokuto-core"
-version = "0.3.6"
+version = "0.4.0-alpha"
 dependencies = [
  "aquamarine",
  "indexmap",
@@ -2159,7 +2159,7 @@ dependencies = [
 
 [[package]]
 name = "sokuto-runtime"
-version = "0.3.6"
+version = "0.4.0-alpha"
 dependencies = [
  "aquamarine",
  "crossbeam-queue",
@@ -2182,7 +2182,7 @@ dependencies = [
 
 [[package]]
 name = "sokuto-server"
-version = "0.3.6"
+version = "0.4.0-alpha"
 dependencies = [
  "aho-corasick",
  "aquamarine",

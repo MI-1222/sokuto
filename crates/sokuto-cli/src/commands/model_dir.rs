@@ -32,17 +32,17 @@ pub enum ModelDirError {
 /// # エラー
 /// - ディレクトリまたは必須成果物が存在しない場合に [`ModelDirError`] を返す。
 pub fn validate_model_dir(dir: &Path) -> Result<(), ModelDirError> {
-    if !dir.exists() {
+    if !dir.is_dir() {
         return Err(ModelDirError::NotFound(dir.to_path_buf()));
     }
 
     let onnx_file = dir.join("model.onnx");
-    if !onnx_file.exists() {
+    if !onnx_file.is_file() {
         return Err(ModelDirError::MissingModelFile(onnx_file));
     }
 
     let tok_file = dir.join("tokenizer.json");
-    if !tok_file.exists() {
+    if !tok_file.is_file() {
         return Err(ModelDirError::MissingTokenizerFile(tok_file));
     }
 
@@ -59,6 +59,17 @@ mod tests {
         let non_existent = PathBuf::from("target/non_existent_model_dir_for_test");
         let result = validate_model_dir(&non_existent);
         assert_eq!(result, Err(ModelDirError::NotFound(non_existent)));
+    }
+
+    #[test]
+    fn test_validate_model_dir_not_a_directory() {
+        let temp_file = std::env::temp_dir().join("sokuto_test_file_not_a_dir");
+        let _ = fs::write(&temp_file, b"not a directory");
+
+        let result = validate_model_dir(&temp_file);
+        assert_eq!(result, Err(ModelDirError::NotFound(temp_file.clone())));
+
+        let _ = fs::remove_file(&temp_file);
     }
 
     #[test]

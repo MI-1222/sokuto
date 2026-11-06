@@ -141,5 +141,9 @@ pub enum Commands {
         /// FP32 モデルとのパリティ検証を実行する (デフォルト: 有効)。
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         verify: bool,
+
+        /// Python 量子化スクリプトのパス (省略時はリポジトリルートを自動探索)。
+        #[arg(long, env = "SOKUTO_QUANTIZE_SCRIPT_PATH")]
+        script_path: Option<PathBuf>,
     },
 }

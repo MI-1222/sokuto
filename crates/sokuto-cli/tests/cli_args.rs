@@ -203,11 +203,13 @@ fn test_parse_quantize_defaults() {
             output_dir,
             per_channel,
             verify,
+            script_path,
         } => {
             assert_eq!(model_dir, PathBuf::from("models/default"));
             assert_eq!(output_dir, PathBuf::from("models/quantized"));
             assert!(per_channel);
             assert!(verify);
+            assert_eq!(script_path, None);
         }
         _ => panic!("Quantize コマンドがパースされること。"),
     }
@@ -224,6 +226,8 @@ fn test_parse_quantize_custom_options() {
         "output_dir",
         "--per-channel=false",
         "--verify=false",
+        "--script-path",
+        "custom/quantize.py",
     ];
     let cli = Cli::try_parse_from(args).expect("引数パースに成功すること。");
 
@@ -233,11 +237,13 @@ fn test_parse_quantize_custom_options() {
             output_dir,
             per_channel,
             verify,
+            script_path,
         } => {
             assert_eq!(model_dir, PathBuf::from("input_dir"));
             assert_eq!(output_dir, PathBuf::from("output_dir"));
             assert!(!per_channel);
             assert!(!verify);
+            assert_eq!(script_path, Some(PathBuf::from("custom/quantize.py")));
         }
         _ => panic!("Quantize コマンドがパースされること。"),
     }

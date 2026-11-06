@@ -26,6 +26,8 @@ pub struct QuantizeArgs {
     pub per_channel: bool,
     /// FP32 モデルとのパリティ検証を実行するフラグ。
     pub verify: bool,
+    /// Python 量子化スクリプトのパス (省略時はリポジトリルートから自動探索)。
+    pub script_path: Option<PathBuf>,
 }
 
 /// 量子化結果メタデータ。
@@ -82,16 +84,8 @@ pub fn run_quantize(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error 
     fs::create_dir_all(&args.output_dir)?;
 
     // 3. train 側の Python 量子化スクリプトを実行 (uv run)
-    let project_root = find_project_root(&args.model_dir)?;
-    let train_dir = project_root.join("train");
-
-    if !train_dir.exists() {
-        return Err(format!(
-            "train ディレクトリが見つかりません: {}。",
-            train_dir.display()
-        )
-        .into());
-    }
+    let (quantize_script, project_dir) =
+        resolve_quantize_script(args.script_path.as_deref(), &args.model_dir)?;
 
     let model_dir_abs = fs::canonicalize(&args.model_dir)?;
     let output_dir_abs = if args.output_dir.is_absolute() {
@@ -100,19 +94,10 @@ pub fn run_quantize(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error 
         std::env::current_dir()?.join(&args.output_dir)
     };
 
-    let quantize_script = train_dir.join("export").join("quantize.py");
-    if !quantize_script.exists() {
-        return Err(format!(
-            "量子化スクリプトが見つかりません: {}。",
-            quantize_script.display()
-        )
-        .into());
-    }
-
     let mut cmd = Command::new("uv");
     cmd.arg("run")
         .arg("--project")
-        .arg(&train_dir)
+        .arg(&project_dir)
         .arg("python")
         .arg(&quantize_script)
         .arg("--model-dir")
@@ -132,7 +117,7 @@ pub fn run_quantize(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error 
         cmd.arg("--no-verify");
     }
 
-    cmd.current_dir(&project_root);
+    cmd.current_dir(&project_dir);
 
     eprintln!("Python 量子化パイプラインを起動中...");
     let output = match cmd.output() {
@@ -211,6 +196,69 @@ pub fn run_quantize(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error 
     Ok(())
 }
 
+/// 量子化スクリプトおよび uv プロジェクトディレクトリを解決する。
+pub fn resolve_quantize_script(
+    script_path: Option<&Path>,
+    model_dir: &Path,
+) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(custom_script) = script_path {
+        if !custom_script.exists() {
+            return Err(format!(
+                "指定された量子化スクリプトが見つかりません: {}。",
+                custom_script.display()
+            )
+            .into());
+        }
+        let script_abs = fs::canonicalize(custom_script)?;
+        let project_dir = find_pyproject_root(&script_abs)
+            .unwrap_or_else(|| script_abs.parent().unwrap_or(&script_abs).to_path_buf());
+        Ok((script_abs, project_dir))
+    } else {
+        let project_root = find_project_root(model_dir)?;
+        let train_dir = project_root.join("train");
+
+        if !train_dir.exists() {
+            return Err(format!(
+                "開発用リポジトリ内の train ディレクトリが見つかりません: {}。リポジトリ外から実行する場合は --script-path オプションで量子化スクリプトのパスを明示的に指定してください。",
+                train_dir.display()
+            )
+            .into());
+        }
+
+        let quantize_script = train_dir.join("export").join("quantize.py");
+        if !quantize_script.exists() {
+            return Err(format!(
+                "開発用リポジトリ内の量子化スクリプトが見つかりません: {}。--script-path オプションで量子化スクリプトのパスを明示的に指定してください。",
+                quantize_script.display()
+            )
+            .into());
+        }
+
+        Ok((quantize_script, train_dir))
+    }
+}
+
+/// スクリプトパスの祖先から pyproject.toml を持つディレクトリを探索する。
+fn find_pyproject_root(start_path: &Path) -> Option<PathBuf> {
+    let mut current = if start_path.is_dir() {
+        start_path.to_path_buf()
+    } else {
+        start_path.parent()?.to_path_buf()
+    };
+
+    loop {
+        if current.join("pyproject.toml").exists() {
+            return Some(current);
+        }
+        if let Some(parent) = current.parent() {
+            current = parent.to_path_buf();
+        } else {
+            break;
+        }
+    }
+    None
+}
+
 /// プロジェクトルートディレクトリを探索する。
 fn find_project_root(
     start_dir: &Path,
@@ -246,5 +294,48 @@ fn find_project_root(
         }
     }
 
-    Err("プロジェクトルートディレクトリ (Cargo.toml, crates/ が存在する場所) を特定できませんでした。".into())
+    Err(
+        "開発用リポジトリルート (Cargo.toml, crates/, train/ が存在する場所) を特定できませんでした。\
+        'sokuto quantize' は開発用リポジトリ内の Python パイプライン (train/export/quantize.py) を利用するコマンドです。\
+        リポジトリ外から実行する場合は '--script-path <PATH>' オプションで量子化スクリプトのパスを明示的に指定してください。"
+            .into(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_resolve_quantize_script_not_found() {
+        let non_existent = Path::new("non_existent_dir/custom_quantize.py");
+        let result = resolve_quantize_script(Some(non_existent), Path::new("models/default"));
+        assert!(
+            result.is_err(),
+            "存在しないスクリプトパスを指定した場合はエラーを返すこと。"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("指定された量子化スクリプトが見つかりません"),
+            "エラーメッセージにスクリプト未検出の旨が含まれていること。"
+        );
+    }
+
+    #[test]
+    fn test_find_pyproject_root() {
+        let cwd = std::env::current_dir().expect("カレントディレクトリの取得に成功。");
+        let train_pyproject = cwd.join("train").join("export").join("quantize.py");
+        if train_pyproject.exists() {
+            let found = find_pyproject_root(&train_pyproject);
+            assert!(
+                found.is_some(),
+                "train/export/quantize.py から pyproject.toml を検出できること。"
+            );
+            assert!(
+                found.unwrap().ends_with("train"),
+                "検出されたプロジェクトルートが train であること。"
+            );
+        }
+    }
 }

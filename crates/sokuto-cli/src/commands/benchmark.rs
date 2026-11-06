@@ -17,7 +17,7 @@ use sokuto_runtime::engine::coarse::CoarseToFineConfig;
 use sokuto_runtime::engine::{BatchScratchpad, InferenceEngine};
 use sokuto_runtime::tokenizer::JevTokenizer;
 
-use crate::commands::serve::validate_model_dir;
+use crate::commands::model_dir::validate_model_dir;
 use crate::commands::session_config::SessionConfigBuilder;
 
 /// ベンチマーク実行対象シナリオ。
@@ -231,10 +231,7 @@ where
 /// ベンチマークコマンドを実行する。
 pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 1. モデルディレクトリ検証
-    if let Err(err) = validate_model_dir(&args.model_dir) {
-        eprintln!("エラー: {err}");
-        return Err(err.into());
-    }
+    validate_model_dir(&args.model_dir)?;
 
     // 2. セッション設定の構築
     let session_config = SessionConfigBuilder::new()

@@ -5,9 +5,10 @@
 
 use std::fs;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
+pub use crate::commands::model_dir::{ModelDirError, validate_model_dir};
 use crate::commands::session_config::SessionConfigBuilder;
 pub use crate::commands::session_config::parse_provider;
 use sokuto_core::contract::calibration::CalibrationConfig;
@@ -53,34 +54,6 @@ pub struct ServeArgs {
     pub inter_threads: Option<usize>,
 }
 
-/// モデルディレクトリの完全性を検証する。
-pub fn validate_model_dir(dir: &Path) -> Result<(), String> {
-    if !dir.exists() {
-        return Err(format!(
-            "モデルディレクトリが存在しません: {}。",
-            dir.display()
-        ));
-    }
-
-    let onnx_file = dir.join("model.onnx");
-    if !onnx_file.exists() {
-        return Err(format!(
-            "必須モデルファイルが見つかりません: {}。",
-            onnx_file.display()
-        ));
-    }
-
-    let tok_file = dir.join("tokenizer.json");
-    if !tok_file.exists() {
-        return Err(format!(
-            "必須トークナイザー定義ファイルが見つかりません: {}。",
-            tok_file.display()
-        ));
-    }
-
-    Ok(())
-}
-
 /// HTTP サーバー起動処理を実行する。
 ///
 /// # 引数
@@ -95,10 +68,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error 
         .try_init();
 
     // 1. モデルディレクトリの検証 (Fast-Fail)
-    if let Err(err) = validate_model_dir(&args.model_dir) {
-        tracing::error!("{err}");
-        return Err(err.into());
-    }
+    validate_model_dir(&args.model_dir)?;
 
     // 2. セッション設定の構築
     let session_config = SessionConfigBuilder::new()

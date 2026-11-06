@@ -2140,6 +2140,7 @@ dependencies = [
  "sokuto-core",
  "sokuto-runtime",
  "sokuto-server",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "tracing-subscriber",

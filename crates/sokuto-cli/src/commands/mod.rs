@@ -5,6 +5,7 @@
 pub mod benchmark;
 pub mod export_openapi;
 pub mod healthcheck;
+pub mod model_dir;
 pub mod quantize;
 pub mod serve;
 pub mod session_config;

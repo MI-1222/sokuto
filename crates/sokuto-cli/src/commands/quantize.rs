@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sokuto_runtime::engine::{InferenceEngine, SessionConfig};
 use sokuto_runtime::tokenizer::JevTokenizer;
 
-use crate::commands::serve::validate_model_dir;
+use crate::commands::model_dir::validate_model_dir;
 
 /// 量子化実行オプション構造体。
 #[derive(Debug, Clone, clap::Args, PartialEq, Eq)]
@@ -78,10 +78,7 @@ pub struct QuantizeResultDetails {
 /// ONNX INT8 PTQ 量子化コマンドを実行する。
 pub fn run_quantize(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 1. 入力モデルディレクトリの存在と必須ファイルチェック
-    if let Err(err) = validate_model_dir(&args.model_dir) {
-        eprintln!("エラー: {err}");
-        return Err(err.into());
-    }
+    validate_model_dir(&args.model_dir)?;
 
     eprintln!(
         "ONNX INT8 PTQ 量子化を開始します (入力: {}, 出力先: {})...",

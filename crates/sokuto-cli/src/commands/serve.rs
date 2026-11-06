@@ -88,8 +88,9 @@ pub fn validate_model_dir(dir: &Path) -> Result<(), String> {
 pub async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "sokuto_server=info,tower_http=info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "sokuto=info,sokuto_cli=info,sokuto_core=info,sokuto_runtime=info,sokuto_server=info,tower_http=info".into()
+            }),
         )
         .try_init();
 

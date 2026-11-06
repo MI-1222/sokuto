@@ -19,8 +19,24 @@ use sokuto_cli::{Cli, Commands};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// 構造化ログトレーシング (`tracing_subscriber`) を初期化する。
+///
+/// 環境変数 `RUST_LOG` が設定されている場合はそのディレクティブを優先し、
+/// 未指定の場合は sokuto 関連クレートおよび HTTP サーバーの標準ログレベル (info) を適用する。
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "sokuto=info,sokuto_cli=info,sokuto_core=info,sokuto_runtime=info,sokuto_server=info,tower_http=info".into()
+            }),
+        )
+        .try_init();
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_tracing();
+
     let cli = Cli::parse();
 
     match cli.command {

@@ -8,7 +8,8 @@ use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_core::gating::GatingConfig;
 use sokuto_runtime::dag::InProcessDagExecutor;
 use sokuto_runtime::engine::{
-    CoarseToFineConfig, DualSessionEngine, InferenceEngine, StateCacheManager,
+    CacheCompressionMode, CoarseToFineConfig, DualSessionEngine, InferenceEngine, SessionConfig,
+    StateCacheManager,
 };
 use sokuto_runtime::hierarchical::HierarchicalRouterConfig;
 use sokuto_runtime::hierarchical::mapping::HierarchicalMapping;
@@ -246,6 +247,79 @@ impl AppState {
                     "階層マッピング JSON のパースに失敗しました: {:?}",
                     mapping_path
                 );
+            }
+        }
+
+        self
+    }
+
+    /// モデルディレクトリ内のデュアルセッションモデル(`state_encoder.onnx`, `query_evaluator.onnx`)を検出し、
+    /// 存在すれば環境変数の設定に基づいて `DualSessionEngine` と `StateCacheManager` を初期化して登録する。
+    ///
+    /// # 引数
+    /// - `dir`: モデルファイルが配置されているディレクトリ。
+    /// - `session_config`: ONNX Runtime セッション構築設定。
+    pub fn init_dual_engine_from_dir<P: AsRef<std::path::Path>>(
+        mut self,
+        dir: P,
+        session_config: SessionConfig,
+    ) -> Self {
+        let dir = dir.as_ref();
+        let state_model_path = dir.join("state_encoder.onnx");
+        let query_model_path = dir.join("query_evaluator.onnx");
+
+        if state_model_path.exists() && query_model_path.exists() {
+            tracing::info!(
+                "2 セッション分割型モデルを検出しました: State={}, Query={}",
+                state_model_path.display(),
+                query_model_path.display()
+            );
+
+            let cache_max_bytes = std::env::var("SOKUTO_STATE_CACHE_MAX_BYTES")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(512 * 1024 * 1024);
+
+            let cache_ttl_secs = std::env::var("SOKUTO_STATE_CACHE_TTL_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(600);
+
+            let compression_mode = match std::env::var("SOKUTO_STATE_CACHE_COMPRESSION")
+                .unwrap_or_else(|_| "fp16".to_string())
+                .to_lowercase()
+                .as_str()
+            {
+                "none" | "fp32" => CacheCompressionMode::None,
+                "int8" => CacheCompressionMode::Int8Symmetric,
+                _ => CacheCompressionMode::Fp16,
+            };
+
+            let cache_manager = Arc::new(StateCacheManager::new(
+                cache_max_bytes,
+                cache_ttl_secs,
+                compression_mode,
+            ));
+
+            match DualSessionEngine::new(
+                &state_model_path,
+                &query_model_path,
+                session_config,
+                Arc::clone(&cache_manager),
+            ) {
+                Ok(dual_engine) => {
+                    tracing::info!(
+                        "DualSessionEngine を初期化しました (キャッシュ上限: {}MB, 圧縮: {:?})。",
+                        cache_max_bytes / (1024 * 1024),
+                        compression_mode
+                    );
+                    self = self.with_dual_engine(Arc::new(dual_engine), cache_manager);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "DualSessionEngine の構築に失敗したため、単一モデルモードで運用します: {err}"
+                    );
+                }
             }
         }
 

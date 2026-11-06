@@ -348,7 +348,7 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
         };
 
         // ウォームアップ
-        for _ in 0..args.warmup.min(5) {
+        for _ in 0..args.warmup {
             let _ = engine.evaluate_question_coarse_to_fine(
                 &tokenizer,
                 state,
@@ -358,16 +358,9 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
             )?;
         }
 
-        let iterations = if scenario_filter == "all" && args.iterations > 20 {
-            eprintln!(
-                "Coarse-to-Fine シナリオは高負荷のため、全体ベンチマーク時は反復回数を 20 回に制限して実行します (個別実行時は --scenario coarse で全数実行可能)。"
-            );
-            20
-        } else {
-            args.iterations
-        };
-        let mut durations = Vec::with_capacity(iterations);
-        for _ in 0..iterations {
+        // 本測定
+        let mut durations = Vec::with_capacity(args.iterations);
+        for _ in 0..args.iterations {
             let start = Instant::now();
             let _ = engine.evaluate_question_coarse_to_fine(
                 &tokenizer,

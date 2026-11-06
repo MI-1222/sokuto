@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use sokuto_cli::{BenchmarkScenario, Cli, Commands};
+use sokuto_cli::{BenchmarkScenario, Cli, Commands, ExecutionProviderArg};
 
 #[test]
 fn test_parse_export_openapi_default() {
@@ -81,7 +81,7 @@ fn test_parse_serve_custom_options() {
             assert_eq!(args.port, 8080);
             assert_eq!(args.model_dir, PathBuf::from("custom_models"));
             assert_eq!(args.pool_size, 4);
-            assert_eq!(args.provider, Some("cpu".to_string()));
+            assert_eq!(args.provider, Some(ExecutionProviderArg::Cpu));
             assert_eq!(args.intra_threads, Some(4));
             assert_eq!(args.inter_threads, Some(2));
         }
@@ -142,7 +142,7 @@ fn test_parse_benchmark_custom_options() {
             assert_eq!(args.model_dir, PathBuf::from("bench_model"));
             assert_eq!(args.iterations, 100);
             assert_eq!(args.warmup, 20);
-            assert_eq!(args.provider, Some("coreml".to_string()));
+            assert_eq!(args.provider, Some(ExecutionProviderArg::Coreml));
             assert_eq!(args.scenario, BenchmarkScenario::Batch);
             assert_eq!(args.pool_size, 4);
             assert_eq!(args.intra_threads, Some(2));
@@ -152,6 +152,20 @@ fn test_parse_benchmark_custom_options() {
         }
         _ => panic!("Benchmark コマンドのパースに失敗。"),
     }
+}
+
+#[test]
+fn test_parse_benchmark_unknown_provider_fails() {
+    let args = ["sokuto", "benchmark", "--provider", "unknown_backend"];
+    let result = Cli::try_parse_from(args);
+    assert!(result.is_err(), "未知の provider はエラーになること。");
+}
+
+#[test]
+fn test_parse_serve_unknown_provider_fails() {
+    let args = ["sokuto", "serve", "--provider", "invalid_backend"];
+    let result = Cli::try_parse_from(args);
+    assert!(result.is_err(), "未知の provider はエラーになること。");
 }
 
 #[test]

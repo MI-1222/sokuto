@@ -54,6 +54,32 @@ impl ExecutionProvider {
     }
 }
 
+impl std::fmt::Display for ExecutionProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
+impl std::str::FromStr for ExecutionProvider {
+    type Err = String;
+
+    /// 文字列から [`ExecutionProvider`] をパースする。
+    ///
+    /// 大小文字を区別せず、`auto`, `coreml`, `cuda`, `tensorrt`, `cpu` を解釈する。
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "coreml" => Ok(Self::CoreML),
+            "cuda" => Ok(Self::CUDA),
+            "tensorrt" => Ok(Self::TensorRT),
+            "cpu" => Ok(Self::CPU),
+            other => Err(format!(
+                "未知の Execution Provider です: '{other}'。利用可能: auto, coreml, cuda, tensorrt, cpu。"
+            )),
+        }
+    }
+}
+
 /// グラフ最適化レベル。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OptimizationLevel {
@@ -245,5 +271,42 @@ mod tests {
         assert!(!cfg2.parallel_execution);
         assert!(cfg2.intra_threads.is_some());
         assert!(cfg2.intra_threads.unwrap() <= 8);
+    }
+
+    #[test]
+    fn test_execution_provider_from_str() {
+        use std::str::FromStr;
+
+        assert_eq!(
+            ExecutionProvider::from_str("auto").unwrap(),
+            ExecutionProvider::Auto
+        );
+        assert_eq!(
+            ExecutionProvider::from_str("CoreML").unwrap(),
+            ExecutionProvider::CoreML
+        );
+        assert_eq!(
+            ExecutionProvider::from_str("CUDA").unwrap(),
+            ExecutionProvider::CUDA
+        );
+        assert_eq!(
+            ExecutionProvider::from_str("tensorrt").unwrap(),
+            ExecutionProvider::TensorRT
+        );
+        assert_eq!(
+            ExecutionProvider::from_str("CPU").unwrap(),
+            ExecutionProvider::CPU
+        );
+
+        assert!(ExecutionProvider::from_str("invalid_provider").is_err());
+    }
+
+    #[test]
+    fn test_execution_provider_display() {
+        assert_eq!(format!("{}", ExecutionProvider::Auto), "Auto");
+        assert_eq!(format!("{}", ExecutionProvider::CoreML), "CoreML");
+        assert_eq!(format!("{}", ExecutionProvider::CUDA), "CUDA");
+        assert_eq!(format!("{}", ExecutionProvider::TensorRT), "TensorRT");
+        assert_eq!(format!("{}", ExecutionProvider::CPU), "CPU");
     }
 }

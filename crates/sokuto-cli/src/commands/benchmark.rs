@@ -18,7 +18,7 @@ use sokuto_runtime::engine::{BatchScratchpad, InferenceEngine};
 use sokuto_runtime::tokenizer::JevTokenizer;
 
 use crate::commands::model_dir::validate_model_dir;
-use crate::commands::session_config::SessionConfigBuilder;
+use crate::commands::session_config::{ExecutionProviderArg, SessionConfigBuilder};
 
 /// ベンチマーク実行対象シナリオ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, Serialize, Deserialize)]
@@ -86,9 +86,9 @@ pub struct BenchmarkArgs {
     #[arg(short = 'w', long, default_value_t = 10)]
     pub warmup: usize,
 
-    /// 優先 Execution Provider (auto, coreml, cuda, tensorrt, cpu)。
+    /// 優先 Execution Provider。
     #[arg(long)]
-    pub provider: Option<String>,
+    pub provider: Option<ExecutionProviderArg>,
 
     /// 実行対象シナリオ (all, single, batch, coarse, scratchpad)。
     #[arg(short = 's', long, default_value = "all")]
@@ -238,7 +238,7 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
         .pool_size(args.pool_size)
         .intra_threads(args.intra_threads)
         .inter_threads(args.inter_threads)
-        .provider_opt(args.provider.as_deref())
+        .provider_opt(args.provider)
         .enable_mem_arena(args.enable_mem_arena())
         .build()?;
 

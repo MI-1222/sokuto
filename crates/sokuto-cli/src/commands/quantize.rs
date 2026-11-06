@@ -285,20 +285,17 @@ fn find_project_root(
         }
     };
 
+    let cwd = std::env::current_dir()?;
     let start_path = if start_dir.is_absolute() {
         start_dir.to_path_buf()
     } else {
-        std::env::current_dir()?.join(start_dir)
+        cwd.join(start_dir)
     };
 
-    if let Some(root) = find_root(start_path) {
-        return Ok(root);
-    }
-
-    // カレントディレクトリ起点でも探索
-    let cwd = std::env::current_dir()?;
-    if let Some(root) = find_root(cwd) {
-        return Ok(root);
+    for candidate in [start_path, cwd] {
+        if let Some(root) = find_root(candidate) {
+            return Ok(root);
+        }
     }
 
     Err(
@@ -344,5 +341,20 @@ mod tests {
                 "検出されたプロジェクトルートが train であること。"
             );
         }
+    }
+
+    #[test]
+    fn test_find_project_root() {
+        let cwd = std::env::current_dir().expect("カレントディレクトリの取得に成功。");
+        let root = find_project_root(&cwd);
+        assert!(
+            root.is_ok(),
+            "リポジトリ内のカレントディレクトリからプロジェクトルートを特定できること。"
+        );
+        let root_path = root.unwrap();
+        assert!(
+            root_path.join("Cargo.toml").exists(),
+            "特定されたルートに Cargo.toml が存在すること。"
+        );
     }
 }

@@ -207,7 +207,7 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 }
 
 /// 指定されたシナリオ操作をウォームアップ実行および本測定し、統計量を算出する。
-fn measure_scenario<F, T>(
+fn measure_scenario<F, T, E>(
     name: &str,
     decisions_per_run: usize,
     warmup: usize,
@@ -215,15 +215,16 @@ fn measure_scenario<F, T>(
     mut op: F,
 ) -> Result<ScenarioStats, CliError>
 where
-    F: FnMut() -> Result<T, CliError>,
+    F: FnMut() -> Result<T, E>,
+    E: Into<CliError>,
 {
     for _ in 0..warmup {
-        let _ = op()?;
+        let _ = op().map_err(Into::into)?;
     }
     let mut durations = Vec::with_capacity(iterations);
     for _ in 0..iterations {
         let start = Instant::now();
-        let _ = op()?;
+        let _ = op().map_err(Into::into)?;
         durations.push(start.elapsed().as_secs_f64() * 1000.0);
     }
     Ok(compute_stats(name, decisions_per_run, &mut durations))
@@ -307,11 +308,7 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), CliError> {
             1,
             args.warmup,
             args.iterations,
-            || {
-                engine
-                    .forward_question(&tokenized_choice)
-                    .map_err(Into::into)
-            },
+            || engine.forward_question(&tokenized_choice),
         )?);
 
         // E2E パイプライン (トークナイズ + 推論 + 決定プリミティブ数理解決・ゲーティング)
@@ -321,14 +318,12 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), CliError> {
             args.warmup,
             args.iterations,
             || {
-                engine
-                    .predict_single_question(
-                        &tokenizer,
-                        state_choice,
-                        &question_choice,
-                        &calib_config,
-                    )
-                    .map_err(Into::into)
+                engine.predict_single_question(
+                    &tokenizer,
+                    state_choice,
+                    &question_choice,
+                    &calib_config,
+                )
             },
         )?);
 
@@ -353,11 +348,7 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), CliError> {
             1,
             args.warmup,
             args.iterations,
-            || {
-                engine
-                    .forward_question(&tokenized_score)
-                    .map_err(Into::into)
-            },
+            || engine.forward_question(&tokenized_score),
         )?);
 
         suite_results.scenarios.push(measure_scenario(
@@ -366,14 +357,12 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), CliError> {
             args.warmup,
             args.iterations,
             || {
-                engine
-                    .predict_single_question(
-                        &tokenizer,
-                        state_score,
-                        &question_score,
-                        &calib_config,
-                    )
-                    .map_err(Into::into)
+                engine.predict_single_question(
+                    &tokenizer,
+                    state_score,
+                    &question_score,
+                    &calib_config,
+                )
             },
         )?);
 
@@ -387,7 +376,7 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), CliError> {
             1,
             args.warmup,
             args.iterations,
-            || engine.forward_question(&tokenized_noul).map_err(Into::into),
+            || engine.forward_question(&tokenized_noul),
         )?);
 
         suite_results.scenarios.push(measure_scenario(
@@ -396,9 +385,12 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), CliError> {
             args.warmup,
             args.iterations,
             || {
-                engine
-                    .predict_single_question(&tokenizer, state_noul, &question_noul, &calib_config)
-                    .map_err(Into::into)
+                engine.predict_single_question(
+                    &tokenizer,
+                    state_noul,
+                    &question_noul,
+                    &calib_config,
+                )
             },
         )?);
     }
@@ -428,7 +420,7 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), CliError> {
                 batch_size,
                 args.warmup,
                 args.iterations,
-                || engine.forward_batch_tokenized(&batch).map_err(Into::into),
+                || engine.forward_batch_tokenized(&batch),
             )?);
 
             // E2E パイプライン (トークナイズ + バッチ推論 + 各質問の決定数理解決・ゲーティング)
@@ -437,11 +429,7 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), CliError> {
                 batch_size,
                 args.warmup,
                 args.iterations,
-                || {
-                    engine
-                        .evaluate_batch_questions(&tokenizer, state, &questions, &calib_config)
-                        .map_err(Into::into)
-                },
+                || engine.evaluate_batch_questions(&tokenizer, state, &questions, &calib_config),
             )?);
         }
     }
@@ -471,11 +459,7 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), CliError> {
             1,
             args.warmup,
             args.iterations,
-            || {
-                engine
-                    .predict_single_question(&tokenizer, state, &question, &calib_config)
-                    .map_err(Into::into)
-            },
+            || engine.predict_single_question(&tokenizer, state, &question, &calib_config),
         )?);
 
         // Coarse-to-Fine 評価 (粗密2段階探索による枝刈り E2E パイプライン)
@@ -485,15 +469,13 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), CliError> {
             args.warmup,
             args.iterations,
             || {
-                engine
-                    .evaluate_question_coarse_to_fine(
-                        &tokenizer,
-                        state,
-                        &question,
-                        &calib_config,
-                        &coarse_config,
-                    )
-                    .map_err(Into::into)
+                engine.evaluate_question_coarse_to_fine(
+                    &tokenizer,
+                    state,
+                    &question,
+                    &calib_config,
+                    &coarse_config,
+                )
             },
         )?);
     }
@@ -519,11 +501,7 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), CliError> {
             8,
             args.warmup,
             args.iterations,
-            || {
-                engine
-                    .evaluate_batch_questions(&tokenizer, state, &questions, &calib_config)
-                    .map_err(Into::into)
-            },
+            || engine.evaluate_batch_questions(&tokenizer, state, &questions, &calib_config),
         )?);
 
         // スクラッチパッド再利用バッチ評価 (アロケーションを抑える E2E パイプライン)
@@ -534,15 +512,13 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), CliError> {
             args.warmup,
             args.iterations,
             || {
-                engine
-                    .evaluate_batch_questions_with_scratchpad(
-                        &tokenizer,
-                        state,
-                        &questions,
-                        &calib_config,
-                        &mut scratchpad,
-                    )
-                    .map_err(Into::into)
+                engine.evaluate_batch_questions_with_scratchpad(
+                    &tokenizer,
+                    state,
+                    &questions,
+                    &calib_config,
+                    &mut scratchpad,
+                )
             },
         )?);
     }

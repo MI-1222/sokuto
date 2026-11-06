@@ -12,7 +12,6 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use sokuto_core::contract::calibration::CalibrationConfig;
-use sokuto_core::decision::evaluate_question;
 use sokuto_core::schema::Question;
 use sokuto_runtime::engine::coarse::CoarseToFineConfig;
 use sokuto_runtime::engine::{BatchScratchpad, InferenceEngine};
@@ -267,17 +266,21 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
             },
         )?);
 
-        // E2E パイプライン (トークナイズ + 推論 + 決定プリミティブ数理解決)
+        // E2E パイプライン (トークナイズ + 推論 + 決定プリミティブ数理解決・ゲーティング)
         suite_results.scenarios.push(measure_scenario(
             "Single Choice (K=3, E2E)",
             1,
             args.warmup,
             args.iterations,
             || {
-                let tok = tokenizer.encode_question(state_choice, &question_choice)?;
-                let logits = engine.forward_question(&tok)?;
-                let _ = evaluate_question(&question_choice, &logits, &calib_config)?;
-                Ok(())
+                engine
+                    .predict_single_question(
+                        &tokenizer,
+                        state_choice,
+                        &question_choice,
+                        &calib_config,
+                    )
+                    .map_err(Into::into)
             },
         )?);
 
@@ -315,10 +318,14 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
             args.warmup,
             args.iterations,
             || {
-                let tok = tokenizer.encode_question(state_score, &question_score)?;
-                let logits = engine.forward_question(&tok)?;
-                let _ = evaluate_question(&question_score, &logits, &calib_config)?;
-                Ok(())
+                engine
+                    .predict_single_question(
+                        &tokenizer,
+                        state_score,
+                        &question_score,
+                        &calib_config,
+                    )
+                    .map_err(Into::into)
             },
         )?);
 
@@ -341,10 +348,9 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
             args.warmup,
             args.iterations,
             || {
-                let tok = tokenizer.encode_question(state_noul, &question_noul)?;
-                let logits = engine.forward_question(&tok)?;
-                let _ = evaluate_question(&question_noul, &logits, &calib_config)?;
-                Ok(())
+                engine
+                    .predict_single_question(&tokenizer, state_noul, &question_noul, &calib_config)
+                    .map_err(Into::into)
             },
         )?);
     }
@@ -418,10 +424,9 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
             args.warmup,
             args.iterations,
             || {
-                let tok = tokenizer.encode_question(state, &question)?;
-                let logits = engine.forward_question(&tok)?;
-                let _ = evaluate_question(&question, &logits, &calib_config)?;
-                Ok(())
+                engine
+                    .predict_single_question(&tokenizer, state, &question, &calib_config)
+                    .map_err(Into::into)
             },
         )?);
 

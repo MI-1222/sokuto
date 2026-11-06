@@ -3,6 +3,7 @@
 //! CLI 引数に基づき ONNX Runtime の `SessionConfig` を構築するビルダーおよび
 //! Execution Provider のパース処理を提供する。
 
+use crate::error::CliError;
 use sokuto_runtime::engine::{ExecutionProvider, SessionConfig};
 
 /// CLI 引数用の Execution Provider (実行バックエンド) 指定。
@@ -69,10 +70,10 @@ impl std::fmt::Display for ExecutionProviderArg {
 }
 
 impl std::str::FromStr for ExecutionProviderArg {
-    type Err = String;
+    type Err = CliError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let ep: ExecutionProvider = s.parse()?;
+        let ep = parse_provider(s)?;
         Ok(Self::from(ep))
     }
 }
@@ -83,9 +84,9 @@ impl std::str::FromStr for ExecutionProviderArg {
 ///
 /// # エラー
 ///
-/// サポートされていないプロバイダ文字列が指定された場合はエラーメッセージを返す。
-pub fn parse_provider(name: &str) -> Result<ExecutionProvider, String> {
-    name.parse()
+/// サポートされていないプロバイダ文字列が指定された場合は [`CliError::UnknownProvider`] を返す。
+pub fn parse_provider(name: &str) -> Result<ExecutionProvider, CliError> {
+    name.parse().map_err(CliError::UnknownProvider)
 }
 
 /// CLI 引数から [`SessionConfig`] を段階的に構築するビルダー。
@@ -153,7 +154,7 @@ impl SessionConfigBuilder {
     /// # エラー
     ///
     /// 未知のプロバイダ文字列が渡された場合はエラーを返却する。
-    pub fn provider_str(mut self, provider: &str) -> Result<Self, String> {
+    pub fn provider_str(mut self, provider: &str) -> Result<Self, CliError> {
         self.provider = Some(parse_provider(provider)?);
         Ok(self)
     }
@@ -169,7 +170,7 @@ impl SessionConfigBuilder {
     /// `Auto` の場合はデフォルトの優先リストを、特定プロバイダの場合は
     /// `[指定プロバイダ, CPU]` というフォールバック順序を設定する。
     /// なお、指定プロバイダが `CPU` の場合は重複登録を防ぐため `[CPU]` のみを設定する。
-    pub fn build(self) -> Result<SessionConfig, String> {
+    pub fn build(self) -> Result<SessionConfig, CliError> {
         let mut session_config = SessionConfig {
             pool_size: self.pool_size.max(1),
             intra_threads: self.intra_threads,
@@ -199,7 +200,7 @@ pub fn build_session_config(
     intra_threads: Option<usize>,
     inter_threads: Option<usize>,
     provider: Option<impl Into<ExecutionProvider>>,
-) -> Result<SessionConfig, String> {
+) -> Result<SessionConfig, CliError> {
     SessionConfigBuilder::new()
         .pool_size(pool_size)
         .intra_threads(intra_threads)

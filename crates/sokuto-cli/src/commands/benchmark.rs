@@ -19,6 +19,7 @@ use sokuto_runtime::tokenizer::JevTokenizer;
 
 use crate::commands::model_dir::validate_model_dir;
 use crate::commands::session_config::{ExecutionProviderArg, SessionConfigBuilder};
+use crate::error::CliError;
 
 /// ベンチマーク実行対象シナリオ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, Serialize, Deserialize)]
@@ -212,9 +213,9 @@ fn measure_scenario<F, T>(
     warmup: usize,
     iterations: usize,
     mut op: F,
-) -> Result<ScenarioStats, Box<dyn std::error::Error + Send + Sync>>
+) -> Result<ScenarioStats, CliError>
 where
-    F: FnMut() -> Result<T, Box<dyn std::error::Error + Send + Sync>>,
+    F: FnMut() -> Result<T, CliError>,
 {
     for _ in 0..warmup {
         let _ = op()?;
@@ -229,7 +230,7 @@ where
 }
 
 /// ベンチマークコマンドを実行する。
-pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), CliError> {
     // 1. モデルディレクトリ検証
     validate_model_dir(&args.model_dir)?;
 

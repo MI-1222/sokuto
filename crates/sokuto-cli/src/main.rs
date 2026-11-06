@@ -14,13 +14,13 @@ use sokuto_cli::commands::export_openapi::run_export_openapi;
 use sokuto_cli::commands::healthcheck::run_healthcheck;
 use sokuto_cli::commands::quantize::run_quantize;
 use sokuto_cli::commands::serve::run_serve;
-use sokuto_cli::{Cli, Commands, init_tracing};
+use sokuto_cli::{Cli, CliError, Commands, init_tracing};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> Result<(), CliError> {
     init_tracing();
 
     let cli = Cli::parse();

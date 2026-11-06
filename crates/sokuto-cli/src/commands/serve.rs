@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 pub use crate::commands::model_dir::{ModelDirError, validate_model_dir};
 use crate::commands::session_config::{ExecutionProviderArg, SessionConfigBuilder};
+use crate::error::CliError;
 use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_runtime::engine::InferenceEngine;
 use sokuto_runtime::tokenizer::JevTokenizer;
@@ -57,7 +58,7 @@ pub struct ServeArgs {
 ///
 /// # 引数
 /// - `args`: サーバー起動構成パラメータ。
-pub async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
     // 1. モデルディレクトリの検証 (Fast-Fail)
     validate_model_dir(&args.model_dir)?;
 
@@ -110,7 +111,9 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error 
     let state = Arc::new(state);
     let addr = resolve_socket_addr(&args.host, args.port).await?;
 
-    sokuto_server::run_server(addr, state, prometheus_handle).await?;
+    sokuto_server::run_server(addr, state, prometheus_handle)
+        .await
+        .map_err(|e| CliError::Server(e.to_string()))?;
 
     Ok(())
 }
@@ -123,18 +126,20 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error 
 /// # 引数
 /// - `host`: ホスト名または IP アドレス (例: "127.0.0.1", "localhost", "::1", "[::1]")。
 /// - `port`: ポート番号。
-pub async fn resolve_socket_addr(
-    host: &str,
-    port: u16,
-) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
+pub async fn resolve_socket_addr(host: &str, port: u16) -> Result<SocketAddr, CliError> {
     let normalized_host = host.trim_start_matches('[').trim_end_matches(']');
     let mut addrs = tokio::net::lookup_host((normalized_host, port))
         .await
-        .map_err(|err| format!("ホスト名 '{host}:{port}' の名前解決に失敗しました: {err}。"))?;
+        .map_err(|err| {
+            CliError::Config(format!(
+                "ホスト名 '{host}:{port}' の名前解決に失敗しました: {err}。"
+            ))
+        })?;
 
     addrs.next().ok_or_else(|| {
-        format!("ホスト名 '{host}:{port}' に対応するソケットアドレスが見つかりませんでした。")
-            .into()
+        CliError::Config(format!(
+            "ホスト名 '{host}:{port}' に対応するソケットアドレスが見つかりませんでした。"
+        ))
     })
 }
 

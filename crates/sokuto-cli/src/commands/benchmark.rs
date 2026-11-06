@@ -22,28 +22,54 @@ use crate::commands::serve::validate_model_dir;
 use crate::commands::session_config::SessionConfigBuilder;
 
 /// ベンチマーク実行構成パラメータ。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, clap::Args, PartialEq, Eq)]
 pub struct BenchmarkArgs {
     /// モデルファイル格納ディレクトリ。
+    #[arg(short, long, default_value = "models/default")]
     pub model_dir: PathBuf,
+
     /// 測定反復回数。
+    #[arg(short = 'n', long, default_value_t = 50)]
     pub iterations: usize,
+
     /// ウォームアップ反復回数。
+    #[arg(short = 'w', long, default_value_t = 10)]
     pub warmup: usize,
-    /// 優先 Execution Provider。
+
+    /// 優先 Execution Provider (auto, coreml, cuda, tensorrt, cpu)。
+    #[arg(long)]
     pub provider: Option<String>,
-    /// 実行対象シナリオ ("all", "single", "batch", "coarse", "scratchpad")。
+
+    /// 実行対象シナリオ (all, single, batch, coarse, scratchpad)。
+    #[arg(short = 's', long, default_value = "all")]
     pub scenario: String,
+
     /// セッションプールサイズ。
+    #[arg(long, default_value_t = 1)]
     pub pool_size: usize,
+
     /// 単一オペレータ内の並列スレッド数 (intra-op)。
+    #[arg(long)]
     pub intra_threads: Option<usize>,
+
     /// 複数オペレータ間の並列スレッド数 (inter-op)。
+    #[arg(long)]
     pub inter_threads: Option<usize>,
-    /// CPU メモリアリーナを有効化するかどうか。
-    pub enable_mem_arena: bool,
+
+    /// CPU メモリアリーナを無効化する (OS アロケータ mimalloc に都度返却)。
+    #[arg(long, default_value_t = false)]
+    pub no_mem_arena: bool,
+
     /// CI 連携用 JSON 形式出力フラグ。
+    #[arg(long)]
     pub json: bool,
+}
+
+impl BenchmarkArgs {
+    /// CPU メモリアリーナが有効かどうかを判定する。
+    pub fn enable_mem_arena(&self) -> bool {
+        !self.no_mem_arena
+    }
 }
 
 /// 単一シナリオの計測統計サマリー。
@@ -166,7 +192,7 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
         .intra_threads(args.intra_threads)
         .inter_threads(args.inter_threads)
         .provider_opt(args.provider.as_deref())
-        .enable_mem_arena(args.enable_mem_arena)
+        .enable_mem_arena(args.enable_mem_arena())
         .build()?;
 
     let onnx_path = args.model_dir.join("model.onnx");

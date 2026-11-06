@@ -8,11 +8,19 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 /// ヘルスチェック実行引数構造体。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, clap::Args, PartialEq, Eq)]
 pub struct HealthcheckArgs {
     /// 監視対象 URL (例: `http://127.0.0.1:3000/ready`)。
+    #[arg(
+        short,
+        long,
+        env = "SOKUTO_HEALTHCHECK_URL",
+        default_value = "http://127.0.0.1:3000/ready"
+    )]
     pub url: String,
+
     /// 接続および応答タイムアウト秒数。
+    #[arg(short, long, default_value_t = 3)]
     pub timeout_secs: u64,
 }
 

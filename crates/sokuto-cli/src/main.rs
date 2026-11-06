@@ -9,11 +9,11 @@
 //! - OpenAPI 3.1 仕様書の静的エクスポート (`export-openapi`)。
 
 use clap::Parser;
-use sokuto_cli::commands::benchmark::{BenchmarkArgs, run_benchmark};
+use sokuto_cli::commands::benchmark::run_benchmark;
 use sokuto_cli::commands::export_openapi::run_export_openapi;
-use sokuto_cli::commands::healthcheck::{HealthcheckArgs, run_healthcheck};
-use sokuto_cli::commands::quantize::{QuantizeArgs, run_quantize};
-use sokuto_cli::commands::serve::{ServeArgs, run_serve};
+use sokuto_cli::commands::healthcheck::run_healthcheck;
+use sokuto_cli::commands::quantize::run_quantize;
+use sokuto_cli::commands::serve::run_serve;
 use sokuto_cli::{Cli, Commands};
 
 #[global_allocator]
@@ -27,71 +27,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::ExportOpenapi { output } => {
             run_export_openapi(output)?;
         }
-        Commands::Healthcheck { url, timeout_secs } => {
-            let args = HealthcheckArgs { url, timeout_secs };
+        Commands::Healthcheck(args) => {
             run_healthcheck(args)?;
         }
-        Commands::Serve {
-            host,
-            port,
-            model_dir,
-            pool_size,
-            provider,
-            intra_threads,
-            inter_threads,
-        } => {
-            let args = ServeArgs {
-                host,
-                port,
-                model_dir,
-                pool_size,
-                provider,
-                intra_threads,
-                inter_threads,
-            };
+        Commands::Serve(args) => {
             run_serve(args).await?;
         }
-        Commands::Benchmark {
-            model_dir,
-            iterations,
-            warmup,
-            provider,
-            scenario,
-            pool_size,
-            intra_threads,
-            inter_threads,
-            no_mem_arena,
-            json,
-        } => {
-            let args = BenchmarkArgs {
-                model_dir,
-                iterations,
-                warmup,
-                provider,
-                scenario,
-                pool_size,
-                intra_threads,
-                inter_threads,
-                enable_mem_arena: !no_mem_arena,
-                json,
-            };
+        Commands::Benchmark(args) => {
             // CPU バウンドな計算ループをワーカースレッドのブロッキングから分離
             tokio::task::spawn_blocking(move || run_benchmark(args)).await??;
         }
-        Commands::Quantize {
-            model_dir,
-            output_dir,
-            per_channel,
-            verify,
-            script_path,
-        } => {
-            let args = QuantizeArgs {
-                model_dir,
-                output_dir,
-                per_channel,
-                verify,
-                script_path,
-            };
+        Commands::Quantize(args) => {
             tokio::task::spawn_blocking(move || run_quantize(args)).await??;
         }
     }

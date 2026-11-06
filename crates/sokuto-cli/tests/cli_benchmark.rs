@@ -25,7 +25,7 @@ fn test_run_benchmark_fast_smoke() {
         pool_size: 1,
         intra_threads: None,
         inter_threads: None,
-        enable_mem_arena: true,
+        no_mem_arena: false,
         json: false,
     };
 
@@ -50,7 +50,7 @@ fn test_run_benchmark_json_output() {
         pool_size: 1,
         intra_threads: None,
         inter_threads: None,
-        enable_mem_arena: true,
+        no_mem_arena: false,
         json: true,
     };
 

@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use sokuto_cli::commands::benchmark::{BenchmarkArgs, run_benchmark};
+use sokuto_cli::commands::benchmark::{BenchmarkArgs, BenchmarkScenario, run_benchmark};
 
 #[test]
 fn test_run_benchmark_fast_smoke() {
@@ -21,7 +21,7 @@ fn test_run_benchmark_fast_smoke() {
         iterations: 2,
         warmup: 1,
         provider: Some("cpu".to_string()),
-        scenario: "single".to_string(),
+        scenario: BenchmarkScenario::Single,
         pool_size: 1,
         intra_threads: None,
         inter_threads: None,
@@ -30,7 +30,7 @@ fn test_run_benchmark_fast_smoke() {
     };
 
     let result = run_benchmark(args);
-    assert!(result.is_ok(), "単一質問ベンチマークの実行が成功すること。");
+    assert!(result.is_ok(), "単一質問ベンチマークの実行に成功。");
 }
 
 #[test]
@@ -46,7 +46,7 @@ fn test_run_benchmark_json_output() {
         iterations: 1,
         warmup: 1,
         provider: Some("cpu".to_string()),
-        scenario: "scratchpad".to_string(),
+        scenario: BenchmarkScenario::Scratchpad,
         pool_size: 1,
         intra_threads: None,
         inter_threads: None,
@@ -57,6 +57,6 @@ fn test_run_benchmark_json_output() {
     let result = run_benchmark(args);
     assert!(
         result.is_ok(),
-        "スクラッチパッドベンチマーク (JSON モード) の実行が成功すること。"
+        "スクラッチパッドベンチマーク (JSON モード) の実行に成功。"
     );
 }

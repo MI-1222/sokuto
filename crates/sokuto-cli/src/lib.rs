@@ -4,7 +4,7 @@
 
 pub mod commands;
 
-pub use commands::benchmark::BenchmarkArgs;
+pub use commands::benchmark::{BenchmarkArgs, BenchmarkScenario};
 pub use commands::healthcheck::HealthcheckArgs;
 pub use commands::quantize::QuantizeArgs;
 pub use commands::serve::ServeArgs;

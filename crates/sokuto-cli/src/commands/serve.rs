@@ -40,17 +40,6 @@ pub struct ServeArgs {
     /// ONNX Runtime セッション構成引数。
     #[command(flatten)]
     pub session: SessionArgs,
-
-    /// CPU メモリアリーナを無効化する (OS アロケータ mimalloc に都度返却)。
-    #[arg(long, env = "SOKUTO_NO_MEM_ARENA", default_value_t = false)]
-    pub no_mem_arena: bool,
-}
-
-impl ServeArgs {
-    /// CPU メモリアリーナが有効かどうかを判定する。
-    pub fn enable_mem_arena(&self) -> bool {
-        !self.no_mem_arena
-    }
 }
 
 /// HTTP サーバー起動処理を実行する。
@@ -62,11 +51,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
     validate_model_dir(&args.model_dir)?;
 
     // 2. セッション設定の構築
-    let session_config = args
-        .session
-        .to_builder()
-        .enable_mem_arena(args.enable_mem_arena())
-        .build();
+    let session_config = args.session.build_config();
 
     let artifact_paths = ModelArtifactPaths::resolve(&args.model_dir);
 
@@ -128,28 +113,27 @@ mod tests {
                 provider: None,
                 intra_threads: None,
                 inter_threads: None,
+                no_mem_arena: false,
             },
-            no_mem_arena: false,
         };
         assert!(
-            args_default.enable_mem_arena(),
+            args_default.session.enable_mem_arena(),
             "デフォルトでメモリアリーナが有効であることの検証に成功。"
         );
 
         let args_no_arena = ServeArgs {
-            no_mem_arena: true,
+            session: SessionArgs {
+                no_mem_arena: true,
+                ..args_default.session
+            },
             ..args_default
         };
         assert!(
-            !args_no_arena.enable_mem_arena(),
+            !args_no_arena.session.enable_mem_arena(),
             "no_mem_arena 有効時にメモリアリーナが無効化されることの検証に成功。"
         );
 
-        let session_config = args_no_arena
-            .session
-            .to_builder()
-            .enable_mem_arena(args_no_arena.enable_mem_arena())
-            .build();
+        let session_config = args_no_arena.session.build_config();
         assert!(
             !session_config.enable_mem_arena,
             "SessionConfig にメモリアリーナ無効化が正しく伝播することの検証に成功。"

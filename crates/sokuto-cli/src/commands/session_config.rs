@@ -109,12 +109,21 @@ pub struct SessionArgs {
     /// 複数オペレータ間の並列スレッド数 (inter-op)。
     #[arg(long, env = "SOKUTO_INTER_THREADS")]
     pub inter_threads: Option<usize>,
+
+    /// CPU メモリアリーナを無効化する (OS アロケータ mimalloc に都度返却)。
+    #[arg(long, env = "SOKUTO_NO_MEM_ARENA", default_value_t = false)]
+    pub no_mem_arena: bool,
 }
 
 /// [`SessionArgs`] の型エイリアス。
 pub type SessionConfigArgs = SessionArgs;
 
 impl SessionArgs {
+    /// CPU メモリアリーナが有効かどうかを判定する。
+    pub fn enable_mem_arena(&self) -> bool {
+        !self.no_mem_arena
+    }
+
     /// 引数設定から [`SessionConfigBuilder`] を構築する。
     pub fn to_builder(&self) -> SessionConfigBuilder {
         SessionConfigBuilder::new()
@@ -122,6 +131,7 @@ impl SessionArgs {
             .intra_threads(self.intra_threads)
             .inter_threads(self.inter_threads)
             .provider_opt(self.provider)
+            .enable_mem_arena(self.enable_mem_arena())
     }
 
     /// 設定内容から [`SessionConfig`] を構築する。
@@ -378,14 +388,25 @@ mod tests {
             provider: Some(ExecutionProviderArg::Coreml),
             intra_threads: Some(2),
             inter_threads: Some(1),
+            no_mem_arena: false,
         };
+        assert!(args.enable_mem_arena());
         let config = args.build_config();
         assert_eq!(config.pool_size, 4);
         assert_eq!(config.intra_threads, Some(2));
         assert_eq!(config.inter_threads, Some(1));
+        assert!(config.enable_mem_arena);
         assert_eq!(
             config.preferred_providers,
             vec![ExecutionProvider::CoreML, ExecutionProvider::CPU]
         );
+
+        let args_no_arena = SessionArgs {
+            no_mem_arena: true,
+            ..args
+        };
+        assert!(!args_no_arena.enable_mem_arena());
+        let config_no_arena = args_no_arena.build_config();
+        assert!(!config_no_arena.enable_mem_arena);
     }
 }

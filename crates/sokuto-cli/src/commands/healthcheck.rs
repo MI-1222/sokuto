@@ -152,8 +152,7 @@ pub async fn run_healthcheck(args: HealthcheckArgs) -> Result<(), CliError> {
         .map_err(|_| CliError::HealthcheckFailed("リクエスト送信がタイムアウトしました。".into()))?
         .map_err(CliError::Io)?;
 
-    let (reader, _) = stream.into_split();
-    let mut reader = tokio::io::BufReader::new(reader);
+    let mut reader = tokio::io::BufReader::new(stream);
     let mut status_line = String::new();
     const MAX_STATUS_LINE_LEN: usize = 8192;
 

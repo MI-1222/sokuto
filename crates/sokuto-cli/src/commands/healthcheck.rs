@@ -5,7 +5,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// ヘルスチェック実行引数構造体。
 #[derive(Debug, Clone)]
@@ -27,14 +27,45 @@ fn parse_http_url(url: &str) -> Result<(String, u16, String), String> {
         None => (stripped, "/"),
     };
 
-    let (host, port) = if let Some(idx) = host_port.find(':') {
+    let (host, port) = if let Some(rest) = host_port.strip_prefix('[') {
+        let close_idx = rest.find(']').ok_or_else(|| {
+            format!("無効な IPv6 アドレス表記です。']' がありません: '{host_port}'。")
+        })?;
+        let ip_str = &rest[..close_idx];
+        if ip_str.is_empty() {
+            return Err(format!("IPv6 アドレスが空です: '{host_port}'。"));
+        }
+        ip_str
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|e| format!("無効な IPv6 アドレスです: '{ip_str}' ({e})。"))?;
+
+        let after = &rest[close_idx + 1..];
+        let port = if after.is_empty() {
+            80
+        } else if let Some(port_str) = after.strip_prefix(':') {
+            port_str
+                .parse::<u16>()
+                .map_err(|e| format!("ポート番号のパースに失敗しました: '{port_str}' ({e})。"))?
+        } else {
+            return Err(format!(
+                "無効な IPv6 ホスト・ポート形式です: '{host_port}'。"
+            ));
+        };
+        (format!("[{ip_str}]"), port)
+    } else if let Some(idx) = host_port.rfind(':') {
         let host = &host_port[..idx];
+        if host.is_empty() {
+            return Err(format!("ホスト名が空です: '{host_port}'。"));
+        }
         let port_str = &host_port[idx + 1..];
         let port = port_str
             .parse::<u16>()
             .map_err(|e| format!("ポート番号のパースに失敗しました: '{port_str}' ({e})。"))?;
         (host.to_string(), port)
     } else {
+        if host_port.is_empty() {
+            return Err(format!("ホスト名が空です: '{url}'。"));
+        }
         (host_port.to_string(), 80)
     };
 
@@ -56,6 +87,7 @@ pub fn run_healthcheck(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (host, port, path) = parse_http_url(&args.url)?;
     let timeout = Duration::from_secs(args.timeout_secs);
+    let deadline = Instant::now() + timeout;
 
     let socket_addrs: Vec<_> = format!("{host}:{port}").to_socket_addrs()?.collect();
     if socket_addrs.is_empty() {
@@ -66,7 +98,15 @@ pub fn run_healthcheck(
     let mut stream = None;
 
     for addr in socket_addrs {
-        match TcpStream::connect_timeout(&addr, timeout) {
+        let now = Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(now) else {
+            return Err("接続試行がタイムアウトしました。".into());
+        };
+        if remaining.is_zero() {
+            return Err("接続試行がタイムアウトしました。".into());
+        }
+
+        match TcpStream::connect_timeout(&addr, remaining) {
             Ok(s) => {
                 stream = Some(s);
                 break;
@@ -87,8 +127,14 @@ pub fn run_healthcheck(
         }
     };
 
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
+    let now = Instant::now();
+    let remaining = deadline
+        .checked_duration_since(now)
+        .unwrap_or(Duration::from_millis(1));
+    let io_timeout = remaining.max(Duration::from_millis(1));
+
+    stream.set_read_timeout(Some(io_timeout))?;
+    stream.set_write_timeout(Some(io_timeout))?;
 
     let user_agent = concat!("sokuto-healthcheck/", env!("CARGO_PKG_VERSION"));
     let request = format!(
@@ -166,8 +212,69 @@ mod tests {
         assert_eq!(port, 80);
         assert_eq!(path, "/health");
 
+        // IPv6 リテラル (ポート指定あり)
+        let (host, port, path) = parse_http_url("http://[::1]:3000/ready").unwrap();
+        assert_eq!(host, "[::1]");
+        assert_eq!(port, 3000);
+        assert_eq!(path, "/ready");
+
+        // IPv6 リテラル (ポート省略)
+        let (host, port, path) = parse_http_url("http://[::1]/ready").unwrap();
+        assert_eq!(host, "[::1]");
+        assert_eq!(port, 80);
+        assert_eq!(path, "/ready");
+
+        // IPv6 リテラル (パス省略)
+        let (host, port, path) = parse_http_url("http://[::1]").unwrap();
+        assert_eq!(host, "[::1]");
+        assert_eq!(port, 80);
+        assert_eq!(path, "/");
+
+        // 不正なスキーム
         let err = parse_http_url("https://localhost:3000/health");
         assert!(err.is_err());
+
+        // 不正な IPv6 表記 (閉じ括弧なし)
+        let err = parse_http_url("http://[::1:3000/ready");
+        assert!(err.is_err());
+
+        // 不正な IPv6 アドレス
+        let err = parse_http_url("http://[not-an-ip]:3000/ready");
+        assert!(err.is_err());
+
+        // ホスト名が空
+        let err = parse_http_url("http://:3000/ready");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_run_healthcheck_ipv6() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::thread;
+
+        let Ok(listener) = TcpListener::bind("[::1]:0") else {
+            // IPv6 ループバックが利用できない環境ではスキップ。
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+
+        let server_handle = thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+                let _ = socket.write_all(response.as_bytes());
+            }
+        });
+
+        let args = HealthcheckArgs {
+            url: format!("http://[::1]:{port}/health"),
+            timeout_secs: 5,
+        };
+
+        let result = run_healthcheck(args);
+        assert!(result.is_ok());
+
+        let _ = server_handle.join();
     }
 
     #[test]

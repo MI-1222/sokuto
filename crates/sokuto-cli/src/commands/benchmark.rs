@@ -20,6 +20,57 @@ use sokuto_runtime::tokenizer::JevTokenizer;
 use crate::commands::serve::validate_model_dir;
 use crate::commands::session_config::SessionConfigBuilder;
 
+/// ベンチマーク実行対象シナリオ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BenchmarkScenario {
+    /// 全シナリオを実行する。
+    #[default]
+    All,
+    /// 単一質問推論シナリオ (Choice, Score, Noul)。
+    Single,
+    /// バッチスケーリングシナリオ (Q=1, 2, 4, 8)。
+    Batch,
+    /// 粗密2段階探索シナリオ (Coarse-to-Fine vs Flat)。
+    Coarse,
+    /// スクラッチパッド再利用シナリオ。
+    Scratchpad,
+}
+
+impl BenchmarkScenario {
+    /// 単一質問シナリオを実行対象に含むかを判定する。
+    pub fn should_run_single(&self) -> bool {
+        matches!(self, Self::All | Self::Single)
+    }
+
+    /// バッチスケーリングシナリオを実行対象に含むかを判定する。
+    pub fn should_run_batch(&self) -> bool {
+        matches!(self, Self::All | Self::Batch)
+    }
+
+    /// 粗密2段階探索シナリオを実行対象に含むかを判定する。
+    pub fn should_run_coarse(&self) -> bool {
+        matches!(self, Self::All | Self::Coarse)
+    }
+
+    /// スクラッチパッド再利用シナリオを実行対象に含むかを判定する。
+    pub fn should_run_scratchpad(&self) -> bool {
+        matches!(self, Self::All | Self::Scratchpad)
+    }
+}
+
+impl std::fmt::Display for BenchmarkScenario {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::All => write!(f, "all"),
+            Self::Single => write!(f, "single"),
+            Self::Batch => write!(f, "batch"),
+            Self::Coarse => write!(f, "coarse"),
+            Self::Scratchpad => write!(f, "scratchpad"),
+        }
+    }
+}
+
 /// ベンチマーク実行構成パラメータ。
 #[derive(Debug, Clone, clap::Args, PartialEq, Eq)]
 pub struct BenchmarkArgs {
@@ -41,7 +92,7 @@ pub struct BenchmarkArgs {
 
     /// 実行対象シナリオ (all, single, batch, coarse, scratchpad)。
     #[arg(short = 's', long, default_value = "all")]
-    pub scenario: String,
+    pub scenario: BenchmarkScenario,
 
     /// セッションプールサイズ。
     #[arg(long, default_value_t = 1)]
@@ -226,11 +277,10 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
         scenarios: Vec::new(),
     };
 
-    let scenario_filter = args.scenario.to_lowercase();
-    let should_run_single = scenario_filter == "all" || scenario_filter == "single";
-    let should_run_batch = scenario_filter == "all" || scenario_filter == "batch";
-    let should_run_coarse = scenario_filter == "all" || scenario_filter == "coarse";
-    let should_run_scratch = scenario_filter == "all" || scenario_filter == "scratchpad";
+    let should_run_single = args.scenario.should_run_single();
+    let should_run_batch = args.scenario.should_run_batch();
+    let should_run_coarse = args.scenario.should_run_coarse();
+    let should_run_scratch = args.scenario.should_run_scratchpad();
 
     // --- シナリオ 1〜3: Single Decision (Choice, Score, Noul) ---
     if should_run_single {

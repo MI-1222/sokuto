@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use sokuto_cli::{Cli, Commands};
+use sokuto_cli::{BenchmarkScenario, Cli, Commands};
 
 #[test]
 fn test_parse_export_openapi_default() {
@@ -100,14 +100,14 @@ fn test_parse_benchmark_defaults() {
             assert_eq!(args.iterations, 50);
             assert_eq!(args.warmup, 10);
             assert_eq!(args.provider, None);
-            assert_eq!(args.scenario, "all");
+            assert_eq!(args.scenario, BenchmarkScenario::All);
             assert_eq!(args.pool_size, 1);
             assert_eq!(args.intra_threads, None);
             assert_eq!(args.inter_threads, None);
             assert!(!args.no_mem_arena);
             assert!(!args.json);
         }
-        _ => panic!("Benchmark コマンドがパースされること。"),
+        _ => panic!("Benchmark コマンドのパースに失敗。"),
     }
 }
 
@@ -143,15 +143,25 @@ fn test_parse_benchmark_custom_options() {
             assert_eq!(args.iterations, 100);
             assert_eq!(args.warmup, 20);
             assert_eq!(args.provider, Some("coreml".to_string()));
-            assert_eq!(args.scenario, "batch");
+            assert_eq!(args.scenario, BenchmarkScenario::Batch);
             assert_eq!(args.pool_size, 4);
             assert_eq!(args.intra_threads, Some(2));
             assert_eq!(args.inter_threads, Some(1));
             assert!(args.no_mem_arena);
             assert!(args.json);
         }
-        _ => panic!("Benchmark コマンドがパースされること。"),
+        _ => panic!("Benchmark コマンドのパースに失敗。"),
     }
+}
+
+#[test]
+fn test_parse_benchmark_unknown_scenario_fails() {
+    let args = ["sokuto", "benchmark", "--scenario", "unknown_scenario"];
+    let result = Cli::try_parse_from(args);
+    assert!(
+        result.is_err(),
+        "未知のシナリオ指定時にパースエラーで拒否されることに成功。"
+    );
 }
 
 #[test]

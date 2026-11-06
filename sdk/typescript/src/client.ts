@@ -35,6 +35,11 @@ export class SokutoClient {
     return this.lastStateHash;
   }
 
+  /** State キャッシュキーを手動設定する。 */
+  setLastStateHash(hash: string | null): void {
+    this.lastStateHash = hash;
+  }
+
   /** 記憶している State キャッシュキーをクリアする。 */
   clearStateHash(): void {
     this.lastStateHash = null;

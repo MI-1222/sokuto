@@ -212,6 +212,12 @@ pub async fn state_batch_handler(
                     let mut combined_answers = indexmap::IndexMap::with_capacity(questions.len());
                     let mut fallback_questions = indexmap::IndexMap::new();
 
+                    let effective_state = if is_state_empty {
+                        cached_state.state_text.as_deref().unwrap_or(&state_text)
+                    } else {
+                        &state_text
+                    };
+
                     for (qid, question) in &questions {
                         let is_hierarchical = question.question_type == QuestionType::Choice
                             && question
@@ -228,7 +234,7 @@ pub async fn state_batch_handler(
 
                         if is_hierarchical {
                             let res = router.route(
-                                &state_text,
+                                effective_state,
                                 &question.instructions,
                                 Some(&gating_config),
                             )?;

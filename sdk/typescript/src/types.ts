@@ -88,6 +88,8 @@ export interface CascadeResult<T = unknown> {
   system2Thinking?: string;
   /** 推論を担当したモデル識別子。 */
   modelName?: string;
+  /** エスカレーション時に手元の State で再構成された対比型プロンプト。 */
+  triagePrompt?: TriagePrompt;
   /** System 1 の生レスポンスデータ。 */
   rawS1Response?: Record<string, unknown>;
   /** System 2 の生レスポンスデータ。 */
@@ -134,6 +136,10 @@ export interface AnswerGatingDetail {
   entropy?: number;
   is_ood?: boolean;
   reason?: string;
+  escalation?: {
+    uncertainty_reason?: string;
+    prompt_template?: string;
+  };
 }
 
 /** sokuto 回答単体インターフェース。 */

@@ -328,6 +328,9 @@ pub struct CachedStateFeatures {
     pub compression_mode: CacheCompressionMode,
     /// `State` の有効トークンアテンションマスク列 (`[batch_size, seq_len]`)。
     pub state_mask: Vec<i64>,
+    /// キャッシュされた State 原文テキスト（または先頭抜粋）。
+    /// State-Offloading 時に System 2 へのエスカレーションプロンプト生成で活用される。
+    pub state_text: Option<String>,
 }
 
 impl CachedStateFeatures {
@@ -346,6 +349,18 @@ impl CachedStateFeatures {
         byte_size: usize,
         state_mask: Vec<i64>,
     ) -> Self {
+        Self::new_raw_with_text(hash_key, shape, ort_value, byte_size, state_mask, None)
+    }
+
+    /// 非圧縮の生 `Value` と State 原文テキストからキャッシュエントリを生成する。
+    pub fn new_raw_with_text(
+        hash_key: u64,
+        shape: Vec<usize>,
+        ort_value: Value,
+        byte_size: usize,
+        state_mask: Vec<i64>,
+        state_text: Option<String>,
+    ) -> Self {
         let total_tokens = if shape.len() >= 2 {
             shape[0] * shape[1]
         } else {
@@ -363,6 +378,7 @@ impl CachedStateFeatures {
             byte_size,
             compression_mode: CacheCompressionMode::None,
             state_mask,
+            state_text,
         }
     }
 
@@ -380,6 +396,18 @@ impl CachedStateFeatures {
         raw_slice: &[f32],
         mode: CacheCompressionMode,
         state_mask: Vec<i64>,
+    ) -> Result<Self> {
+        Self::new_compressed_with_text(hash_key, shape, raw_slice, mode, state_mask, None)
+    }
+
+    /// `f32` スライスと State 原文テキストを指定された圧縮モードで変換してキャッシュエントリを生成する。
+    pub fn new_compressed_with_text(
+        hash_key: u64,
+        shape: Vec<usize>,
+        raw_slice: &[f32],
+        mode: CacheCompressionMode,
+        state_mask: Vec<i64>,
+        state_text: Option<String>,
     ) -> Result<Self> {
         let hidden_size = if shape.len() >= 3 {
             shape[2]
@@ -416,6 +444,7 @@ impl CachedStateFeatures {
                     byte_size,
                     compression_mode: mode,
                     state_mask,
+                    state_text,
                 })
             }
             CacheCompressionMode::Fp16 => {
@@ -428,6 +457,7 @@ impl CachedStateFeatures {
                     byte_size,
                     compression_mode: mode,
                     state_mask,
+                    state_text,
                 })
             }
             CacheCompressionMode::Int8Symmetric => {
@@ -444,9 +474,16 @@ impl CachedStateFeatures {
                     byte_size,
                     compression_mode: mode,
                     state_mask,
+                    state_text,
                 })
             }
         }
+    }
+
+    /// State 原文テキストを設定するビルダーメソッド。
+    pub fn with_state_text(mut self, text: Option<String>) -> Self {
+        self.state_text = text;
+        self
     }
 
     /// 推論入力としてバインド可能な `Arc<Value>` を取得する。
@@ -923,23 +960,26 @@ impl DualSessionEngine {
         let shape_vec: Vec<usize> = shape.iter().map(|&x| x as usize).collect();
 
         let compression = self.cache_manager.compression_mode();
+        let state_text_owned = Some(state_text.to_string());
         let cached_entry = if compression == CacheCompressionMode::None {
             let total_elements: usize = shape_vec.iter().product();
             let byte_size = total_elements * std::mem::size_of::<f32>();
-            Arc::new(CachedStateFeatures::new_raw(
+            Arc::new(CachedStateFeatures::new_raw_with_text(
                 key,
                 shape_vec,
                 state_val,
                 byte_size,
                 attention_mask.to_vec(),
+                state_text_owned,
             ))
         } else {
-            Arc::new(CachedStateFeatures::new_compressed(
+            Arc::new(CachedStateFeatures::new_compressed_with_text(
                 key,
                 shape_vec,
                 flat_data,
                 compression,
                 attention_mask.to_vec(),
+                state_text_owned,
             )?)
         };
 
@@ -1269,10 +1309,14 @@ impl DualSessionEngine {
                 )?;
 
                 let energy = calculate_choice_energy(q, sample_logits, calib_config);
+                let effective_state_text = match state_text {
+                    Some(s) if !s.trim().is_empty() => Some(s),
+                    _ => cached_state.state_text.as_deref(),
+                };
                 apply_gating_to_answer_with_energy(
                     &mut answer,
                     energy,
-                    state_text,
+                    effective_state_text,
                     Some(qid.as_str()),
                     Some(q),
                     gating_config,
@@ -1362,10 +1406,14 @@ impl DualSessionEngine {
             evaluate_question(question, &logits, calib_config).map_err(RuntimeError::Core)?;
 
         let energy = calculate_choice_energy(question, &logits, calib_config);
+        let effective_state_text = match state_text {
+            Some(s) if !s.trim().is_empty() => Some(s),
+            _ => cached_state.state_text.as_deref(),
+        };
         apply_gating_to_answer_with_energy(
             &mut answer,
             energy,
-            state_text,
+            effective_state_text,
             None,
             Some(question),
             None,

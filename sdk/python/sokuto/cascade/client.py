@@ -403,11 +403,14 @@ class SokutoCascadeClient:
         prefix: str | None = None,
         model_name: str | None = None,
         auto_hierarchical: bool | None = None,
+        enable_state_offloading: bool = False,
+        state_hash: str | None = None,
     ) -> CascadeResult[M]:
         """Pydantic v2 モデルを受け取り、型安全なカスケード推論を実行する。
 
         7.2 で構築された SchemaTranspiler と連携し、System 1 で解決した場合は
         0.15ms 以下のゼロアロケーション復元を実行し、エスカレーション時は
+        手元に保持している元の State を用いて対比型 Triage プロンプトを再構成し、
         型スキーマに基づく System 2 構造化抽出を行って同一の型 M を返却する。
 
         Args:
@@ -416,6 +419,8 @@ class SokutoCascadeClient:
             prefix (str | None): 質問キープレフィックス。
             model_name (str | None): モデル名。
             auto_hierarchical (bool | None): 階層 DAG 有効化。
+            enable_state_offloading (bool): State 本文の省略 (キャッシュ再利用) 最適化。
+            state_hash (str | None): クライアント指定の State キャッシュキー。
 
         Returns:
             CascadeResult[M]: 復元された Pydantic モデルインスタンスと監査メタデータ。
@@ -446,17 +451,39 @@ class SokutoCascadeClient:
                 reason="circuit_breaker_open",
             )
 
+        # State-Offloading 最適化判定
+        effective_hash = state_hash or self.last_state_hash
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if effective_hash:
+            headers["X-State-Hash"] = effective_hash
+
+        sent_state = "" if (enable_state_offloading and effective_hash) else state
+
         # System 1 への事前コンパイルバイト送信
         s1_result: dict[str, Any] | None = None
         try:
-            body_bytes = template.build_request_bytes(state)
-            headers = {"Content-Type": "application/json"}
+            body_bytes = template.build_request_bytes(sent_state)
             resp = await self._client.post(
                 "/v1/systemone",
                 content=body_bytes,
                 headers=headers,
                 timeout=self.timeout,
             )
+            if (
+                resp.status_code == 400
+                and enable_state_offloading
+                and sent_state == ""
+                and state != ""
+            ):
+                headers.pop("X-State-Hash", None)
+                fallback_bytes = template.build_request_bytes(state)
+                resp = await self._client.post(
+                    "/v1/systemone",
+                    content=fallback_bytes,
+                    headers=headers,
+                    timeout=self.timeout,
+                )
+
             if resp.status_code == 200:
                 json_data = resp.json()
                 if inspect.iscoroutine(json_data):
@@ -464,6 +491,9 @@ class SokutoCascadeClient:
                 else:
                     s1_result = json_data
                 self.circuit_breaker.record_success()
+                rec_hash = resp.headers.get("x-state-hash") or resp.headers.get("X-State-Hash")
+                if rec_hash:
+                    self.last_state_hash = rec_hash
             else:
                 self.circuit_breaker.record_failure()
         except Exception:
@@ -577,6 +607,7 @@ class SokutoCascadeClient:
             latency_ms=elapsed_ms,
             escalation_reason=reason,
             system2_thinking=s2_response.thinking,
+            triage_prompt=triage_prompt,
             raw_s1_response=raw_s1_response,
             raw_s2_response=s2_response.model_dump(),
         )
@@ -647,6 +678,7 @@ class SokutoCascadeClient:
             latency_ms=elapsed_ms,
             escalation_reason=reason,
             system2_thinking=s2_response.thinking,
+            triage_prompt=triage_prompt,
             raw_s1_response=raw_s1_response,
             raw_s2_response=s2_response.model_dump(),
         )

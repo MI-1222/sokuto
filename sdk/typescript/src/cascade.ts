@@ -200,11 +200,13 @@ export class SokutoCascadeClient {
    *
    * @param request 推論リクエスト。
    * @param customSchema System 2 向けの構造化スキーマ。
+   * @param options 最適化オプション (State-Offloading等)。
    * @returns CascadeResult<T> 確定判定結果。
    */
   async execute<T = unknown>(
     request: SokutoRequest,
-    customSchema?: Record<string, unknown>
+    customSchema?: Record<string, unknown>,
+    options?: { enableStateOffloading?: boolean },
   ): Promise<CascadeResult<T>> {
     const startTime = performance.now();
 
@@ -228,23 +230,8 @@ export class SokutoCascadeClient {
 
     let s1Result: SokutoResponse | null = null;
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-
-      const resp = await fetch(`${this.baseUrl}/v1/systemone`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(request),
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-
-      if (resp.ok) {
-        s1Result = (await resp.json()) as SokutoResponse;
-        this.circuitBreaker.recordSuccess();
-      } else {
-        this.circuitBreaker.recordFailure();
-      }
+      s1Result = await this.sokutoClient.predict(request, options);
+      this.circuitBreaker.recordSuccess();
     } catch {
       this.circuitBreaker.recordFailure();
     }
@@ -369,6 +356,7 @@ export class SokutoCascadeClient {
       latencyMs: elapsedMs,
       escalationReason: params.reason,
       system2Thinking: s2Resp.thinking,
+      triagePrompt: prompt,
       rawS1Response: params.rawS1Response,
       rawS2Response: s2Resp as unknown as Record<string, unknown>,
     };
@@ -406,6 +394,7 @@ export class SokutoCascadeClient {
       latencyMs: elapsedMs,
       escalationReason: params.reason,
       system2Thinking: s2Resp.thinking,
+      triagePrompt: prompt,
       rawS1Response: params.rawS1Response,
       rawS2Response: s2Resp as unknown as Record<string, unknown>,
     };

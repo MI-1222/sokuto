@@ -172,4 +172,74 @@ describe("SokutoCascadeClient executeBatch", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it("enableStateOffloading 有効時にエスカレーションされた際、手元の State で Triage プロンプトが再構成されること", async () => {
+    const originalFetch = globalThis.fetch;
+    try {
+      let sentBody = "";
+      globalThis.fetch = async (_url, init) => {
+        sentBody = String(init?.body ?? "");
+        const respData: StateBatchResponse = {
+          answers: {
+            q_ambiguous: {
+              confidence: 0.51,
+              probabilities: { 承認: 0.51, 却下: 0.49 },
+              gating: {
+                route: "confirm_or_escalate",
+                confidence: 0.51,
+                reason: "僅差拮抗",
+                escalation: {
+                  uncertainty_reason: "僅差拮抗",
+                  prompt_template: "<context>\n(コンテキストが指定されていません。)\n</context>",
+                },
+              },
+            },
+          },
+          usage: { prompt_tokens: 30, completion_tokens: 0, total_tokens: 30 },
+          cache_hit: true,
+        };
+
+        return new Response(JSON.stringify(respData), {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+            "X-State-Hash": "cached_state_hash",
+            "X-Cache-Status": "HIT",
+          },
+        });
+      };
+
+      const originalStateText = "重要顧客の特別契約書データ（氏名: 佐藤花子）";
+      const cascadeClient = new SokutoCascadeClient({
+        system2Provider: new MockSystem2Provider({
+          defaultDecision: "承認",
+        }),
+      });
+      // 前回キャッシュハッシュを設定
+      cascadeClient.sokutoClient.setLastStateHash("cached_state_hash");
+
+      const results = await cascadeClient.executeBatch(
+        {
+          state: originalStateText,
+          questions: {
+            q_ambiguous: { instructions: "特例条項を精査せよ", type: "choice" },
+          },
+        },
+        { enableStateOffloading: true },
+      );
+
+      // サーバーへ送信された body では state が空文字 "" になっていること
+      const parsedBody = JSON.parse(sentBody);
+      assert.equal(parsedBody.state, "");
+
+      // エスカレーション結果の検証
+      assert.equal(results.q_ambiguous.source, "system2");
+      assert.ok(results.q_ambiguous.triagePrompt);
+      // 手元の originalStateText が triagePrompt に再構成されて埋め込まれていること
+      assert.ok(results.q_ambiguous.triagePrompt?.userPrompt.includes(originalStateText));
+      assert.ok(results.q_ambiguous.triagePrompt?.userPrompt.includes("佐藤花子"));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Literal
 from unittest.mock import AsyncMock, patch
 
@@ -23,6 +24,8 @@ from sokuto.cascade import (
     MockSystem2Provider,
     SokutoCascadeClient,
     SokutoCascadeClientSync,
+    System2Provider,
+    System2Response,
     TriagePrompt,
     calculate_entropy,
     calculate_top_margin,
@@ -587,3 +590,77 @@ async def test_cascade_exit_criteria_cost_reduction_and_accuracy() -> None:
     assert overall_accuracy >= 0.92, (
         f"カスケード後総合精度 {overall_accuracy * 100:.2f}% が 92.0% を下回りました。"
     )
+
+
+@pytest.mark.anyio
+async def test_execute_model_state_offloading_escalation_prompt_reconstitution() -> None:
+    """State-Offloading 有効時にエスカレーションが発生した場合、手元の State で Triage プロンプトが再構成されることを検証する。"""
+
+    class UserVerification(BaseModel):
+        verified: bool = Field(description="本人確認結果。")
+
+    original_state = "申請者の本人確認書類: 運転免許証（氏名: 田中太郎, 住所: 東京都新宿区...）"
+    cached_hash = "0123456789abcdef"
+
+    # System 2 プロバイダー (呼び出し引数のプロンプトを記録)
+    captured_prompts: list[TriagePrompt] = []
+
+    class CapturingSystem2Provider(System2Provider):
+        async def call(self, prompt: TriagePrompt) -> System2Response:
+            captured_prompts.append(prompt)
+            return System2Response(
+                decision={"verified": True},
+                thinking="書類情報と一致していることを確認。",
+                raw_output='{"verified": true}',
+            )
+
+    # サーバーモック: 不確実性によるエスカレーション (ConfirmOrEscalate) を返却
+    mock_client = AsyncMock()
+    mock_resp = AsyncMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {"X-State-Hash": cached_hash}
+    mock_resp.json.return_value = {
+        "answers": {
+            "verified": {
+                "noul": 0.51,  # 拮抗 (不確実)
+                "gating": {
+                    "route": "confirm_or_escalate",
+                    "confidence": 0.51,
+                    "reason": "真偽判定が僅差拮抗",
+                },
+            }
+        },
+        "model_name": "sokuto-v1",
+    }
+    mock_client.post.return_value = mock_resp
+
+    cascade_client = SokutoCascadeClient(
+        system2_provider=CapturingSystem2Provider(),
+        http_client=mock_client,
+    )
+    cascade_client.last_state_hash = cached_hash
+
+    # State-Offloading 有効化で execute_model 実行
+    result = await cascade_client.execute_model(
+        model_cls=UserVerification,
+        state=original_state,
+        enable_state_offloading=True,
+    )
+
+    # サーバーへのリクエスト本文では State が省略 (空文字) されていることを検証
+    sent_request_call = mock_client.post.call_args
+    assert sent_request_call is not None
+    # body_bytes 内で state は空文字 ""
+    body_data = json.loads(sent_request_call.kwargs["content"].decode("utf-8"))
+    assert body_data["state"] == ""
+
+    # エスカレーション結果の検証
+    assert result.source == CascadeSource.SYSTEM2
+    assert result.decision.verified is True
+    assert result.triage_prompt is not None
+
+    # System 2 に渡されたプロンプトに手元の完全な original_state が復元・再構成されていることの検証
+    assert len(captured_prompts) == 1
+    triage_prompt = captured_prompts[0]
+    assert original_state in triage_prompt.user_prompt
+    assert "運転免許証" in triage_prompt.user_prompt

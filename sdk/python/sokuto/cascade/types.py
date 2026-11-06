@@ -151,5 +151,9 @@ class CascadeResult[T](BaseModel):
     escalation_reason: str | None = Field(default=None, description="委任根拠理由。")
     system2_thinking: str | None = Field(default=None, description="System 2 の推論過程。")
     model_name: str | None = Field(default=None, description="モデル識別子。")
+    triage_prompt: TriagePrompt | None = Field(
+        default=None,
+        description="エスカレーション時に手元の State で再構成された対比型プロンプト。",
+    )
     raw_s1_response: dict[str, Any] | None = Field(default=None, description="S1 生データ。")
     raw_s2_response: dict[str, Any] | None = Field(default=None, description="S2 生データ。")

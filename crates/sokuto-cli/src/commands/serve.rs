@@ -10,7 +10,7 @@ use std::sync::Arc;
 pub use crate::commands::model_dir::{
     ModelArtifactPaths, ModelDirError, load_calibration_config, validate_model_dir,
 };
-use crate::commands::session_config::{ExecutionProviderArg, SessionConfigBuilder};
+pub use crate::commands::session_config::{ExecutionProviderArg, SessionArgs, SessionConfigArgs};
 use crate::error::CliError;
 use sokuto_runtime::engine::InferenceEngine;
 use sokuto_runtime::tokenizer::JevTokenizer;
@@ -37,21 +37,9 @@ pub struct ServeArgs {
     )]
     pub model_dir: PathBuf,
 
-    /// セッションプールサイズ。
-    #[arg(long, env = "SOKUTO_POOL_SIZE", default_value_t = 2)]
-    pub pool_size: usize,
-
-    /// 優先 Execution Provider。
-    #[arg(long, env = "SOKUTO_PROVIDER")]
-    pub provider: Option<ExecutionProviderArg>,
-
-    /// 単一オペレータ内の並列スレッド数 (intra-op)。
-    #[arg(long, env = "SOKUTO_INTRA_THREADS")]
-    pub intra_threads: Option<usize>,
-
-    /// 複数オペレータ間の並列スレッド数 (inter-op)。
-    #[arg(long, env = "SOKUTO_INTER_THREADS")]
-    pub inter_threads: Option<usize>,
+    /// ONNX Runtime セッション構成引数。
+    #[command(flatten)]
+    pub session: SessionArgs,
 }
 
 /// HTTP サーバー起動処理を実行する。
@@ -63,12 +51,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
     validate_model_dir(&args.model_dir)?;
 
     // 2. セッション設定の構築
-    let session_config = SessionConfigBuilder::new()
-        .pool_size(args.pool_size)
-        .intra_threads(args.intra_threads)
-        .inter_threads(args.inter_threads)
-        .provider_opt(args.provider)
-        .build();
+    let session_config = args.session.build_config();
 
     let artifact_paths = ModelArtifactPaths::resolve(&args.model_dir);
 
@@ -77,7 +60,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
         args.model_dir.display(),
         args.host,
         args.port,
-        args.pool_size
+        args.session.pool_size
     );
 
     // 3. Prometheus レコーダーの初期化

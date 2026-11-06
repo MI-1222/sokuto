@@ -44,10 +44,10 @@ fn test_parse_serve_defaults() {
             assert_eq!(args.host, "0.0.0.0");
             assert_eq!(args.port, 3000);
             assert_eq!(args.model_dir, PathBuf::from("models/default"));
-            assert_eq!(args.pool_size, 2);
-            assert_eq!(args.provider, None);
-            assert_eq!(args.intra_threads, None);
-            assert_eq!(args.inter_threads, None);
+            assert_eq!(args.session.pool_size, 1);
+            assert_eq!(args.session.provider, None);
+            assert_eq!(args.session.intra_threads, None);
+            assert_eq!(args.session.inter_threads, None);
         }
         _ => panic!("Serve コマンドがパースされること。"),
     }
@@ -80,10 +80,10 @@ fn test_parse_serve_custom_options() {
             assert_eq!(args.host, "127.0.0.1");
             assert_eq!(args.port, 8080);
             assert_eq!(args.model_dir, PathBuf::from("custom_models"));
-            assert_eq!(args.pool_size, 4);
-            assert_eq!(args.provider, Some(ExecutionProviderArg::Cpu));
-            assert_eq!(args.intra_threads, Some(4));
-            assert_eq!(args.inter_threads, Some(2));
+            assert_eq!(args.session.pool_size, 4);
+            assert_eq!(args.session.provider, Some(ExecutionProviderArg::Cpu));
+            assert_eq!(args.session.intra_threads, Some(4));
+            assert_eq!(args.session.inter_threads, Some(2));
         }
         _ => panic!("Serve コマンドがパースされること。"),
     }
@@ -99,11 +99,11 @@ fn test_parse_benchmark_defaults() {
             assert_eq!(args.model_dir, PathBuf::from("models/default"));
             assert_eq!(args.iterations, 50);
             assert_eq!(args.warmup, 10);
-            assert_eq!(args.provider, None);
             assert_eq!(args.scenario, BenchmarkScenario::All);
-            assert_eq!(args.pool_size, 1);
-            assert_eq!(args.intra_threads, None);
-            assert_eq!(args.inter_threads, None);
+            assert_eq!(args.session.pool_size, 1);
+            assert_eq!(args.session.provider, None);
+            assert_eq!(args.session.intra_threads, None);
+            assert_eq!(args.session.inter_threads, None);
             assert!(!args.no_mem_arena);
             assert!(!args.json);
         }
@@ -142,11 +142,11 @@ fn test_parse_benchmark_custom_options() {
             assert_eq!(args.model_dir, PathBuf::from("bench_model"));
             assert_eq!(args.iterations, 100);
             assert_eq!(args.warmup, 20);
-            assert_eq!(args.provider, Some(ExecutionProviderArg::Coreml));
             assert_eq!(args.scenario, BenchmarkScenario::Batch);
-            assert_eq!(args.pool_size, 4);
-            assert_eq!(args.intra_threads, Some(2));
-            assert_eq!(args.inter_threads, Some(1));
+            assert_eq!(args.session.pool_size, 4);
+            assert_eq!(args.session.provider, Some(ExecutionProviderArg::Coreml));
+            assert_eq!(args.session.intra_threads, Some(2));
+            assert_eq!(args.session.inter_threads, Some(1));
             assert!(args.no_mem_arena);
             assert!(args.json);
         }

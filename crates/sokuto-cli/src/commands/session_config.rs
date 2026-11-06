@@ -89,6 +89,47 @@ pub fn parse_provider(name: &str) -> Result<ExecutionProvider, CliError> {
     name.parse().map_err(CliError::UnknownProvider)
 }
 
+/// ONNX Runtime セッション構成用 CLI 共通引数。
+///
+/// サーバー実行およびベンチマークコマンド等で共通して利用される。
+#[derive(Debug, Clone, clap::Args, PartialEq, Eq)]
+pub struct SessionArgs {
+    /// セッションプールサイズ。
+    #[arg(long, env = "SOKUTO_POOL_SIZE", default_value_t = 1)]
+    pub pool_size: usize,
+
+    /// 優先 Execution Provider。
+    #[arg(long, env = "SOKUTO_PROVIDER")]
+    pub provider: Option<ExecutionProviderArg>,
+
+    /// 単一オペレータ内の並列スレッド数 (intra-op)。
+    #[arg(long, env = "SOKUTO_INTRA_THREADS")]
+    pub intra_threads: Option<usize>,
+
+    /// 複数オペレータ間の並列スレッド数 (inter-op)。
+    #[arg(long, env = "SOKUTO_INTER_THREADS")]
+    pub inter_threads: Option<usize>,
+}
+
+/// [`SessionArgs`] の型エイリアス。
+pub type SessionConfigArgs = SessionArgs;
+
+impl SessionArgs {
+    /// 引数設定から [`SessionConfigBuilder`] を構築する。
+    pub fn to_builder(&self) -> SessionConfigBuilder {
+        SessionConfigBuilder::new()
+            .pool_size(self.pool_size)
+            .intra_threads(self.intra_threads)
+            .inter_threads(self.inter_threads)
+            .provider_opt(self.provider)
+    }
+
+    /// 設定内容から [`SessionConfig`] を構築する。
+    pub fn build_config(&self) -> SessionConfig {
+        self.to_builder().build()
+    }
+}
+
 /// CLI 引数から [`SessionConfig`] を段階的に構築するビルダー。
 #[derive(Debug, Clone)]
 pub struct SessionConfigBuilder {
@@ -324,6 +365,24 @@ mod tests {
             .provider_str("coreml")
             .unwrap()
             .build();
+        assert_eq!(
+            config.preferred_providers,
+            vec![ExecutionProvider::CoreML, ExecutionProvider::CPU]
+        );
+    }
+
+    #[test]
+    fn test_session_args_to_config() {
+        let args = SessionArgs {
+            pool_size: 4,
+            provider: Some(ExecutionProviderArg::Coreml),
+            intra_threads: Some(2),
+            inter_threads: Some(1),
+        };
+        let config = args.build_config();
+        assert_eq!(config.pool_size, 4);
+        assert_eq!(config.intra_threads, Some(2));
+        assert_eq!(config.inter_threads, Some(1));
         assert_eq!(
             config.preferred_providers,
             vec![ExecutionProvider::CoreML, ExecutionProvider::CPU]

@@ -9,7 +9,7 @@ pub use commands::benchmark::{BenchmarkArgs, BenchmarkScenario};
 pub use commands::healthcheck::HealthcheckArgs;
 pub use commands::quantize::QuantizeArgs;
 pub use commands::serve::ServeArgs;
-pub use commands::session_config::ExecutionProviderArg;
+pub use commands::session_config::{ExecutionProviderArg, SessionArgs, SessionConfigArgs};
 pub use error::CliError;
 
 use clap::{Parser, Subcommand};

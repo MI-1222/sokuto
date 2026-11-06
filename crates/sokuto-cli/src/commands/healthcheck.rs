@@ -3,9 +3,10 @@
 //! 最小コンテナ環境など curl が存在しない環境において、
 //! 外部依存なしで HTTP エンドポイントの死活監視・準備状態確認 (Liveness / Readiness) を行う。
 
-use std::io::{BufRead, Read, Write};
-use std::net::TcpStream;
 use std::time::{Duration, Instant};
+
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 use crate::error::CliError;
 
@@ -180,13 +181,19 @@ pub async fn run_healthcheck(args: HealthcheckArgs) -> Result<(), CliError> {
             ));
         }
 
-        match TcpStream::connect_timeout(&addr, remaining) {
-            Ok(s) => {
+        match tokio::time::timeout(remaining, TcpStream::connect(&addr)).await {
+            Ok(Ok(s)) => {
                 stream = Some(s);
                 break;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 last_err = Some(e);
+            }
+            Err(_) => {
+                last_err = Some(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "接続試行がタイムアウトしました。",
+                ));
             }
         }
     }
@@ -204,13 +211,14 @@ pub async fn run_healthcheck(args: HealthcheckArgs) -> Result<(), CliError> {
     };
 
     let now = Instant::now();
-    let remaining = deadline
-        .checked_duration_since(now)
-        .unwrap_or(Duration::from_millis(1));
-    let io_timeout = remaining.max(Duration::from_millis(1));
-
-    stream.set_read_timeout(Some(io_timeout))?;
-    stream.set_write_timeout(Some(io_timeout))?;
+    let remaining = deadline.checked_duration_since(now).ok_or_else(|| {
+        CliError::HealthcheckFailed("リクエスト送信がタイムアウトしました。".into())
+    })?;
+    if remaining.is_zero() {
+        return Err(CliError::HealthcheckFailed(
+            "リクエスト送信がタイムアウトしました。".into(),
+        ));
+    }
 
     let user_agent = concat!("sokuto-healthcheck/", env!("CARGO_PKG_VERSION"));
     let request = format!(
@@ -221,22 +229,39 @@ pub async fn run_healthcheck(args: HealthcheckArgs) -> Result<(), CliError> {
          \r\n"
     );
 
-    stream.write_all(request.as_bytes())?;
+    tokio::time::timeout(remaining, stream.write_all(request.as_bytes()))
+        .await
+        .map_err(|_| CliError::HealthcheckFailed("リクエスト送信がタイムアウトしました。".into()))?
+        .map_err(CliError::Io)?;
 
-    let mut reader = std::io::BufReader::new(stream);
+    let (reader, _) = stream.into_split();
+    let mut reader = tokio::io::BufReader::new(reader);
     let mut status_line = String::new();
     const MAX_STATUS_LINE_LEN: usize = 8192;
 
     loop {
         status_line.clear();
+        let now = Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(now) else {
+            return Err(CliError::HealthcheckFailed(
+                "応答読み取りがタイムアウトしました。".into(),
+            ));
+        };
+        if remaining.is_zero() {
+            return Err(CliError::HealthcheckFailed(
+                "応答読み取りがタイムアウトしました。".into(),
+            ));
+        }
+
         let mut handle = (&mut reader).take(MAX_STATUS_LINE_LEN as u64);
-        match handle.read_line(&mut status_line) {
-            Ok(0) => {
+        let read_res = tokio::time::timeout(remaining, handle.read_line(&mut status_line)).await;
+        match read_res {
+            Ok(Ok(0)) => {
                 return Err(CliError::HealthcheckFailed(
                     "空の HTTP レスポンスを受信しました。".into(),
                 ));
             }
-            Ok(_) => {
+            Ok(Ok(_)) => {
                 if !status_line.ends_with('\n') {
                     return Err(CliError::HealthcheckFailed(format!(
                         "HTTP ステータス行が長すぎるか、不完全です (上限 {MAX_STATUS_LINE_LEN} バイト)。"
@@ -249,15 +274,12 @@ pub async fn run_healthcheck(args: HealthcheckArgs) -> Result<(), CliError> {
                 }
                 break;
             }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
+            Ok(Err(e)) => return Err(CliError::Io(e)),
+            Err(_) => {
                 return Err(CliError::HealthcheckFailed(
                     "応答読み取りがタイムアウトしました。".into(),
                 ));
             }
-            Err(e) => return Err(CliError::Io(e)),
         }
     }
 

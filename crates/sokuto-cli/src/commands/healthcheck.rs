@@ -36,7 +36,7 @@ fn parse_http_url(url: &str) -> Result<(String, u16, String), CliError> {
         ))
     })?;
 
-    let (host_port, path) = match stripped.find('/') {
+    let (host_port, path) = match stripped.find(&['/', '?'][..]) {
         Some(idx) => (&stripped[..idx], &stripped[idx..]),
         None => (stripped, "/"),
     };
@@ -97,6 +97,8 @@ fn parse_http_url(url: &str) -> Result<(String, u16, String), CliError> {
 
     let path = if path.is_empty() {
         "/".to_string()
+    } else if path.starts_with('?') {
+        format!("/{path}")
     } else {
         path.to_string()
     };
@@ -296,6 +298,27 @@ mod tests {
         assert_eq!(host, "[::1]");
         assert_eq!(port, 80);
         assert_eq!(path, "/");
+
+        // クエリパラメータ付き URL (パス省略およびパス指定あり)
+        let (host, port, path) = parse_http_url("http://localhost:3000?ready=1").unwrap();
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 3000);
+        assert_eq!(path, "/?ready=1");
+
+        let (host, port, path) = parse_http_url("http://localhost?ready=1").unwrap();
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 80);
+        assert_eq!(path, "/?ready=1");
+
+        let (host, port, path) = parse_http_url("http://[::1]:3000?ready=1").unwrap();
+        assert_eq!(host, "[::1]");
+        assert_eq!(port, 3000);
+        assert_eq!(path, "/?ready=1");
+
+        let (host, port, path) = parse_http_url("http://localhost:3000/?ready=1").unwrap();
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 3000);
+        assert_eq!(path, "/?ready=1");
 
         // 不正なスキーム
         let err = parse_http_url("https://localhost:3000/health");

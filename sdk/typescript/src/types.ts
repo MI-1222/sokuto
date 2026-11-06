@@ -88,6 +88,8 @@ export interface CascadeResult<T = unknown> {
   system2Thinking?: string;
   /** 推論を担当したモデル識別子。 */
   modelName?: string;
+  /** エスカレーション時に手元の State で再構成された対比型プロンプト。 */
+  triagePrompt?: TriagePrompt;
   /** System 1 の生レスポンスデータ。 */
   rawS1Response?: Record<string, unknown>;
   /** System 2 の生レスポンスデータ。 */
@@ -106,38 +108,89 @@ export interface QuestionSpec {
   criteria?: Record<string, string> | string[] | null;
 }
 
-/**
- * sokuto 推論リクエストペイロード。
- */
+/** sokuto 推論リクエストペイロード。 */
 export interface SokutoRequest {
   state: unknown;
   questions: Record<string, QuestionSpec>;
   model?: string;
+  state_hash?: string;
 }
 
-/**
- * sokuto 推論レスポンスペイロード。
- */
+/** sokuto 一括バッチ質問リクエストペイロード。 */
+export interface StateBatchRequest {
+  state: unknown;
+  questions: Record<string, QuestionSpec>;
+  model?: string;
+  state_hash?: string;
+  gating?: GatingConfig;
+  auto_hierarchical?: boolean;
+}
+
+/** sokuto 回答内ゲーティング詳細。 */
+export interface AnswerGatingDetail {
+  route?: DecisionRoute | string;
+  confidence?: number;
+  energy?: number;
+  free_energy?: number;
+  margin?: number;
+  entropy?: number;
+  is_ood?: boolean;
+  reason?: string;
+  escalation?: {
+    uncertainty_reason?: string;
+    prompt_template?: string;
+  };
+}
+
+/** sokuto 回答単体インターフェース。 */
+export interface AnswerItem {
+  choice?: string;
+  score?: number;
+  noul?: number;
+  confidence?: number;
+  probabilities?: Record<string, number> | number[];
+  gating?: AnswerGatingDetail;
+}
+
+/** sokuto トークン使用統計情報。 */
+export interface TokenUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+/** リクエスト全体の集約ルーティングサマリー。 */
+export interface SystemRoutingSummary {
+  /** リクエスト全体の集約ルーティング (最悪値ルール)。 */
+  aggregate_route: DecisionRoute;
+  /** 後方互換性エイリアス。 */
+  overall_route?: DecisionRoute;
+  /** 自動実行質問数。 */
+  auto_execute_count: number;
+  /** 二次検証質問数。 */
+  confirm_count: number;
+  /** フォールバック質問数。 */
+  fallback_count: number;
+  /** エスカレーション要否フラグ。 */
+  escalation_needed?: boolean;
+}
+
+/** sokuto 推論レスポンスペイロード。 */
 export interface SokutoResponse {
   model_name?: string;
-  answers: Record<
-    string,
-    {
-      choice?: string;
-      score?: number;
-      noul?: number;
-      confidence?: number;
-      probabilities?: Record<string, number> | number[];
-      gating?: {
-        route?: string;
-        confidence?: number;
-        energy?: number;
-        free_energy?: number;
-        margin?: number;
-        entropy?: number;
-        is_ood?: boolean;
-        reason?: string;
-      };
-    }
-  >;
+  answers: Record<string, AnswerItem>;
+  usage?: TokenUsage;
+  routing?: SystemRoutingSummary;
+  cache_status?: "HIT" | "MISS" | "BYPASS" | string;
+  state_hash?: string;
+}
+
+/** sokuto 一括バッチ質問レスポンスペイロード。 */
+export interface StateBatchResponse {
+  answers: Record<string, AnswerItem>;
+  usage: TokenUsage;
+  routing?: SystemRoutingSummary;
+  cache_hit: boolean;
+  state_hash?: string;
+  cache_status?: "HIT" | "MISS" | "BYPASS" | string;
 }

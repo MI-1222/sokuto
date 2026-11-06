@@ -368,3 +368,53 @@ fn test_choice_ood_prompt() {
     assert!(prompt.contains("None of the above / 該当なし"));
     assert!(prompt.contains("既存の選択肢へ無理に当てはめることを避け"));
 }
+
+#[test]
+fn test_escalation_prompt_state_offloading_warning() {
+    let mut criteria = IndexMap::new();
+    criteria.insert("fraud".to_string(), "不正決済".to_string());
+    criteria.insert("chargeback".to_string(), "チャージバック".to_string());
+
+    let q = Question::new_choice("決済障害の種別を判定せよ。", criteria);
+
+    let meta = GatingMetadata {
+        route: DecisionRoute::ConfirmOrEscalate,
+        confidence: 0.55,
+        entropy: Some(0.85),
+        margin: Some(0.05),
+        energy: None,
+        is_ood: false,
+        reason: "僅差拮抗".to_string(),
+        escalation: None,
+    };
+
+    let candidates = vec![
+        CandidateProbability {
+            candidate: "fraud".to_string(),
+            probability: 0.52,
+        },
+        CandidateProbability {
+            candidate: "chargeback".to_string(),
+            probability: 0.48,
+        },
+    ];
+
+    // 1. None 指定時: 警告メッセージが含まれることを検証
+    let prompt_none =
+        build_rich_escalation_prompt(None, Some("incident_type"), Some(&q), &meta, &candidates);
+    assert!(prompt_none.contains("【警告: State 本文が省略（State-Offloading）または未指定です。"));
+    assert!(prompt_none.contains("(コンテキストが指定されていません。)"));
+
+    // 2. 空文字列指定時: 警告メッセージが含まれることを検証
+    let prompt_empty = build_rich_escalation_prompt(
+        Some("   "),
+        Some("incident_type"),
+        Some(&q),
+        &meta,
+        &candidates,
+    );
+    assert!(
+        prompt_empty.contains("【警告: State 本文が省略（State-Offloading）または未指定です。")
+    );
+    assert!(prompt_empty.contains("(コンテキストが指定されていません。)"));
+}

@@ -7,7 +7,9 @@ use std::sync::Arc;
 use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_core::gating::GatingConfig;
 use sokuto_runtime::dag::InProcessDagExecutor;
-use sokuto_runtime::engine::{CoarseToFineConfig, InferenceEngine};
+use sokuto_runtime::engine::{
+    CoarseToFineConfig, DualSessionEngine, InferenceEngine, StateCacheManager,
+};
 use sokuto_runtime::hierarchical::HierarchicalRouterConfig;
 use sokuto_runtime::hierarchical::mapping::HierarchicalMapping;
 use sokuto_runtime::tokenizer::JevTokenizer;
@@ -47,6 +49,10 @@ pub struct AppState {
     pub hierarchical_config: HierarchicalRouterConfig,
     /// 透過的粗密ルーティングモードの有効フラグ。
     pub auto_hierarchical: bool,
+    /// 2 セッション分割型長文推論エンジン (存在する場合)。
+    pub dual_engine: Option<Arc<DualSessionEngine>>,
+    /// State 中間特徴量キャッシュマネージャー (存在する場合)。
+    pub cache_manager: Option<Arc<StateCacheManager>>,
 }
 
 impl AppState {
@@ -91,6 +97,8 @@ impl AppState {
             hierarchical_mapping: None,
             hierarchical_config: HierarchicalRouterConfig::default(),
             auto_hierarchical,
+            dual_engine: None,
+            cache_manager: None,
         }
     }
 
@@ -133,6 +141,8 @@ impl AppState {
             hierarchical_mapping: None,
             hierarchical_config: HierarchicalRouterConfig::default(),
             auto_hierarchical,
+            dual_engine: None,
+            cache_manager: None,
         }
     }
 
@@ -172,7 +182,20 @@ impl AppState {
             hierarchical_mapping: None,
             hierarchical_config: HierarchicalRouterConfig::default(),
             auto_hierarchical,
+            dual_engine: None,
+            cache_manager: None,
         }
+    }
+
+    /// デュアルセッション推論エンジンおよびキャッシュマネージャーを設定する。
+    pub fn with_dual_engine(
+        mut self,
+        dual_engine: Arc<DualSessionEngine>,
+        cache_manager: Arc<StateCacheManager>,
+    ) -> Self {
+        self.dual_engine = Some(dual_engine);
+        self.cache_manager = Some(cache_manager);
+        self
     }
 
     /// ゲーティング設定をカスタマイズして設定する。

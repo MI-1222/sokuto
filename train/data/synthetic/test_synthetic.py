@@ -119,7 +119,7 @@ def test_deduplicator() -> None:
 
 @pytest.mark.anyio
 async def test_quality_gate() -> None:
-    """3段階品質ゲートの各検証基準（スキーマ・重複・クロス検証）を検証する。"""
+    """3段階品質ゲートの各検証基準(スキーマ・重複・クロス検証)を検証する。"""
     q_config = QualityFilterConfig(
         min_state_chars=50,
         max_state_chars=300,
@@ -234,7 +234,7 @@ async def test_pipeline_run_and_resume(tmp_path: Path) -> None:
     assert (config.output_dir / "synthetic_all.jsonl").exists()
     assert (config.output_dir / "synthetic_choice.jsonl").exists()
 
-    # レジューム（中断再開）の検証
+    # レジューム(中断再開)の検証
     # 再度同じディレクトリで 10 件を目標として実行
     pipeline2 = SyntheticPipeline(
         config=config,

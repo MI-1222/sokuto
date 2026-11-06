@@ -1,24 +1,19 @@
 //! # Jev 互換推論エンドポイントモジュール
 //!
-//! `POST /v1/systemone` に対するリクエスト検証、非同期ワーカースレッド隔離、
-//! 粗密 2 段階探索連携、および型付き判定結果のシリアライズを提供する。
+//! `POST /v1/systemone` に対するリクエスト検証、推論サービス呼び出し、
+//! および型付き判定結果のシリアライズを提供する。
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::response::IntoResponse;
-use serde_json::Value;
-use sokuto_core::gating::evaluate_response_routing;
-use sokuto_core::schema::{QuestionType, SystemOneRequest, SystemOneResponse, Usage};
-use sokuto_runtime::hierarchical::CoarseToFineRouter;
+use sokuto_core::schema::{SystemOneRequest, SystemOneResponse};
 
 use crate::error::{ErrorResponse, ServerError};
-use crate::metrics::{
-    record_confidence, record_gating_route, record_hierarchical_early_exit,
-    record_hierarchical_soft_beam, record_http_duration, record_http_request,
-    record_inference_metrics, record_question_type,
-};
+use crate::metrics::{record_http_duration, record_http_request};
+use crate::service::InferenceService;
 use crate::state::AppState;
 
 /// TypeSafe AI Jev 互換の非自己回帰型判断推論エンドポイント。
@@ -39,240 +34,26 @@ use crate::state::AppState;
 )]
 pub async fn system_one_handler(
     State(state): State<Arc<AppState>>,
-    axum::Json(mut req): axum::Json<SystemOneRequest>,
+    headers: HeaderMap,
+    axum::Json(req): axum::Json<SystemOneRequest>,
 ) -> Result<impl IntoResponse, ServerError> {
     let start_time = Instant::now();
 
-    // 1. 高速スキーマ検証
     req.validate()?;
 
-    // クライアントがリクエストした元の質問仕様 (特に Criteria の元ラベル) を退避
-    let original_questions = req.questions.clone();
+    let client_hash_str = headers
+        .get("x-state-hash")
+        .or_else(|| headers.get("X-State-Hash"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| req.state_hash.clone());
 
-    // 2. 前処理ガードレールパイプラインの実行 (物理OOM防壁、サニタイズ、縮約、相対日時、算術集計)
-    state.guardrail_pipeline.process(&mut req, None)?;
+    let inference_service = InferenceService::new(state);
+    let output = inference_service.execute(req, client_hash_str).await?;
 
-    let question_count = req.questions.len();
-
-    // 質問タイプ別メトリクスカウント
-    for question in req.questions.values() {
-        match question.question_type {
-            QuestionType::Choice => record_question_type("choice"),
-            QuestionType::Score => record_question_type("score"),
-            QuestionType::Noul => record_question_type("noul"),
-        }
-    }
-
-    // 3. 正規化済み State の文字列取得
-    let state_text = match &req.state {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
-    };
-
-    // 4. CPU/GPU バウンドな推論処理およびゲーティング判定をブロッキングプールへオフロード
-    let engine = Arc::clone(&state.engine);
-    let tokenizer = Arc::clone(&state.tokenizer);
-    let calib_config = Arc::clone(&state.calib_config);
-    let coarse_config = state.coarse_config.clone();
-    let guardrail_pipeline = state.guardrail_pipeline.clone();
-    let chunk_size = state.chunk_size;
-    let questions = req.questions;
-    let gating_config = req.gating.unwrap_or_else(|| state.gating_config.clone());
-    let auto_hierarchical = req.auto_hierarchical.unwrap_or(state.auto_hierarchical);
-    let hierarchical_mapping = state.hierarchical_mapping.clone();
-    let hierarchical_config = state.hierarchical_config.clone();
-
-    let inference_start = Instant::now();
-    let (answers, prompt_tokens, routing_summary, route_records) =
-        tokio::task::spawn_blocking(move || {
-            // 正規化後ペイロードの正味トークン数を正確に算出
-            let state_tokens = tokenizer
-                .encode_state(&state_text)
-                .map(|toks| toks.len())
-                .unwrap_or(0);
-            let questions_tokens: usize = questions
-                .values()
-                .map(|q| {
-                    sokuto_runtime::tokenizer::prompt::format_prompt(q)
-                        .and_then(|f| {
-                            tokenizer
-                                .inner()
-                                .encode(f.suffix.as_str(), false)
-                                .map_err(|e| {
-                                    sokuto_runtime::error::RuntimeError::TokenizerEncodeError(
-                                        e.to_string(),
-                                    )
-                                })
-                        })
-                        .map(|toks| toks.len())
-                        .unwrap_or(0)
-                })
-                .sum();
-            let total_prompt_tokens = state_tokens + questions_tokens;
-
-            // 透過的粗密ルーティング対象質問の有無を判定 (マッピング適合性および候補数閾値ガード)
-            let has_hierarchical_target = if let Some(ref mapping) = hierarchical_mapping {
-                questions.values().any(|q| {
-                    q.question_type == QuestionType::Choice
-                        && q.criteria
-                            .as_ref()
-                            .and_then(|c| c.as_map())
-                            .map(|m| {
-                                let k = m.len();
-                                (auto_hierarchical && k > 8 || k > 16)
-                                    && m.keys().any(|key| mapping.fine_to_coarse.contains_key(key))
-                            })
-                            .unwrap_or(false)
-                })
-            } else {
-                false
-            };
-
-            let mut answers = if has_hierarchical_target {
-                let mapping = hierarchical_mapping
-                    .as_ref()
-                    .expect("マッピングが存在すること。");
-                let router = CoarseToFineRouter::new(
-                    &engine,
-                    &tokenizer,
-                    mapping.as_ref(),
-                    &calib_config,
-                    hierarchical_config,
-                )?;
-
-                let mut combined_answers = indexmap::IndexMap::with_capacity(questions.len());
-                let mut fallback_questions = indexmap::IndexMap::new();
-
-                for (qid, question) in &questions {
-                    let is_hierarchical = question.question_type == QuestionType::Choice
-                        && question
-                            .criteria
-                            .as_ref()
-                            .and_then(|c| c.as_map())
-                            .map(|m| {
-                                let k = m.len();
-                                (auto_hierarchical && k > 8 || k > 16)
-                                    && m.keys().any(|key| mapping.fine_to_coarse.contains_key(key))
-                            })
-                            .unwrap_or(false);
-
-                    if is_hierarchical {
-                        let res = router.route(
-                            &state_text,
-                            &question.instructions,
-                            Some(&gating_config),
-                        )?;
-                        if res.trace().soft_beam_triggered {
-                            record_hierarchical_soft_beam();
-                        }
-                        if res.trace().early_exit_triggered {
-                            record_hierarchical_early_exit();
-                        }
-                        combined_answers.insert(qid.clone(), res.into_answer());
-                    } else {
-                        fallback_questions.insert(qid.clone(), question.clone());
-                    }
-                }
-
-                if !fallback_questions.is_empty() {
-                    let fallback_answers = engine
-                        .evaluate_batch_questions_coarse_to_fine_chunked_with_gating(
-                            &tokenizer,
-                            &state_text,
-                            &fallback_questions,
-                            &calib_config,
-                            &coarse_config,
-                            chunk_size,
-                            Some(&gating_config),
-                        )?;
-                    for (qid, answer) in fallback_answers {
-                        combined_answers.insert(qid, answer);
-                    }
-                }
-
-                combined_answers
-            } else {
-                // 粗密 2 段階探索とマイクロバッチチャンキングを統合した通常推論を実行
-                engine.evaluate_batch_questions_coarse_to_fine_chunked_with_gating(
-                    &tokenizer,
-                    &state_text,
-                    &questions,
-                    &calib_config,
-                    &coarse_config,
-                    chunk_size,
-                    Some(&gating_config),
-                )?
-            };
-
-            // 後処理ガードレール (二峰性分布検出による安全弁降格、および元ラベルキー復元) の適用
-            guardrail_pipeline.post_process(&mut answers, &original_questions);
-
-            // 確信度ゲーティング (3系統ルーティング) メトリクス収集および集約サマリー算出
-            let (routing_summary, route_records) = if gating_config.enabled {
-                let mut records = Vec::with_capacity(answers.len());
-                for (qid, answer) in answers.iter() {
-                    let q_def = questions.get(qid);
-                    let q_type_str = q_def
-                        .map(|q| match q.question_type {
-                            QuestionType::Choice => "choice",
-                            QuestionType::Score => "score",
-                            QuestionType::Noul => "noul",
-                        })
-                        .unwrap_or("unknown");
-
-                    if let Some(ref meta) = answer.gating {
-                        records.push((
-                            meta.route.as_str(),
-                            q_type_str,
-                            qid.clone(),
-                            meta.route,
-                            meta.confidence,
-                            meta.reason.clone(),
-                        ));
-                    }
-                }
-                let summary = evaluate_response_routing(&answers);
-                (Some(summary), records)
-            } else {
-                (None, Vec::new())
-            };
-
-            Ok::<_, ServerError>((answers, total_prompt_tokens, routing_summary, route_records))
-        })
-        .await
-        .map_err(|join_err| {
-            ServerError::Internal(format!(
-                "ブロッキング推論タスクが異常終了しました: {join_err}。"
-            ))
-        })??;
-
-    let inference_duration = inference_start.elapsed().as_secs_f64();
-    record_inference_metrics(inference_duration, question_count);
-
-    // 確信度メトリクスの記録
-    for answer in answers.values() {
-        if let Some(conf) = answer.effective_confidence() {
-            record_confidence(conf);
-        }
-    }
-
-    // 5. ゲーティング判定ログおよびメトリクスの記録
-    for (route_str, q_type_str, qid, route, confidence, reason) in route_records {
-        record_gating_route(route_str, q_type_str);
-        tracing::info!(
-            question_id = %qid,
-            route = %route,
-            confidence = confidence,
-            reason = %reason,
-            "確信度ゲーティング判定を適用しました。"
-        );
-    }
-
-    // 6. トークン消費量のメタデータ付与
-    let usage = Usage::new(prompt_tokens);
-
-    let mut response = SystemOneResponse::new(answers, usage);
-    if let Some(summary) = routing_summary {
+    let resp_headers = output.to_headers();
+    let mut response = SystemOneResponse::new(output.answers, output.usage);
+    if let Some(summary) = output.routing_summary {
         response = response.with_routing(summary);
     }
 
@@ -280,5 +61,5 @@ pub async fn system_one_handler(
     record_http_duration("/v1/systemone", total_duration);
     record_http_request("/v1/systemone", 200);
 
-    Ok(axum::Json(response))
+    Ok((resp_headers, axum::Json(response)))
 }

@@ -227,3 +227,54 @@ def tokenize_sample(
         "op_indices": op_indices,
         "label": torch.tensor(target_index, dtype=torch.long),
     }
+
+
+def char_spans_to_token_spans(
+    char_spans: list[tuple[int, int]] | list[list[int]],
+    offset_mapping: list[tuple[int, int]] | list[list[int]] | Tensor,
+) -> list[tuple[int, int]]:
+    """文字オフセットスパン (char_start, char_end) をトークン系列スパン (start_token, end_token) へ射影変換する。
+
+    LateChunkingPooling や InSeNT 対照損失層が要求するトークン境界スパンを導出する。
+    FastTokenizer の offset_mapping (各トークンの [char_start, char_end]) を走査し、
+    指定された文字範囲に重なる最小・最大のトークンインデックスを同定する。
+
+    Args:
+        char_spans (list[tuple[int, int]] | list[list[int]]): 文字スパンリスト。
+        offset_mapping (list[tuple[int, int]] | list[list[int]] | Tensor): 各トークンの文字オフセット。
+
+    Returns:
+        list[tuple[int, int]]: 各チャンクに対応するトークン境界 (start_token_idx, end_token_idx) のリスト。
+    """
+    if isinstance(offset_mapping, Tensor):
+        offsets: list[tuple[int, int]] = [
+            (int(row[0].item()), int(row[1].item())) for row in offset_mapping
+        ]
+    else:
+        offsets = [(int(row[0]), int(row[1])) for row in offset_mapping]
+
+    token_spans: list[tuple[int, int]] = []
+
+    for c_start, c_end in char_spans:
+        c_start, c_end = int(c_start), int(c_end)
+        tok_start: int | None = None
+        tok_end: int | None = None
+
+        for tok_idx, (o_start, o_end) in enumerate(offsets):
+            # 特殊トークン ([CLS], [SEP], パディング等) でオフセットが (0, 0) の場合はスキップ
+            if o_start == 0 and o_end == 0 and tok_idx != 0:
+                continue
+
+            # トークンの文字範囲とチャンク文字範囲の重なり判定
+            if max(c_start, o_start) < min(c_end, o_end):
+                if tok_start is None:
+                    tok_start = tok_idx
+                tok_end = tok_idx
+
+        if tok_start is not None and tok_end is not None:
+            token_spans.append((tok_start, tok_end))
+        else:
+            # 重複トークンが検出できない場合のフォールバック
+            token_spans.append((0, 0))
+
+    return token_spans

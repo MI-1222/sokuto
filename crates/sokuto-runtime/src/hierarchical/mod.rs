@@ -23,6 +23,6 @@ pub use calibration::{
 pub use mapping::{HierarchicalMapping, HierarchicalMappingBuilder};
 pub use router::{
     CoarseToFineRouter, DEFAULT_BEAM_MARGIN_THRESHOLD, DEFAULT_CATCHALL_THRESHOLD,
-    DEFAULT_ESCALATE_CONFIDENCE_THRESHOLD, HierarchicalExecutionTrace, HierarchicalResult,
-    HierarchicalRouterConfig,
+    DEFAULT_ESCALATE_CONFIDENCE_THRESHOLD, HierarchicalEngine, HierarchicalExecutionTrace,
+    HierarchicalResult, HierarchicalRouterConfig,
 };

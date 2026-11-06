@@ -96,6 +96,18 @@ class SFTConfig:
     score_weight: float = 1.0
     noul_weight: float = 1.0
 
+    # 長系列拡張 & Late Chunking / InSeNT パラメータ
+    use_yarn: bool = False
+    original_max_position: int = 8192
+    target_max_position: int = 16384
+    yarn_alpha: float = 1.0
+    yarn_beta: float = 32.0
+    pooling_strategy: str = "mean"
+    top_k_chunks: int = 5
+    insent_weight: float = 0.0
+    insent_temperature: float = 0.05
+    insent_lambda_seq: float = 0.2
+
     seed: int = 42
     output_dir: str = "runs/sft"
 

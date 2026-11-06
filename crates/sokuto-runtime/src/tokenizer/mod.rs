@@ -299,6 +299,90 @@ impl JevTokenizer {
             option_keys: formatted.option_keys,
         })
     }
+
+    /// 単一の質問定義から `QueryEvaluator` 入力用トークン列および `[OP]` マーカー位置を生成する。
+    ///
+    /// # 戻り値
+    /// - `TokenizedQuestion`: Query 部分の `input_ids`、`attention_mask`、`op_indices`、`option_keys`。
+    pub fn encode_query(&self, question: &Question) -> Result<TokenizedQuestion> {
+        self.encode_query_with_max_len(question, self.max_sequence_length)
+    }
+
+    /// 系列長制約を指定して、単一の質問定義から `QueryEvaluator` 入力用トークン列を生成する。
+    pub fn encode_query_with_max_len(
+        &self,
+        question: &Question,
+        max_length: usize,
+    ) -> Result<TokenizedQuestion> {
+        let formatted = format_prompt(question)?;
+        let suffix_ids = self.encode_text(&formatted.suffix)?;
+
+        let mut query_tokens = Vec::with_capacity(
+            self.leading_special_tokens.len()
+                + suffix_ids.len()
+                + self.trailing_special_tokens.len(),
+        );
+        query_tokens.extend_from_slice(&self.leading_special_tokens);
+        query_tokens.extend_from_slice(&suffix_ids);
+        query_tokens.extend_from_slice(&self.trailing_special_tokens);
+
+        if query_tokens.len() > max_length {
+            return Err(RuntimeError::PromptExceedsMaxLength {
+                fixed_len: query_tokens.len(),
+                max_len: max_length,
+            });
+        }
+
+        let seq_len = query_tokens.len();
+        let input_ids: Vec<i64> = query_tokens.iter().map(|&id| id as i64).collect();
+        let attention_mask = vec![1i64; seq_len];
+
+        let mut op_indices = Vec::with_capacity(formatted.option_keys.len());
+        let op_token_id_i64 = self.op_token_id as i64;
+        for (idx, &token_id) in input_ids.iter().enumerate() {
+            if token_id == op_token_id_i64 {
+                op_indices.push(idx as i64);
+            }
+        }
+
+        if op_indices.len() != formatted.option_keys.len() {
+            return Err(RuntimeError::OptionMarkerCountMismatch {
+                detected: op_indices.len(),
+                expected: formatted.option_keys.len(),
+            });
+        }
+
+        Ok(TokenizedQuestion {
+            input_ids,
+            attention_mask,
+            op_indices,
+            option_keys: formatted.option_keys,
+        })
+    }
+
+    /// `State` 文字列を `StateEncoder` 入力用トークン列 (`input_ids`, `attention_mask`) としてエンコードする。
+    pub fn encode_state_tensor(&self, state: &str) -> Result<(Vec<i64>, Vec<i64>)> {
+        let text_tokens = self.encode_state(state)?;
+        let mut tokens = Vec::with_capacity(
+            self.leading_special_tokens.len()
+                + self.state_prefix_tokens.len()
+                + text_tokens.len()
+                + self.trailing_special_tokens.len(),
+        );
+        tokens.extend_from_slice(&self.leading_special_tokens);
+        tokens.extend_from_slice(&self.state_prefix_tokens);
+        tokens.extend_from_slice(&text_tokens);
+        tokens.extend_from_slice(&self.trailing_special_tokens);
+
+        if tokens.len() > self.max_sequence_length {
+            tokens.truncate(self.max_sequence_length);
+        }
+
+        let seq_len = tokens.len();
+        let input_ids: Vec<i64> = tokens.iter().map(|&t| t as i64).collect();
+        let attention_mask = vec![1i64; seq_len];
+        Ok((input_ids, attention_mask))
+    }
 }
 
 #[cfg(test)]

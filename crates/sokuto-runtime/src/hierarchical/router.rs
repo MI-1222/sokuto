@@ -11,6 +11,7 @@ use sokuto_core::math::{normalized_entropy, top_margin};
 use sokuto_core::schema::{Answer, Criteria, Question, QuestionType};
 
 use crate::engine::InferenceEngine;
+use crate::engine::cache::{CachedStateFeatures, DualSessionEngine};
 use crate::engine::coarse::{HierarchicalCoarseScorer, ModelDrivenCoarseScorer};
 use crate::error::{Result, RuntimeError};
 use crate::hierarchical::calibration::{
@@ -166,9 +167,22 @@ impl HierarchicalResult {
     }
 }
 
+/// 粗密階層ルーティングで使用する推論エンジンバックエンド。
+pub enum HierarchicalEngine<'a> {
+    /// 単一 ONNX モデルによる通常推論エンジン。
+    Single(&'a InferenceEngine),
+    /// 中間特徴量キャッシュを活用するデュアルセッションエンジン。
+    Dual {
+        /// デュアルセッションエンジンへの参照。
+        engine: &'a DualSessionEngine,
+        /// キャッシュ済みの中間特徴量への参照。
+        cached_state: &'a CachedStateFeatures,
+    },
+}
+
 /// 粗密二段階階層ルーティングを実行するオーケストレータ。
 pub struct CoarseToFineRouter<'a> {
-    engine: &'a InferenceEngine,
+    backend: HierarchicalEngine<'a>,
     tokenizer: &'a JevTokenizer,
     mapping: &'a HierarchicalMapping,
     calib_config: &'a CalibrationConfig,
@@ -176,9 +190,47 @@ pub struct CoarseToFineRouter<'a> {
 }
 
 impl<'a> CoarseToFineRouter<'a> {
-    /// 新しいルーターインスタンスを生成する。
+    /// 新しいルーターインスタンスを単一推論エンジンから生成する。
     pub fn new(
         engine: &'a InferenceEngine,
+        tokenizer: &'a JevTokenizer,
+        mapping: &'a HierarchicalMapping,
+        calib_config: &'a CalibrationConfig,
+        config: HierarchicalRouterConfig,
+    ) -> Result<Self> {
+        Self::with_backend(
+            HierarchicalEngine::Single(engine),
+            tokenizer,
+            mapping,
+            calib_config,
+            config,
+        )
+    }
+
+    /// キャッシュ済み中間特徴量を保持するデュアルセッションエンジンから新しいルーターインスタンスを生成する。
+    pub fn new_dual(
+        engine: &'a DualSessionEngine,
+        cached_state: &'a CachedStateFeatures,
+        tokenizer: &'a JevTokenizer,
+        mapping: &'a HierarchicalMapping,
+        calib_config: &'a CalibrationConfig,
+        config: HierarchicalRouterConfig,
+    ) -> Result<Self> {
+        Self::with_backend(
+            HierarchicalEngine::Dual {
+                engine,
+                cached_state,
+            },
+            tokenizer,
+            mapping,
+            calib_config,
+            config,
+        )
+    }
+
+    /// 任意の推論バックエンドからルーターインスタンスを生成する。
+    pub fn with_backend(
+        backend: HierarchicalEngine<'a>,
         tokenizer: &'a JevTokenizer,
         mapping: &'a HierarchicalMapping,
         calib_config: &'a CalibrationConfig,
@@ -198,7 +250,7 @@ impl<'a> CoarseToFineRouter<'a> {
         }
 
         Ok(Self {
-            engine,
+            backend,
             tokenizer,
             mapping,
             calib_config,
@@ -223,11 +275,36 @@ impl<'a> CoarseToFineRouter<'a> {
         gating_config: Option<&GatingConfig>,
     ) -> Result<HierarchicalResult> {
         // --- Step 1: 第 1 パス (大分類推論 & Dirichlet 較正) ---
-        let coarse_scorer = ModelDrivenCoarseScorer::new(self.engine, self.tokenizer)
-            .with_calibration(self.calib_config);
-
-        let coarse_probabilities =
-            coarse_scorer.score_coarse(state, instructions, &self.mapping.coarse_categories)?;
+        let coarse_probabilities = match self.backend {
+            HierarchicalEngine::Single(single_engine) => {
+                let coarse_scorer = ModelDrivenCoarseScorer::new(single_engine, self.tokenizer)
+                    .with_calibration(self.calib_config);
+                coarse_scorer.score_coarse(state, instructions, &self.mapping.coarse_categories)?
+            }
+            HierarchicalEngine::Dual {
+                engine,
+                cached_state,
+            } => {
+                let coarse_question = Question {
+                    question_type: QuestionType::Choice,
+                    instructions: instructions.to_string(),
+                    criteria: Some(sokuto_core::schema::Criteria::Map(
+                        self.mapping.coarse_categories.clone(),
+                    )),
+                };
+                let raw_logits =
+                    engine.forward_question_raw(self.tokenizer, cached_state, &coarse_question)?;
+                let base_temp = self
+                    .calib_config
+                    .get_temperature(QuestionType::Choice, self.mapping.coarse_categories.len());
+                let probs = temperature_scaled_softmax(&raw_logits, base_temp);
+                let mut map = IndexMap::with_capacity(self.mapping.coarse_categories.len());
+                for (i, key) in self.mapping.coarse_categories.keys().enumerate() {
+                    map.insert(key.clone(), probs[i]);
+                }
+                map
+            }
+        };
 
         // ODIR 正則化 Dirichlet 較正の適用 (設定されている場合)
         let coarse_probabilities = if let Some(ref calibrator) = self.config.coarse_calibrator {
@@ -393,9 +470,15 @@ impl<'a> CoarseToFineRouter<'a> {
         };
 
         // Softmax 前の生ロジットを直接抽出 (二重 Softmax & 疑似ロジット対数逆算の歪みを根絶)
-        let raw_logits = self
-            .engine
-            .forward_question_raw(self.tokenizer, state, &fine_question)?;
+        let raw_logits = match self.backend {
+            HierarchicalEngine::Single(single_engine) => {
+                single_engine.forward_question_raw(self.tokenizer, state, &fine_question)?
+            }
+            HierarchicalEngine::Dual {
+                engine,
+                cached_state,
+            } => engine.forward_question_raw(self.tokenizer, cached_state, &fine_question)?,
+        };
 
         // --- Step 5: 温度調整 & 確率結合 ---
         let fine_temperature =

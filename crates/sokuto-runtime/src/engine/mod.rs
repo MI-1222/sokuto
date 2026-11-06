@@ -4,6 +4,7 @@
 //! および Execution Provider 解決機構を提供する。
 
 pub mod batch;
+pub mod cache;
 pub mod coarse;
 pub mod config;
 pub mod escalation;
@@ -12,6 +13,10 @@ pub mod provider;
 pub mod session;
 
 pub use batch::{BatchScratchpad, DEFAULT_MAX_BATCH_CHUNK_SIZE};
+pub use cache::{
+    AlignedBuffer64, CacheCompressionMode, CachedStateFeatures, CachedTensorPayload,
+    DEFAULT_DUAL_MAX_BATCH_CHUNK_SIZE, DualSessionEngine, StateCacheManager, is_aligned_64,
+};
 pub use coarse::{
     CandidateEmbeddingCache, CoarseScorer, CoarseToFineConfig, DEFAULT_COARSE_THRESHOLD,
     DEFAULT_NEGATIVE_KEYS, DEFAULT_TOP_M_CANDIDATES, EmbeddingCoarseScorer, FilteredCandidates,

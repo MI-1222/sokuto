@@ -5,7 +5,12 @@
  * 非自己回帰の単一フォワードパス推論を実行する。
  */
 
-import type { SokutoRequest, SokutoResponse } from "./types.js";
+import type {
+  SokutoRequest,
+  SokutoResponse,
+  StateBatchRequest,
+  StateBatchResponse,
+} from "./types.js";
 
 /**
  * sokuto-server 向け HTTP 推論クライアント。
@@ -13,6 +18,7 @@ import type { SokutoRequest, SokutoResponse } from "./types.js";
 export class SokutoClient {
   public readonly baseUrl: string;
   public readonly timeoutMs: number;
+  private lastStateHash: string | null = null;
 
   /**
    * クライアントを初期化する。
@@ -24,40 +30,183 @@ export class SokutoClient {
     this.timeoutMs = options?.timeoutMs ?? 50;
   }
 
+  /** 直近にサーバーから受信した State キャッシュキーを取得する。 */
+  getLastStateHash(): string | null {
+    return this.lastStateHash;
+  }
+
+  /** State キャッシュキーを手動設定する。 */
+  setLastStateHash(hash: string | null): void {
+    this.lastStateHash = hash;
+  }
+
+  /** 記憶している State キャッシュキーをクリアする。 */
+  clearStateHash(): void {
+    this.lastStateHash = null;
+  }
+
   /**
    * /v1/systemone エンドポイントへ推論リクエストを送信する。
    *
    * @param request リクエストデータ。
+   * @param options 最適化オプション (State-Offloading等)。
    * @returns SokutoResponse レスポンスデータ。
    */
-  async predict(request: SokutoRequest): Promise<SokutoResponse> {
+  async predict(
+    request: SokutoRequest,
+    options?: { enableStateOffloading?: boolean },
+  ): Promise<SokutoResponse> {
     const url = `${this.baseUrl}/v1/systemone`;
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), this.timeoutMs);
 
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+
+    const effectiveHash = request.state_hash ?? this.lastStateHash;
+    if (effectiveHash) {
+      headers["X-State-Hash"] = effectiveHash;
+    }
+
+    let payload = { ...request };
+    if (options?.enableStateOffloading && effectiveHash && request.state) {
+      payload = { ...payload, state: "" };
+    }
+
     try {
-      const resp = await fetch(url, {
+      let resp = await fetch(url, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(request),
+        headers,
+        body: JSON.stringify(payload),
         signal: controller.signal,
       });
+
+      // State-Offloading でミスした場合は本文を含めて自動フォールバック再送
+      if (
+        !resp.ok &&
+        resp.status === 400 &&
+        options?.enableStateOffloading &&
+        payload.state === "" &&
+        request.state
+      ) {
+        delete headers["X-State-Hash"];
+        const fallbackRequest = { ...request };
+        delete fallbackRequest.state_hash;
+        resp = await fetch(url, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(fallbackRequest),
+          signal: controller.signal,
+        });
+      }
 
       if (!resp.ok) {
         throw new Error(`sokuto-server HTTP ${resp.status}: ${await resp.text()}`);
       }
 
-      return (await resp.json()) as SokutoResponse;
+      const receivedHash = resp.headers.get("x-state-hash") ?? resp.headers.get("X-State-Hash");
+      if (receivedHash) {
+        this.lastStateHash = receivedHash;
+      }
+      const cacheStatus =
+        resp.headers.get("x-cache-status") ??
+        resp.headers.get("X-Cache-Status") ??
+        resp.headers.get("x-cache") ??
+        "BYPASS";
+
+      const data = (await resp.json()) as SokutoResponse;
+      data.cache_status = cacheStatus;
+      if (receivedHash) {
+        data.state_hash = receivedHash;
+      }
+      return data;
     } finally {
       clearTimeout(id);
     }
   }
 
   /**
-   * サーバーの稼働状態 (/ready) を確認する。
+   * /v1/systemone/state-batch エンドポイントへ一括バッチ質問リクエストを送信する。
+   *
+   * @param request バッチリクエストデータ。
+   * @param options 最適化オプション。
+   * @returns StateBatchResponse レスポンスデータ。
    */
+  async evaluateBatch(
+    request: StateBatchRequest,
+    options?: { enableStateOffloading?: boolean },
+  ): Promise<StateBatchResponse> {
+    const url = `${this.baseUrl}/v1/systemone/state-batch`;
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), this.timeoutMs);
+
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+
+    const effectiveHash = request.state_hash ?? this.lastStateHash;
+    if (effectiveHash) {
+      headers["X-State-Hash"] = effectiveHash;
+    }
+
+    let payload = { ...request };
+    if (options?.enableStateOffloading && effectiveHash && request.state) {
+      payload = { ...payload, state: "" };
+    }
+
+    try {
+      let resp = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+
+      if (
+        !resp.ok &&
+        resp.status === 400 &&
+        options?.enableStateOffloading &&
+        payload.state === "" &&
+        request.state
+      ) {
+        delete headers["X-State-Hash"];
+        const fallbackRequest = { ...request };
+        delete fallbackRequest.state_hash;
+        resp = await fetch(url, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(fallbackRequest),
+          signal: controller.signal,
+        });
+      }
+
+      if (!resp.ok) {
+        throw new Error(`sokuto-server HTTP ${resp.status}: ${await resp.text()}`);
+      }
+
+      const receivedHash = resp.headers.get("x-state-hash") ?? resp.headers.get("X-State-Hash");
+      if (receivedHash) {
+        this.lastStateHash = receivedHash;
+      }
+      const cacheStatus =
+        resp.headers.get("x-cache-status") ??
+        resp.headers.get("X-Cache-Status") ??
+        resp.headers.get("x-cache") ??
+        "BYPASS";
+
+      const data = (await resp.json()) as StateBatchResponse;
+      data.cache_status = cacheStatus;
+      if (receivedHash) {
+        data.state_hash = receivedHash;
+      }
+      return data;
+    } finally {
+      clearTimeout(id);
+    }
+  }
+
+  /** サーバーの稼働状態 (/ready) を確認する。 */
   async isReady(): Promise<boolean> {
     const url = `${this.baseUrl}/ready`;
     try {

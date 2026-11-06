@@ -13,13 +13,18 @@ from data.converters.ag_news import AGNewsConverter
 from data.converters.banking77 import Banking77Converter
 from data.converters.base import BaseDatasetConverter
 from data.converters.clinc150 import Clinc150Converter
+from data.converters.compliance_ja import ComplianceJAConverter
+from data.converters.jbe_qa import JBEQAConverter
 from data.converters.jglue_jcommonsenseqa import JGlueJCommonsenseQAConverter
 from data.converters.jglue_jnli import JGlueJNLIConverter
 from data.converters.jglue_jsts import JGlueJSTSConverter
 from data.converters.jglue_marc_ja import JGlueMarcJaConverter
+from data.converters.legal_rikai import LegalRikaiConverter
 from data.converters.mnli import MNLIConverter
+from data.converters.niah import NIAHBenchmarkConverter
 from data.converters.sst5 import SST5Converter
 from data.converters.synthetic import SyntheticDatasetConverter
+from data.converters.synthetic_long import LongContextSyntheticConverter
 from data.negative_sampler import SyntheticNegativeInjector
 from data.schema import UnifiedSample
 
@@ -63,6 +68,19 @@ class UnifiedDatasetBuilder:
             "synthetic_choice": SyntheticDatasetConverter(mode="choice", seed=seed),
             "synthetic_score": SyntheticDatasetConverter(mode="score", seed=seed),
             "synthetic_noul": SyntheticDatasetConverter(mode="noul", seed=seed),
+            # 長文実務データセット & ベンチマーク
+            "jbe_qa": JBEQAConverter(mode="both", seed=seed),
+            "jbe_qa_noul": JBEQAConverter(mode="noul", seed=seed),
+            "jbe_qa_choice": JBEQAConverter(mode="choice", seed=seed),
+            "legal_rikai": LegalRikaiConverter(mode="both", seed=seed),
+            "legal_rikai_choice": LegalRikaiConverter(mode="choice", seed=seed),
+            "legal_rikai_noul": LegalRikaiConverter(mode="noul", seed=seed),
+            "compliance_ja": ComplianceJAConverter(mode="all", seed=seed),
+            "compliance_ja_score": ComplianceJAConverter(mode="score", seed=seed),
+            "compliance_ja_choice": ComplianceJAConverter(mode="choice", seed=seed),
+            "compliance_ja_noul": ComplianceJAConverter(mode="noul", seed=seed),
+            "niah_long": NIAHBenchmarkConverter(seed=seed),
+            "synthetic_long_context": LongContextSyntheticConverter(seed=seed),
         }
 
     def register_converter(self, name: str, converter: BaseDatasetConverter) -> None:

@@ -10,7 +10,8 @@ use sokuto_core::gating::{
     SystemRoutingSummary,
 };
 use sokuto_core::schema::{
-    Answer, Criteria, Question, QuestionType, SystemOneRequest, SystemOneResponse, Usage,
+    Answer, Criteria, Question, QuestionType, StateBatchRequest, StateBatchResponse,
+    SystemOneRequest, SystemOneResponse, Usage,
 };
 use utoipa::OpenApi;
 
@@ -26,6 +27,7 @@ use crate::schema::dag::{
 #[openapi(
     paths(
         crate::handlers::systemone::system_one_handler,
+        crate::handlers::state_batch::state_batch_handler,
         crate::handlers::dag::dag_handler,
         crate::handlers::ops::health_handler,
         crate::handlers::ops::ready_handler,
@@ -35,6 +37,8 @@ use crate::schema::dag::{
         schemas(
             SystemOneRequest,
             SystemOneResponse,
+            StateBatchRequest,
+            StateBatchResponse,
             Question,
             QuestionType,
             Criteria,

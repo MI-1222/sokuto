@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from data.schema import QuestionType
+from training.insent_loss import InSeNTLoss
 
 DEFAULT_MASK_VALUE = -1e4
 """無効候補に適用する負の無限大代替値。半精度アンダーフローや NaN を防止する。"""
@@ -511,7 +512,7 @@ class InfoNCEContrastiveLoss(nn.Module):
 
 
 class JevMultiTaskLoss(nn.Module):
-    """Jev アーキテクチャ用 数理的複合損失エンジン (Phase 4 改訂版)。
+    """Jev アーキテクチャ用 数理的複合損失エンジン。
 
     Choice (動的平滑化 + Focal), Score (RPS / EMD), Noul (ASL / 非対称 BCE),
     および補助対照損失 (InfoNCE) を統合し、異種タスク混在バッチに対して
@@ -541,6 +542,9 @@ class JevMultiTaskLoss(nn.Module):
         choice_weight: float = 1.0,
         score_weight: float = 1.0,
         noul_weight: float = 1.0,
+        insent_weight: float = 0.0,
+        insent_temperature: float = 0.05,
+        insent_lambda_seq: float = 0.2,
     ) -> None:
         """複合損失エンジンを初期化する。
 
@@ -556,6 +560,9 @@ class JevMultiTaskLoss(nn.Module):
             choice_weight (float): Choice 型損失の重み係数。
             score_weight (float): Score 型損失の重み係数。
             noul_weight (float): Noul 型損失の重み係数。
+            insent_weight (float): InSeNT 対照損失の重み係数 (0.0 で無効化, 推奨: 0.15)。
+            insent_temperature (float): InSeNT 対照損失の温度パラメータ。
+            insent_lambda_seq (float): InSeNT の In-Sequence 損失比率。
         """
         super().__init__()
         self.choice_loss_fn = LabelSmoothedFocalLoss(
@@ -578,11 +585,16 @@ class JevMultiTaskLoss(nn.Module):
         self.contrastive_loss_fn = InfoNCEContrastiveLoss(
             temperature=contrastive_temperature
         )
+        self.insent_loss_fn = InSeNTLoss(
+            temperature=insent_temperature,
+            lambda_seq=insent_lambda_seq,
+        )
 
         self.contrastive_weight = contrastive_weight
         self.choice_weight = choice_weight
         self.score_weight = score_weight
         self.noul_weight = noul_weight
+        self.insent_weight = insent_weight
 
     def forward(
         self,
@@ -592,6 +604,10 @@ class JevMultiTaskLoss(nn.Module):
         question_types: list[str | QuestionType] | None = None,
         state_repr: Tensor | None = None,
         option_repr: Tensor | None = None,
+        query_embeddings: Tensor | None = None,
+        chunk_embeddings: Tensor | None = None,
+        target_chunk_indices: Tensor | None = None,
+        chunk_mask: Tensor | None = None,
         return_dict: bool = False,
     ) -> Tensor | tuple[Tensor, dict[str, float]]:
         """異種タスク混在バッチに対する複合数理損失を算出する。
@@ -601,7 +617,8 @@ class JevMultiTaskLoss(nn.Module):
         2. タスク種別 (`choice`, `score`, `noul`) に応じて各サブ損失を計算する。
         3. `contrastive_weight > 0` かつ特徴量が提供されている場合、有効候補マーカーとの InfoNCE 類似度損失を算出する。
         4. タスクごとに平均損失を求め、タスク重みで合算する (ゼロ除算ガード適用)。
-        5. `return_dict=True` の場合はメトリクス内訳辞書を併せて返却する。
+        5. `insent_weight > 0` かつチャンク情報が提供されている場合、InSeNT 対照損失を加算する。
+        6. `return_dict=True` の場合はメトリクス内訳辞書を併せて返却する。
 
         Args:
             logits (Tensor): ロジットテンソル `[batch_size, max_options]`。
@@ -610,13 +627,19 @@ class JevMultiTaskLoss(nn.Module):
             question_types (list[str | QuestionType] | None): 各サンプルの質問種別リスト。未指定時は全て Choice として処理。
             state_repr (Tensor | None): 文脈表現ベクトル `[batch_size, hidden_size]`。
             option_repr (Tensor | None): 候補マーカーベクトル `[batch_size, max_options, hidden_size]`。
+            query_embeddings (Tensor | None): 質問表現ベクトル `[batch_size, hidden_size]` (InSeNT 用)。
+            chunk_embeddings (Tensor | None): 集約チャンク表現 `[batch_size, num_chunks, hidden_size]`。
+            target_chunk_indices (Tensor | None): 各サンプルの正解条項インデックス `[batch_size]`。
+            chunk_mask (Tensor | None): 有効チャンクマスク `[batch_size, num_chunks]`。
             return_dict (bool): メトリクス辞書を同時に返却するかどうか。
+
 
         Returns:
             Tensor | tuple[Tensor, dict[str, float]]:
                 - 通常時: スカラー総損失テンソル。
                 - 辞書返却時: (total_loss, loss_dict) のタプル。
         """
+
         batch_size = logits.size(0)
         device = logits.device
 
@@ -717,6 +740,38 @@ class JevMultiTaskLoss(nn.Module):
         if contrast_losses and self.contrastive_weight > 0.0:
             total_loss = total_loss + self.contrastive_weight * mean_contrast
 
+        # InSeNT 対照損失の加算 (長系列 & Late Chunking 時)
+        insent_loss_val = 0.0
+        if (
+            self.insent_weight > 0.0
+            and chunk_embeddings is not None
+            and target_chunk_indices is not None
+        ):
+            # 質問側表現: query_embeddings または state_repr または option_repr の平均。
+            q_emb = (
+                query_embeddings
+                if query_embeddings is not None
+                else (
+                    state_repr
+                    if state_repr is not None
+                    else (option_repr.mean(dim=1) if option_repr is not None else None)
+                )
+            )
+            if q_emb is None:
+                raise ValueError(
+                    "InSeNT 損失の計算には質問側の表現 (query_embeddings, state_repr, または option_repr) が必須です。"
+                    "chunk_embeddings への自己対照フォールバックは数理的に推奨されません。"
+                )
+
+            insent_loss = self.insent_loss_fn(
+                query_embeddings=q_emb,
+                chunk_embeddings=chunk_embeddings,
+                target_chunk_indices=target_chunk_indices,
+                chunk_mask=chunk_mask,
+            )
+            total_loss = total_loss + self.insent_weight * insent_loss
+            insent_loss_val = float(insent_loss.detach().item())
+
         if not return_dict:
             return total_loss
 
@@ -728,6 +783,7 @@ class JevMultiTaskLoss(nn.Module):
             "loss_contrast": float(mean_contrast.detach().item())
             if contrast_losses
             else 0.0,
+            "loss_insent": insent_loss_val,
         }
 
         return total_loss, loss_dict

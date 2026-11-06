@@ -141,6 +141,7 @@ impl EscalationPromptBuilder {
                 }
             }
             _ => {
+                prompt.push_str("【警告: State 本文が省略（State-Offloading）または未指定です。System 2 での判断に必要な場合はクライアント側の元テキストを参照してください】\n");
                 prompt.push_str("(コンテキストが指定されていません。)\n");
             }
         }

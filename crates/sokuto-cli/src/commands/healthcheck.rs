@@ -3,7 +3,7 @@
 //! 最小コンテナ環境など curl が存在しない環境において、
 //! 外部依存なしで HTTP エンドポイントの死活監視・準備状態確認 (Liveness / Readiness) を行う。
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
@@ -147,16 +147,30 @@ pub fn run_healthcheck(
 
     stream.write_all(request.as_bytes())?;
 
-    let mut response_bytes = Vec::new();
-    let mut buffer = [0u8; 1024];
+    let mut reader = std::io::BufReader::new(stream);
+    let mut status_line = String::new();
+    const MAX_STATUS_LINE_LEN: usize = 8192;
+
     loop {
-        match stream.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(n) => {
-                response_bytes.extend_from_slice(&buffer[..n]);
-                if response_bytes.contains(&b'\n') {
-                    break;
+        status_line.clear();
+        let mut handle = (&mut reader).take(MAX_STATUS_LINE_LEN as u64);
+        match handle.read_line(&mut status_line) {
+            Ok(0) => {
+                return Err("空の HTTP レスポンスを受信しました。".into());
+            }
+            Ok(_) => {
+                if !status_line.ends_with('\n') {
+                    return Err(format!(
+                        "HTTP ステータス行が長すぎるか、不完全です (上限 {MAX_STATUS_LINE_LEN} バイト)。"
+                    )
+                    .into());
                 }
+                let trimmed = status_line.trim_matches(|c| c == '\r' || c == '\n');
+                if trimmed.is_empty() {
+                    // RFC 7230 §3.5: 先行する空行 (CRLF) を読み飛ばす。
+                    continue;
+                }
+                break;
             }
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
@@ -168,14 +182,10 @@ pub fn run_healthcheck(
         }
     }
 
-    let response_text = String::from_utf8_lossy(&response_bytes);
-    let mut lines = response_text.lines();
-    let status_line = lines.next().ok_or("空の HTTP レスポンスを受信しました。")?;
-
-    // 例: "HTTP/1.1 200 OK"
-    let parts: Vec<&str> = status_line.split_whitespace().collect();
+    let trimmed = status_line.trim_matches(|c| c == '\r' || c == '\n');
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
     if parts.len() < 2 {
-        return Err(format!("不正な HTTP ステータス行です: '{status_line}'。").into());
+        return Err(format!("不正な HTTP ステータス行です: '{trimmed}'。").into());
     }
 
     let status_code = parts[1].parse::<u16>().map_err(|e| {
@@ -186,13 +196,10 @@ pub fn run_healthcheck(
     })?;
 
     if status_code == 200 {
-        tracing::debug!("ヘルスチェック成功: {status_line}。");
+        tracing::debug!("ヘルスチェック成功: {trimmed}。");
         Ok(())
     } else {
-        Err(
-            format!("ヘルスチェック失敗 (ステータスコード {status_code}): '{status_line}'。")
-                .into(),
-        )
+        Err(format!("ヘルスチェック失敗 (ステータスコード {status_code}): '{trimmed}'。").into())
     }
 }
 
@@ -308,6 +315,70 @@ mod tests {
         assert!(result.is_ok());
         // 5秒のタイムアウトを待たずに即座 (500ms 未満) に脱出できたことを検証。
         assert!(elapsed < Duration::from_millis(400));
+
+        let _ = server_handle.join();
+    }
+
+    #[test]
+    fn test_run_healthcheck_fragmented_status_line() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server_handle = thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                // パケット分割を模倣: "HTTP/1.1 200 OK\r" の \r 直後で分割して送信。
+                let chunk1 = b"HTTP/1.1 200 OK\r";
+                socket.write_all(chunk1).unwrap();
+                socket.flush().unwrap();
+
+                thread::sleep(Duration::from_millis(30));
+
+                let chunk2 = b"\nContent-Length: 2\r\n\r\nOK";
+                socket.write_all(chunk2).unwrap();
+                socket.flush().unwrap();
+            }
+        });
+
+        let args = HealthcheckArgs {
+            url: format!("http://127.0.0.1:{port}/health"),
+            timeout_secs: 5,
+        };
+
+        let result = run_healthcheck(args);
+        assert!(result.is_ok());
+
+        let _ = server_handle.join();
+    }
+
+    #[test]
+    fn test_run_healthcheck_leading_empty_lines() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server_handle = thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                // 先行する CRLF 空行を含むレスポンスを送信。
+                let response = "\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+                socket.write_all(response.as_bytes()).unwrap();
+                socket.flush().unwrap();
+            }
+        });
+
+        let args = HealthcheckArgs {
+            url: format!("http://127.0.0.1:{port}/health"),
+            timeout_secs: 5,
+        };
+
+        let result = run_healthcheck(args);
+        assert!(result.is_ok());
 
         let _ = server_handle.join();
     }

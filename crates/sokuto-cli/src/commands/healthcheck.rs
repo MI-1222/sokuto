@@ -4,7 +4,7 @@
 //! 外部依存なしで HTTP エンドポイントの死活監視・準備状態確認 (Liveness / Readiness) を行う。
 
 use std::io::{BufRead, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 /// ヘルスチェック実行引数構造体。
@@ -89,8 +89,8 @@ fn parse_http_url(url: &str) -> Result<(String, u16, String), String> {
 /// ホスト名およびポート番号からソケットアドレスを解決する。
 ///
 /// IP アドレス文字列（IPv4 または `[::1]` などの IPv6 リテラル）の場合は DNS 問い合わせを行わずに即座にパースし、
-/// ホスト名の場合は別スレッドとタイムアウト付きチャネルを用いて指定期限 (`deadline`) 内での解決を保証する。
-fn resolve_socket_addrs(
+/// ホスト名の場合は Tokio の非同期名前解決とタイムアウトを用いて指定期限 (`deadline`) 内での解決を保証する。
+async fn resolve_socket_addrs(
     host: &str,
     port: u16,
     deadline: Instant,
@@ -112,26 +112,11 @@ fn resolve_socket_addrs(
         return Err("名前解決がタイムアウトしました。".into());
     }
 
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let host_port = format!("{host}:{port}");
-    std::thread::Builder::new()
-        .name("dns-resolve".to_string())
-        .spawn(move || {
-            let res = host_port
-                .to_socket_addrs()
-                .map(|iter| iter.collect::<Vec<_>>());
-            let _ = tx.send(res);
-        })
-        .map_err(|e| format!("名前解決スレッドの起動に失敗しました: {e}"))?;
-
-    match rx.recv_timeout(remaining) {
-        Ok(res) => Ok(res?),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            Err(format!("ホスト名 '{host}' の名前解決がタイムアウトしました。").into())
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err(format!("ホスト名 '{host}' の名前解決スレッドが予期せず終了しました。").into())
-        }
+    match tokio::time::timeout(remaining, tokio::net::lookup_host(&host_port)).await {
+        Ok(Ok(iter)) => Ok(iter.collect()),
+        Ok(Err(e)) => Err(format!("ホスト名 '{host}' の名前解決に失敗しました: {e}。").into()),
+        Err(_) => Err(format!("ホスト名 '{host}' の名前解決がタイムアウトしました。").into()),
     }
 }
 
@@ -139,7 +124,7 @@ fn resolve_socket_addrs(
 ///
 /// # 引数
 /// - `args`: ヘルスチェック対象 URL およびタイムアウト設定。
-pub fn run_healthcheck(
+pub async fn run_healthcheck(
     args: HealthcheckArgs,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if args.timeout_secs == 0 {
@@ -150,7 +135,7 @@ pub fn run_healthcheck(
     let timeout = Duration::from_secs(args.timeout_secs);
     let deadline = Instant::now() + timeout;
 
-    let socket_addrs = resolve_socket_addrs(&host, port, deadline)?;
+    let socket_addrs = resolve_socket_addrs(&host, port, deadline).await?;
     if socket_addrs.is_empty() {
         return Err(format!("ホスト名のアドレス解決に失敗しました: {host}:{port}。").into());
     }
@@ -315,8 +300,8 @@ mod tests {
         assert!(err.is_err());
     }
 
-    #[test]
-    fn test_run_healthcheck_ipv6() {
+    #[tokio::test]
+    async fn test_run_healthcheck_ipv6() {
         use std::io::Write;
         use std::net::TcpListener;
         use std::thread;
@@ -339,14 +324,14 @@ mod tests {
             timeout_secs: 5,
         };
 
-        let result = run_healthcheck(args);
+        let result = run_healthcheck(args).await;
         assert!(result.is_ok());
 
         let _ = server_handle.join();
     }
 
-    #[test]
-    fn test_run_healthcheck_immediate_return_without_close() {
+    #[tokio::test]
+    async fn test_run_healthcheck_immediate_return_without_close() {
         use std::io::Write;
         use std::net::TcpListener;
         use std::thread;
@@ -370,7 +355,7 @@ mod tests {
         };
 
         let start = std::time::Instant::now();
-        let result = run_healthcheck(args);
+        let result = run_healthcheck(args).await;
         let elapsed = start.elapsed();
 
         assert!(result.is_ok());
@@ -380,8 +365,8 @@ mod tests {
         let _ = server_handle.join();
     }
 
-    #[test]
-    fn test_run_healthcheck_fragmented_status_line() {
+    #[tokio::test]
+    async fn test_run_healthcheck_fragmented_status_line() {
         use std::io::Write;
         use std::net::TcpListener;
         use std::thread;
@@ -409,14 +394,14 @@ mod tests {
             timeout_secs: 5,
         };
 
-        let result = run_healthcheck(args);
+        let result = run_healthcheck(args).await;
         assert!(result.is_ok());
 
         let _ = server_handle.join();
     }
 
-    #[test]
-    fn test_run_healthcheck_leading_empty_lines() {
+    #[tokio::test]
+    async fn test_run_healthcheck_leading_empty_lines() {
         use std::io::Write;
         use std::net::TcpListener;
         use std::thread;
@@ -438,19 +423,19 @@ mod tests {
             timeout_secs: 5,
         };
 
-        let result = run_healthcheck(args);
+        let result = run_healthcheck(args).await;
         assert!(result.is_ok());
 
         let _ = server_handle.join();
     }
 
-    #[test]
-    fn test_run_healthcheck_timeout_secs_zero() {
+    #[tokio::test]
+    async fn test_run_healthcheck_timeout_secs_zero() {
         let args = HealthcheckArgs {
             url: "http://127.0.0.1:3000/ready".to_string(),
             timeout_secs: 0,
         };
-        let result = run_healthcheck(args);
+        let result = run_healthcheck(args).await;
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
@@ -477,23 +462,25 @@ mod tests {
         assert_eq!(parsed.args.timeout_secs, 1);
     }
 
-    #[test]
-    fn test_resolve_socket_addrs() {
+    #[tokio::test]
+    async fn test_resolve_socket_addrs() {
         let deadline = Instant::now() + Duration::from_secs(5);
 
         // IPv4 アドレス
-        let addrs = resolve_socket_addrs("127.0.0.1", 8080, deadline).unwrap();
+        let addrs = resolve_socket_addrs("127.0.0.1", 8080, deadline)
+            .await
+            .unwrap();
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0], "127.0.0.1:8080".parse().unwrap());
 
         // IPv6 アドレス (ブラケット付き)
-        let addrs = resolve_socket_addrs("[::1]", 8080, deadline).unwrap();
+        let addrs = resolve_socket_addrs("[::1]", 8080, deadline).await.unwrap();
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0], "[::1]:8080".parse().unwrap());
 
         // 期限切れ
         let expired_deadline = Instant::now() - Duration::from_millis(10);
-        let err = resolve_socket_addrs("localhost", 8080, expired_deadline);
+        let err = resolve_socket_addrs("localhost", 8080, expired_deadline).await;
         assert!(err.is_err());
     }
 }

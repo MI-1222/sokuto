@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             run_export_openapi(output)?;
         }
         Commands::Healthcheck(args) => {
-            run_healthcheck(args)?;
+            run_healthcheck(args).await?;
         }
         Commands::Serve(args) => {
             run_serve(args).await?;

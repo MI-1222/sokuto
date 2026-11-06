@@ -16,17 +16,26 @@ use sokuto_runtime::tokenizer::JevTokenizer;
 use crate::commands::serve::validate_model_dir;
 
 /// 量子化実行オプション構造体。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, clap::Args, PartialEq, Eq)]
 pub struct QuantizeArgs {
     /// 元モデルファイル群が存在するディレクトリパス。
+    #[arg(short, long, default_value = "models/default")]
     pub model_dir: PathBuf,
+
     /// 量子化後成果物バンドルの出力先ディレクトリパス。
+    #[arg(short, long, default_value = "models/quantized")]
     pub output_dir: PathBuf,
-    /// チャンネル単位での重み量子化フラグ。
+
+    /// チャンネル単位で重みを量子化する (デフォルト: 有効)。
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub per_channel: bool,
-    /// FP32 モデルとのパリティ検証を実行するフラグ。
+
+    /// FP32 モデルとのパリティ検証を実行する (デフォルト: 有効)。
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub verify: bool,
-    /// Python 量子化スクリプトのパス (省略時はリポジトリルートから自動探索)。
+
+    /// Python 量子化スクリプトのパス (省略時はリポジトリルートを自動探索)。
+    #[arg(long, env = "SOKUTO_QUANTIZE_SCRIPT_PATH")]
     pub script_path: Option<PathBuf>,
 }
 

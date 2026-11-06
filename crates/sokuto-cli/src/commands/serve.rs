@@ -17,21 +17,39 @@ use sokuto_server::metrics::setup_metrics_recorder;
 use sokuto_server::state::AppState;
 
 /// サーバー起動オプション構造体。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, clap::Args, PartialEq, Eq)]
 pub struct ServeArgs {
     /// バインド先ホストアドレス。
+    #[arg(short = 'H', long, env = "SOKUTO_HOST", default_value = "0.0.0.0")]
     pub host: String,
+
     /// バインド先ポート番号。
+    #[arg(short, long, env = "SOKUTO_PORT", default_value_t = 3000)]
     pub port: u16,
+
     /// モデルファイル格納ディレクトリ。
+    #[arg(
+        short,
+        long,
+        env = "SOKUTO_MODEL_DIR",
+        default_value = "models/default"
+    )]
     pub model_dir: PathBuf,
+
     /// セッションプールサイズ。
+    #[arg(long, env = "SOKUTO_POOL_SIZE", default_value_t = 2)]
     pub pool_size: usize,
+
     /// 優先 Execution Provider (auto, coreml, cuda, tensorrt, cpu)。
+    #[arg(long, env = "SOKUTO_PROVIDER")]
     pub provider: Option<String>,
+
     /// 単一オペレータ内の並列スレッド数 (intra-op)。
+    #[arg(long, env = "SOKUTO_INTRA_THREADS")]
     pub intra_threads: Option<usize>,
+
     /// 複数オペレータ間の並列スレッド数 (inter-op)。
+    #[arg(long, env = "SOKUTO_INTER_THREADS")]
     pub inter_threads: Option<usize>,
 }
 

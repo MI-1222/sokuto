@@ -18,9 +18,9 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-/// 数値・通貨・パーセント抽出用正規表現 (全角数字・ピリオド・カンマ対応)。
+/// 数値・通貨・パーセント抽出用正規表現 (全角数字・ピリオド・カンマ・位取り・単位対応)。
 static NUMERIC_ENTITY_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?P<val>[0-9０-９]+(?:[,\.，．][0-9０-９]+)*)\s*(?P<unit>万|億|兆|円|ドル|%|％|個|本|件|人|倍)?")
+    Regex::new(r"(?P<val>[0-9０-９]+(?:[,\.，．][0-9０-９]+)*)\s*(?P<scale>万|億|兆)?\s*(?P<unit>円|ドル|%|％|個|本|件|人|名|倍)?")
         .expect("数値エンティティ抽出正規表現のコンパイルに成功すること。")
 });
 
@@ -31,24 +31,22 @@ static DATE_ENTITY_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// 代表的な日本語同義語・言い換えペアリスト。
-static SYNONYM_PAIRS: LazyLock<Vec<(&'static str, &'static str)>> = LazyLock::new(|| {
-    vec![
-        ("倍増", "100%増"),
-        ("倍増", "2倍"),
-        ("二倍", "2倍"),
-        ("減少", "低下"),
-        ("増加", "上昇"),
-        ("完了", "終了"),
-        ("完了", "済"),
-        ("開始", "スタート"),
-        ("売上", "売上高"),
-        ("利益", "純利益"),
-        ("不具合", "バグ"),
-        ("欠陥", "不良"),
-        ("承認", "許可"),
-        ("拒否", "却下"),
-    ]
-});
+static SYNONYM_PAIRS: &[(&str, &str)] = &[
+    ("倍増", "100%増"),
+    ("倍増", "2倍"),
+    ("二倍", "2倍"),
+    ("減少", "低下"),
+    ("増加", "上昇"),
+    ("完了", "終了"),
+    ("完了", "済"),
+    ("開始", "スタート"),
+    ("売上", "売上高"),
+    ("利益", "純利益"),
+    ("不具合", "バグ"),
+    ("欠陥", "不良"),
+    ("承認", "許可"),
+    ("拒否", "却下"),
+];
 
 /// ハルシネーション検証設定構造体。
 #[derive(Debug, Clone, PartialEq)]
@@ -112,6 +110,7 @@ pub struct HallucinationVerificationResult {
 /// テキストから数値および日付エンティティを正規化抽出する。
 pub fn extract_normalized_entities(text: &str) -> Vec<NormalizedEntity> {
     let mut entities = Vec::new();
+    let mut date_ranges = Vec::new();
 
     // 1. 年月日日付エンティティの抽出 (YYYYMMDD 整数値として正規化)
     for caps in DATE_ENTITY_REGEX.captures_iter(text) {
@@ -138,14 +137,14 @@ pub fn extract_normalized_entities(text: &str) -> Vec<NormalizedEntity> {
             parse_digits(d_m.as_str()),
         ) {
             let date_val = (y * 10_000 + m * 100 + d) as f64;
-            entities.push(NormalizedEntity {
-                raw: caps
-                    .get(0)
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_default(),
-                normalized_value: date_val,
-                unit: Some("date".to_string()),
-            });
+            if let Some(whole_match) = caps.get(0) {
+                date_ranges.push(whole_match.range());
+                entities.push(NormalizedEntity {
+                    raw: whole_match.as_str().to_string(),
+                    normalized_value: date_val,
+                    unit: Some("date".to_string()),
+                });
+            }
         }
     }
 
@@ -154,6 +153,17 @@ pub fn extract_normalized_entities(text: &str) -> Vec<NormalizedEntity> {
         let Some(val_match) = caps.name("val") else {
             continue;
         };
+
+        let whole_match = caps.get(0).unwrap_or(val_match);
+        let whole_range = whole_match.range();
+
+        // 日付エンティティとして抽出済みの範囲と重なる場合は除外
+        let overlaps_date = date_ranges
+            .iter()
+            .any(|dr| !(whole_range.end <= dr.start || whole_range.start >= dr.end));
+        if overlaps_date {
+            continue;
+        }
 
         // 全角数字、全角カンマ、全角ピリオドを半角へ正規化
         let clean_val_str = val_match
@@ -171,11 +181,9 @@ pub fn extract_normalized_entities(text: &str) -> Vec<NormalizedEntity> {
             continue;
         };
 
-        let unit = caps.name("unit").map(|m| m.as_str().to_string());
-
-        // 単位に応じた桁数正規化 (万 -> 1e4, 億 -> 1e8, 兆 -> 1e12)
-        if let Some(ref u) = unit {
-            match u.as_str() {
+        // 位取り (万 -> 1e4, 億 -> 1e8, 兆 -> 1e12) に応じた桁数正規化
+        if let Some(scale_match) = caps.name("scale") {
+            match scale_match.as_str() {
                 "万" => val *= 10_000.0,
                 "億" => val *= 100_000_000.0,
                 "兆" => val *= 1_000_000_000_000.0,
@@ -183,11 +191,15 @@ pub fn extract_normalized_entities(text: &str) -> Vec<NormalizedEntity> {
             }
         }
 
+        // 単位の正規化 (全角% -> %, 名 -> 人)
+        let unit = caps.name("unit").map(|m| match m.as_str() {
+            "％" => "%".to_string(),
+            "名" => "人".to_string(),
+            other => other.to_string(),
+        });
+
         entities.push(NormalizedEntity {
-            raw: caps
-                .get(0)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default(),
+            raw: whole_match.as_str().to_string(),
             normalized_value: val,
             unit,
         });
@@ -196,9 +208,9 @@ pub fn extract_normalized_entities(text: &str) -> Vec<NormalizedEntity> {
     entities
 }
 
-/// State と Claim の数値エンティティを照合し、不整合 (未記載の数値や食い違い) があるか判定する。
+/// State と Claim の数値・日付エンティティを照合し、不整合 (未記載の数値や単位の食い違い) があるか判定する。
 ///
-/// Claim 側に現れる数値が State 側に存在しない場合、または値が異なる場合に不整合と判定する。
+/// Claim 側に現れるエンティティが State 側に存在しない場合、または数値や単位が異なる場合に不整合と判定する。
 pub fn check_entity_mismatch(state: &str, claim: &str) -> bool {
     let state_entities = extract_normalized_entities(state);
     let claim_entities = extract_normalized_entities(claim);
@@ -207,14 +219,21 @@ pub fn check_entity_mismatch(state: &str, claim: &str) -> bool {
         return false;
     }
 
-    // State 側に存在する正規化値の集合
-    let state_values: Vec<f64> = state_entities.iter().map(|e| e.normalized_value).collect();
-
     for claim_ent in &claim_entities {
-        // 浮動小数点誤差を許容 (相対誤差 1e-4 以内)
-        let found = state_values
-            .iter()
-            .any(|&sv| (sv - claim_ent.normalized_value).abs() / (sv.abs().max(1.0)) < 1e-4);
+        // 単位の一致および数値/日付の許容誤差照合
+        let found = state_entities.iter().any(|se| {
+            let unit_matched = se.unit == claim_ent.unit;
+            let val_matched = if se.unit.as_deref() == Some("date") {
+                // 日付 (YYYYMMDD) は整数値のため完全一致 (誤差 0.5 未満)
+                (se.normalized_value - claim_ent.normalized_value).abs() < 0.5
+            } else {
+                // 一般数値は浮動小数点誤差を許容 (相対誤差 1e-4 以内)
+                (se.normalized_value - claim_ent.normalized_value).abs()
+                    / (se.normalized_value.abs().max(1.0))
+                    < 1e-4
+            };
+            val_matched && unit_matched
+        });
 
         if !found {
             // 同義語表現 (例: state に「倍増」があり、claim_ent が「2倍」「100%増」の場合) を救済
@@ -228,7 +247,7 @@ pub fn check_entity_mismatch(state: &str, claim: &str) -> bool {
             });
 
             if !is_covered_by_synonym {
-                // Claim に State にない数値が含まれている
+                // Claim に State にない数値または単位不整合が含まれている
                 return true;
             }
         }
@@ -364,6 +383,17 @@ mod tests {
 
         let claim_bad = "契約金は 1,000億円です。";
         assert!(check_entity_mismatch(state, claim_bad));
+
+        // 単位不一致の検知 (人 vs 円, 人 vs %)
+        let state_person = "参加者は 100人です。";
+        let claim_yen = "参加費は 100円です。";
+        let claim_pct = "達成率は 100% です。";
+        assert!(check_entity_mismatch(state_person, claim_yen));
+        assert!(check_entity_mismatch(state_person, claim_pct));
+
+        // 単位の正規化互換 (名 -> 人)
+        let claim_person_alias = "参加者は 100名です。";
+        assert!(!check_entity_mismatch(state_person, claim_person_alias));
     }
 
     #[test]
@@ -385,7 +415,8 @@ mod tests {
         let text = "締結日は 2026年10月4日、投資額は 1.5億円 (全角: １．５億円) です。";
         let entities = extract_normalized_entities(text);
 
-        // 日付 1 件 + 数値 2 件 = 3 件
+        // 日付 1 件 + 数値 2 件 = 3 件 (日付内の 2026, 10, 4 は重複抽出されない)
+        assert_eq!(entities.len(), 3);
         assert!(
             entities
                 .iter()
@@ -404,5 +435,9 @@ mod tests {
 
         let claim_good_date = "締結日は 2026-10-04 です。";
         assert!(!check_entity_mismatch(state, claim_good_date));
+
+        // 日付重複除外により Claim 側の別小数字 (1件) が正しく不整合判定されること
+        let claim_with_count = "締結日は 2026年10月4日で、完了は 1件です。";
+        assert!(check_entity_mismatch(state, claim_with_count));
     }
 }

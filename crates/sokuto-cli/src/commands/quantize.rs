@@ -151,8 +151,8 @@ pub fn run_quantize(args: QuantizeArgs) -> Result<(), CliError> {
     }
 
     // 4. 出力先成果物バンドルの完全性検証
-    let quantized_onnx = args.output_dir.join("model.onnx");
-    let quantized_tok = args.output_dir.join("tokenizer.json");
+    let quantized_onnx = output_dir_abs.join("model.onnx");
+    let quantized_tok = output_dir_abs.join("tokenizer.json");
 
     if !quantized_onnx.exists() || !quantized_tok.exists() {
         return Err(CliError::Quantize(format!(
@@ -169,7 +169,7 @@ pub fn run_quantize(args: QuantizeArgs) -> Result<(), CliError> {
     drop(test_engine);
 
     // 6. メタデータの読み込みとサマリー表示
-    let meta_file = args.output_dir.join("quantize_metadata.json");
+    let meta_file = output_dir_abs.join("quantize_metadata.json");
     if meta_file.exists() {
         let meta_str = fs::read_to_string(&meta_file)?;
         if let Ok(meta) = serde_json::from_str::<QuantizeMetadata>(&meta_str) {

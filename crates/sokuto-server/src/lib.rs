@@ -28,12 +28,14 @@ pub mod handlers;
 pub mod metrics;
 pub mod openapi;
 pub mod schema;
+pub mod service;
 pub mod state;
 
 pub use error::{ErrorResponse, ServerError};
 pub use guardrails::{GuardrailConfig, GuardrailPipeline};
 pub use openapi::{export_openapi_json, generate_openapi_spec};
 pub use schema::dag::{DagRequest, DagResponse};
+pub use service::{InferenceOutput, InferenceService};
 pub use state::AppState;
 
 /// サーバーのバージョン情報を取得する。

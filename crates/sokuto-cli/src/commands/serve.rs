@@ -83,12 +83,12 @@ pub fn validate_model_dir(dir: &Path) -> Result<(), String> {
 /// # 引数
 /// - `args`: サーバー起動構成パラメータ。
 pub async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tracing_subscriber::fmt()
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "sokuto_server=info,tower_http=info".into()),
         )
-        .init();
+        .try_init();
 
     // 1. モデルディレクトリの検証 (Fast-Fail)
     if let Err(err) = validate_model_dir(&args.model_dir) {

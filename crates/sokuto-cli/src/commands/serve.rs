@@ -6,11 +6,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub use crate::commands::model_dir::{
-    ModelArtifactPaths, ModelDirError, load_calibration_config, validate_model_dir,
-};
+use crate::commands::model_dir::{ModelArtifactPaths, load_calibration_config, validate_model_dir};
 use crate::commands::net::resolve_single_socket_addr;
-pub use crate::commands::session_config::{ExecutionProviderArg, SessionArgs, SessionConfigArgs};
+use crate::commands::session_config::SessionArgs;
 use crate::error::CliError;
 use sokuto_runtime::engine::InferenceEngine;
 use sokuto_runtime::tokenizer::JevTokenizer;

@@ -3,13 +3,13 @@
 //! TypeSafe AI Jev 互換 HTTP API サーバーを初期化し、
 //! 指定されたモデルと Execution Provider でエンドポイントを提供する。
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 pub use crate::commands::model_dir::{
     ModelArtifactPaths, ModelDirError, load_calibration_config, validate_model_dir,
 };
+use crate::commands::net::resolve_single_socket_addr;
 pub use crate::commands::session_config::{ExecutionProviderArg, SessionArgs, SessionConfigArgs};
 use crate::error::CliError;
 use sokuto_runtime::engine::InferenceEngine;
@@ -85,63 +85,13 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
         .init_dual_engine_from_dir(&args.model_dir, session_config);
 
     let state = Arc::new(state);
-    let addr = resolve_socket_addr(&args.host, args.port).await?;
+    let addr = resolve_single_socket_addr(&args.host, args.port)
+        .await
+        .map_err(|err| CliError::Config(err.to_string()))?;
 
     sokuto_server::run_server(addr, state, prometheus_handle)
         .await
         .map_err(|e| CliError::Server(e.to_string()))?;
 
     Ok(())
-}
-
-/// ホスト名または IP アドレスとポート番号からソケットアドレスを非同期解決する。
-///
-/// IPv6 アドレスが角括弧で囲まれている場合 (`[::1]`) も除去して正規化し、
-/// 非同期名前解決またはパースを実行する。
-///
-/// # 引数
-/// - `host`: ホスト名または IP アドレス (例: "127.0.0.1", "localhost", "::1", "[::1]")。
-/// - `port`: ポート番号。
-pub async fn resolve_socket_addr(host: &str, port: u16) -> Result<SocketAddr, CliError> {
-    crate::commands::net::resolve_single_socket_addr(host, port)
-        .await
-        .map_err(|err| CliError::Config(err.to_string()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_resolve_socket_addr_ipv4() {
-        let addr = resolve_socket_addr("127.0.0.1", 8080)
-            .await
-            .expect("IPv4 アドレスの解決に失敗。");
-        assert_eq!(addr, "127.0.0.1:8080".parse::<SocketAddr>().unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_resolve_socket_addr_localhost() {
-        let addr = resolve_socket_addr("localhost", 8080)
-            .await
-            .expect("localhost の解決に失敗。");
-        assert_eq!(addr.port(), 8080);
-        assert!(addr.ip().is_loopback());
-    }
-
-    #[tokio::test]
-    async fn test_resolve_socket_addr_ipv6() {
-        let addr = resolve_socket_addr("::1", 8080)
-            .await
-            .expect("IPv6 アドレス (角括弧なし) の解決に失敗。");
-        assert_eq!(addr, "[::1]:8080".parse::<SocketAddr>().unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_resolve_socket_addr_ipv6_bracketed() {
-        let addr = resolve_socket_addr("[::1]", 8080)
-            .await
-            .expect("IPv6 アドレス (角括弧あり) の解決に失敗。");
-        assert_eq!(addr, "[::1]:8080".parse::<SocketAddr>().unwrap());
-    }
 }

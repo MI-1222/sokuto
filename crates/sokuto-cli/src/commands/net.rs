@@ -186,6 +186,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_resolve_host_port_ipv6() {
+        let addrs = resolve_host_port("::1", 8080)
+            .await
+            .expect("IPv6 アドレス (角括弧なし) の解決に失敗。");
+        assert_eq!(addrs, vec!["[::1]:8080".parse::<SocketAddr>().unwrap()]);
+    }
+
+    #[tokio::test]
     async fn test_resolve_host_port_ipv6_bracketed() {
         let addrs = resolve_host_port("[::1]", 8080)
             .await

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use crate::commands::net::resolve_host_port_with_deadline;
 use crate::error::CliError;
 
 /// ヘルスチェック実行引数構造体。
@@ -103,20 +104,6 @@ fn parse_http_url(url: &str) -> Result<(String, u16, String), CliError> {
     Ok((host, port, path))
 }
 
-/// ホスト名およびポート番号からソケットアドレスを解決する。
-///
-/// IP アドレス文字列（IPv4 または `[::1]` などの IPv6 リテラル）の場合は DNS 問い合わせを行わずに即座にパースし、
-/// ホスト名の場合は Tokio の非同期名前解決とタイムアウトを用いて指定期限 (`deadline`) 内での解決を保証する。
-async fn resolve_socket_addrs(
-    host: &str,
-    port: u16,
-    deadline: Instant,
-) -> Result<Vec<std::net::SocketAddr>, CliError> {
-    crate::commands::net::resolve_host_port_with_deadline(host, port, Some(deadline))
-        .await
-        .map_err(|err| CliError::HealthcheckFailed(err.to_string()))
-}
-
 /// HTTP GET リクエストを送信し、ステータスコード 200 OK であるかを判定する。
 ///
 /// # 引数
@@ -132,7 +119,9 @@ pub async fn run_healthcheck(args: HealthcheckArgs) -> Result<(), CliError> {
     let timeout = Duration::from_secs(args.timeout_secs);
     let deadline = Instant::now() + timeout;
 
-    let socket_addrs = resolve_socket_addrs(&host, port, deadline).await?;
+    let socket_addrs = resolve_host_port_with_deadline(&host, port, Some(deadline))
+        .await
+        .map_err(|err| CliError::HealthcheckFailed(err.to_string()))?;
     if socket_addrs.is_empty() {
         return Err(CliError::HealthcheckFailed(format!(
             "ホスト名のアドレス解決に失敗しました: {host}:{port}。"
@@ -501,28 +490,6 @@ mod tests {
         // 1 以上は正常にパースできる
         let parsed = TestCli::try_parse_from(["test", "--timeout-secs", "1"]).unwrap();
         assert_eq!(parsed.args.timeout_secs, 1);
-    }
-
-    #[tokio::test]
-    async fn test_resolve_socket_addrs() {
-        let deadline = Instant::now() + Duration::from_secs(5);
-
-        // IPv4 アドレス
-        let addrs = resolve_socket_addrs("127.0.0.1", 8080, deadline)
-            .await
-            .unwrap();
-        assert_eq!(addrs.len(), 1);
-        assert_eq!(addrs[0], "127.0.0.1:8080".parse().unwrap());
-
-        // IPv6 アドレス (ブラケット付き)
-        let addrs = resolve_socket_addrs("[::1]", 8080, deadline).await.unwrap();
-        assert_eq!(addrs.len(), 1);
-        assert_eq!(addrs[0], "[::1]:8080".parse().unwrap());
-
-        // 期限切れ
-        let expired_deadline = Instant::now() - Duration::from_millis(10);
-        let err = resolve_socket_addrs("localhost", 8080, expired_deadline).await;
-        assert!(err.is_err());
     }
 
     #[test]

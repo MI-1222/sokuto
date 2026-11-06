@@ -46,3 +46,18 @@ pub enum Commands {
     /// FP32 ONNX モデルに対して動的 INT8 PTQ 量子化を実行する。
     Quantize(QuantizeArgs),
 }
+
+/// 構造化ログトレーシング (`tracing_subscriber`) を初期化する。
+///
+/// 環境変数 `RUST_LOG` が設定されている場合はそのディレクティブを優先し、
+/// 未指定の場合は sokuto 関連クレートおよび HTTP サーバーの標準ログレベル (info) を適用する。
+/// すでにトレーサーが初期化されている場合は何もしない。
+pub fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "sokuto=info,sokuto_cli=info,sokuto_core=info,sokuto_runtime=info,sokuto_server=info,tower_http=info".into()
+            }),
+        )
+        .try_init();
+}

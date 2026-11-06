@@ -205,10 +205,10 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
         );
         criteria.insert("ignore".to_string(), "特に対処せず保留する".to_string());
         let question = Question::new_choice("適切な対応を選択してください。", criteria);
+        let tokenized = tokenizer.encode_question(state, &question)?;
 
         // ウォームアップ
         for _ in 0..args.warmup {
-            let tokenized = tokenizer.encode_question(state, &question)?;
             let _ = engine.forward_question(&tokenized)?;
         }
 
@@ -216,7 +216,6 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
         let mut durations = Vec::with_capacity(args.iterations);
         for _ in 0..args.iterations {
             let start = Instant::now();
-            let tokenized = tokenizer.encode_question(state, &question)?;
             let _ = engine.forward_question(&tokenized)?;
             durations.push(start.elapsed().as_secs_f64() * 1000.0);
         }
@@ -240,10 +239,10 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
         ];
         let question =
             Question::new_score("セキュリティ脅威の深刻度を段階評価してください。", criteria);
+        let tokenized = tokenizer.encode_question(state, &question)?;
 
         // ウォームアップ
         for _ in 0..args.warmup {
-            let tokenized = tokenizer.encode_question(state, &question)?;
             let _ = engine.forward_question(&tokenized)?;
         }
 
@@ -251,7 +250,6 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
         let mut durations = Vec::with_capacity(args.iterations);
         for _ in 0..args.iterations {
             let start = Instant::now();
-            let tokenized = tokenizer.encode_question(state, &question)?;
             let _ = engine.forward_question(&tokenized)?;
             durations.push(start.elapsed().as_secs_f64() * 1000.0);
         }
@@ -266,10 +264,10 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
         eprintln!("[3/6] Single Noul (真偽判定) を測定中...");
         let state = "サーバーの CPU 使用率が 98%、空きメモリが 50MB 未満です。";
         let question = Question::new_noul("直ちにアラートを発報すべき緊急事態ですか？");
+        let tokenized = tokenizer.encode_question(state, &question)?;
 
         // ウォームアップ
         for _ in 0..args.warmup {
-            let tokenized = tokenizer.encode_question(state, &question)?;
             let _ = engine.forward_question(&tokenized)?;
         }
 
@@ -277,7 +275,6 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
         let mut durations = Vec::with_capacity(args.iterations);
         for _ in 0..args.iterations {
             let start = Instant::now();
-            let tokenized = tokenizer.encode_question(state, &question)?;
             let _ = engine.forward_question(&tokenized)?;
             durations.push(start.elapsed().as_secs_f64() * 1000.0);
         }
@@ -304,10 +301,10 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
                     Question::new_choice(format!("質問項目 {i} の判定を行ってください。"), c),
                 );
             }
+            let batch = tokenizer.encode_batch_questions(state, &questions)?;
 
             // ウォームアップ
             for _ in 0..args.warmup {
-                let batch = tokenizer.encode_batch_questions(state, &questions)?;
                 let _ = engine.forward_batch_tokenized(&batch)?;
             }
 
@@ -315,7 +312,6 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
             let mut durations = Vec::with_capacity(args.iterations);
             for _ in 0..args.iterations {
                 let start = Instant::now();
-                let batch = tokenizer.encode_batch_questions(state, &questions)?;
                 let _ = engine.forward_batch_tokenized(&batch)?;
                 durations.push(start.elapsed().as_secs_f64() * 1000.0);
             }

@@ -18,7 +18,7 @@ pub fn run_export_openapi(
     let json_str = export_openapi_json();
 
     if let Some(path) = output {
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent)?;
         }
         fs::write(&path, &json_str)?;

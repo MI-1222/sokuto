@@ -154,7 +154,7 @@ pub struct BenchmarkSuiteResult {
 
 /// 時間測定値配列から統計量を算出する。
 fn compute_stats(name: &str, decisions_per_run: usize, durations_ms: &mut [f64]) -> ScenarioStats {
-    durations_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    durations_ms.sort_by(f64::total_cmp);
     let n = durations_ms.len();
 
     let min_ms = durations_ms.first().copied().unwrap_or(0.0);

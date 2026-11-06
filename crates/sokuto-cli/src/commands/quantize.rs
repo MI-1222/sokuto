@@ -14,6 +14,7 @@ use sokuto_runtime::engine::{InferenceEngine, SessionConfig};
 use sokuto_runtime::tokenizer::JevTokenizer;
 
 use crate::commands::model_dir::validate_model_dir;
+use crate::error::CliError;
 
 /// 量子化実行オプション構造体。
 #[derive(Debug, Clone, clap::Args, PartialEq, Eq)]
@@ -76,7 +77,7 @@ pub struct QuantizeResultDetails {
 }
 
 /// ONNX INT8 PTQ 量子化コマンドを実行する。
-pub fn run_quantize(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn run_quantize(args: QuantizeArgs) -> Result<(), CliError> {
     // 1. 入力モデルディレクトリの存在と必須ファイルチェック
     validate_model_dir(&args.model_dir)?;
 
@@ -129,12 +130,14 @@ pub fn run_quantize(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error 
     let output = match cmd.output() {
         Ok(out) => out,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(
-                "外部コマンド 'uv' の実行に失敗しました。uv がインストールされていないか、PATH に通っていません。Python 環境と uv を確認してください。".into()
-            );
+            return Err(CliError::Quantize(
+                "外部コマンド 'uv' の実行に失敗しました。uv がインストールされていないか、PATH に通っていません。Python 環境と uv を確認してください。".into(),
+            ));
         }
         Err(err) => {
-            return Err(format!("量子化サブプロセスの起動に失敗しました: {err}。").into());
+            return Err(CliError::Quantize(format!(
+                "量子化サブプロセスの起動に失敗しました: {err}。"
+            )));
         }
     };
 
@@ -142,7 +145,9 @@ pub fn run_quantize(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error 
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         eprintln!("量子化スクリプトの実行に失敗しました:\nSTDERR:\n{stderr}\nSTDOUT:\n{stdout}");
-        return Err("量子化サブプロセスの実行に失敗しました。".into());
+        return Err(CliError::Quantize(
+            "量子化サブプロセスの実行に失敗しました。".into(),
+        ));
     }
 
     // 4. 出力先成果物バンドルの完全性検証
@@ -150,12 +155,11 @@ pub fn run_quantize(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error 
     let quantized_tok = args.output_dir.join("tokenizer.json");
 
     if !quantized_onnx.exists() || !quantized_tok.exists() {
-        return Err(format!(
+        return Err(CliError::Quantize(format!(
             "量子化成果物ファイルが不足しています: {} または {}。",
             quantized_onnx.display(),
             quantized_tok.display()
-        )
-        .into());
+        )));
     }
 
     // 5. Rust ランタイムによるロード可能性の検証 (スモークテスト)
@@ -206,14 +210,13 @@ pub fn run_quantize(args: QuantizeArgs) -> Result<(), Box<dyn std::error::Error 
 pub fn resolve_quantize_script(
     script_path: Option<&Path>,
     model_dir: &Path,
-) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(PathBuf, PathBuf), CliError> {
     if let Some(custom_script) = script_path {
         if !custom_script.exists() {
-            return Err(format!(
+            return Err(CliError::Quantize(format!(
                 "指定された量子化スクリプトが見つかりません: {}。",
                 custom_script.display()
-            )
-            .into());
+            )));
         }
         let script_abs = fs::canonicalize(custom_script)?;
         let project_dir = find_pyproject_root(&script_abs)
@@ -224,20 +227,18 @@ pub fn resolve_quantize_script(
         let train_dir = project_root.join("train");
 
         if !train_dir.exists() {
-            return Err(format!(
+            return Err(CliError::Quantize(format!(
                 "開発用リポジトリ内の train ディレクトリが見つかりません: {}。リポジトリ外から実行する場合は --script-path オプションで量子化スクリプトのパスを明示的に指定してください。",
                 train_dir.display()
-            )
-            .into());
+            )));
         }
 
         let quantize_script = train_dir.join("export").join("quantize.py");
         if !quantize_script.exists() {
-            return Err(format!(
+            return Err(CliError::Quantize(format!(
                 "開発用リポジトリ内の量子化スクリプトが見つかりません: {}。--script-path オプションで量子化スクリプトのパスを明示的に指定してください。",
                 quantize_script.display()
-            )
-            .into());
+            )));
         }
 
         Ok((quantize_script, train_dir))
@@ -266,9 +267,7 @@ fn find_pyproject_root(start_path: &Path) -> Option<PathBuf> {
 }
 
 /// プロジェクトルートディレクトリを探索する。
-fn find_project_root(
-    start_dir: &Path,
-) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+fn find_project_root(start_dir: &Path) -> Result<PathBuf, CliError> {
     let find_root = |mut current: PathBuf| {
         loop {
             if current.join("Cargo.toml").exists() && current.join("crates").exists() {
@@ -295,12 +294,12 @@ fn find_project_root(
         }
     }
 
-    Err(
+    Err(CliError::Quantize(
         "開発用リポジトリルート (Cargo.toml, crates/, train/ が存在する場所) を特定できませんでした。\
         'sokuto quantize' は開発用リポジトリ内の Python パイプライン (train/export/quantize.py) を利用するコマンドです。\
         リポジトリ外から実行する場合は '--script-path <PATH>' オプションで量子化スクリプトのパスを明示的に指定してください。"
             .into(),
-    )
+    ))
 }
 
 #[cfg(test)]

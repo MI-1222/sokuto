@@ -7,6 +7,8 @@ use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
+use crate::error::CliError;
+
 /// ヘルスチェック実行引数構造体。
 #[derive(Debug, Clone, clap::Args, PartialEq, Eq)]
 pub struct HealthcheckArgs {
@@ -25,9 +27,11 @@ pub struct HealthcheckArgs {
 }
 
 /// URL をホスト、ポート、パスにパースする。
-fn parse_http_url(url: &str) -> Result<(String, u16, String), String> {
+fn parse_http_url(url: &str) -> Result<(String, u16, String), CliError> {
     let stripped = url.strip_prefix("http://").ok_or_else(|| {
-        format!("無効な URL スキームです。http:// で始まる必要があります: '{url}'。")
+        CliError::HealthcheckFailed(format!(
+            "無効な URL スキームです。http:// で始まる必要があります: '{url}'。"
+        ))
     })?;
 
     let (host_port, path) = match stripped.find('/') {
@@ -37,42 +41,54 @@ fn parse_http_url(url: &str) -> Result<(String, u16, String), String> {
 
     let (host, port) = if let Some(rest) = host_port.strip_prefix('[') {
         let close_idx = rest.find(']').ok_or_else(|| {
-            format!("無効な IPv6 アドレス表記です。']' がありません: '{host_port}'。")
+            CliError::HealthcheckFailed(format!(
+                "無効な IPv6 アドレス表記です。']' がありません: '{host_port}'。"
+            ))
         })?;
         let ip_str = &rest[..close_idx];
         if ip_str.is_empty() {
-            return Err(format!("IPv6 アドレスが空です: '{host_port}'。"));
+            return Err(CliError::HealthcheckFailed(format!(
+                "IPv6 アドレスが空です: '{host_port}'。"
+            )));
         }
-        ip_str
-            .parse::<std::net::Ipv6Addr>()
-            .map_err(|e| format!("無効な IPv6 アドレスです: '{ip_str}' ({e})。"))?;
+        ip_str.parse::<std::net::Ipv6Addr>().map_err(|e| {
+            CliError::HealthcheckFailed(format!("無効な IPv6 アドレスです: '{ip_str}' ({e})。"))
+        })?;
 
         let after = &rest[close_idx + 1..];
         let port = if after.is_empty() {
             80
         } else if let Some(port_str) = after.strip_prefix(':') {
-            port_str
-                .parse::<u16>()
-                .map_err(|e| format!("ポート番号のパースに失敗しました: '{port_str}' ({e})。"))?
+            port_str.parse::<u16>().map_err(|e| {
+                CliError::HealthcheckFailed(format!(
+                    "ポート番号のパースに失敗しました: '{port_str}' ({e})。"
+                ))
+            })?
         } else {
-            return Err(format!(
+            return Err(CliError::HealthcheckFailed(format!(
                 "無効な IPv6 ホスト・ポート形式です: '{host_port}'。"
-            ));
+            )));
         };
         (format!("[{ip_str}]"), port)
     } else if let Some(idx) = host_port.rfind(':') {
         let host = &host_port[..idx];
         if host.is_empty() {
-            return Err(format!("ホスト名が空です: '{host_port}'。"));
+            return Err(CliError::HealthcheckFailed(format!(
+                "ホスト名が空です: '{host_port}'。"
+            )));
         }
         let port_str = &host_port[idx + 1..];
-        let port = port_str
-            .parse::<u16>()
-            .map_err(|e| format!("ポート番号のパースに失敗しました: '{port_str}' ({e})。"))?;
+        let port = port_str.parse::<u16>().map_err(|e| {
+            CliError::HealthcheckFailed(format!(
+                "ポート番号のパースに失敗しました: '{port_str}' ({e})。"
+            ))
+        })?;
         (host.to_string(), port)
     } else {
         if host_port.is_empty() {
-            return Err(format!("ホスト名が空です: '{url}'。"));
+            return Err(CliError::HealthcheckFailed(format!(
+                "ホスト名が空です: '{url}'。"
+            )));
         }
         (host_port.to_string(), 80)
     };
@@ -94,7 +110,7 @@ async fn resolve_socket_addrs(
     host: &str,
     port: u16,
     deadline: Instant,
-) -> Result<Vec<std::net::SocketAddr>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<std::net::SocketAddr>, CliError> {
     let ip_str = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
@@ -107,16 +123,22 @@ async fn resolve_socket_addrs(
     let now = Instant::now();
     let remaining = deadline
         .checked_duration_since(now)
-        .ok_or("名前解決がタイムアウトしました。")?;
+        .ok_or_else(|| CliError::HealthcheckFailed("名前解決がタイムアウトしました。".into()))?;
     if remaining.is_zero() {
-        return Err("名前解決がタイムアウトしました。".into());
+        return Err(CliError::HealthcheckFailed(
+            "名前解決がタイムアウトしました。".into(),
+        ));
     }
 
     let host_port = format!("{host}:{port}");
     match tokio::time::timeout(remaining, tokio::net::lookup_host(&host_port)).await {
         Ok(Ok(iter)) => Ok(iter.collect()),
-        Ok(Err(e)) => Err(format!("ホスト名 '{host}' の名前解決に失敗しました: {e}。").into()),
-        Err(_) => Err(format!("ホスト名 '{host}' の名前解決がタイムアウトしました。").into()),
+        Ok(Err(e)) => Err(CliError::HealthcheckFailed(format!(
+            "ホスト名 '{host}' の名前解決に失敗しました: {e}。"
+        ))),
+        Err(_) => Err(CliError::HealthcheckFailed(format!(
+            "ホスト名 '{host}' の名前解決がタイムアウトしました。"
+        ))),
     }
 }
 
@@ -124,11 +146,11 @@ async fn resolve_socket_addrs(
 ///
 /// # 引数
 /// - `args`: ヘルスチェック対象 URL およびタイムアウト設定。
-pub async fn run_healthcheck(
-    args: HealthcheckArgs,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn run_healthcheck(args: HealthcheckArgs) -> Result<(), CliError> {
     if args.timeout_secs == 0 {
-        return Err("タイムアウト秒数には 1 以上の値を指定してください。".into());
+        return Err(CliError::HealthcheckFailed(
+            "タイムアウト秒数には 1 以上の値を指定してください。".into(),
+        ));
     }
 
     let (host, port, path) = parse_http_url(&args.url)?;
@@ -137,7 +159,9 @@ pub async fn run_healthcheck(
 
     let socket_addrs = resolve_socket_addrs(&host, port, deadline).await?;
     if socket_addrs.is_empty() {
-        return Err(format!("ホスト名のアドレス解決に失敗しました: {host}:{port}。").into());
+        return Err(CliError::HealthcheckFailed(format!(
+            "ホスト名のアドレス解決に失敗しました: {host}:{port}。"
+        )));
     }
 
     let mut last_err = None;
@@ -146,10 +170,14 @@ pub async fn run_healthcheck(
     for addr in socket_addrs {
         let now = Instant::now();
         let Some(remaining) = deadline.checked_duration_since(now) else {
-            return Err("接続試行がタイムアウトしました。".into());
+            return Err(CliError::HealthcheckFailed(
+                "接続試行がタイムアウトしました。".into(),
+            ));
         };
         if remaining.is_zero() {
-            return Err("接続試行がタイムアウトしました。".into());
+            return Err(CliError::HealthcheckFailed(
+                "接続試行がタイムアウトしました。".into(),
+            ));
         }
 
         match TcpStream::connect_timeout(&addr, remaining) {
@@ -169,7 +197,9 @@ pub async fn run_healthcheck(
             let err_msg = last_err
                 .map(|e| e.to_string())
                 .unwrap_or_else(|| "接続先アドレスがありません。".to_string());
-            return Err(format!("{host}:{port} への接続に失敗しました: {err_msg}。").into());
+            return Err(CliError::HealthcheckFailed(format!(
+                "{host}:{port} への接続に失敗しました: {err_msg}。"
+            )));
         }
     };
 
@@ -202,14 +232,15 @@ pub async fn run_healthcheck(
         let mut handle = (&mut reader).take(MAX_STATUS_LINE_LEN as u64);
         match handle.read_line(&mut status_line) {
             Ok(0) => {
-                return Err("空の HTTP レスポンスを受信しました。".into());
+                return Err(CliError::HealthcheckFailed(
+                    "空の HTTP レスポンスを受信しました。".into(),
+                ));
             }
             Ok(_) => {
                 if !status_line.ends_with('\n') {
-                    return Err(format!(
+                    return Err(CliError::HealthcheckFailed(format!(
                         "HTTP ステータス行が長すぎるか、不完全です (上限 {MAX_STATUS_LINE_LEN} バイト)。"
-                    )
-                    .into());
+                    )));
                 }
                 let trimmed = status_line.trim_matches(|c| c == '\r' || c == '\n');
                 if trimmed.is_empty() {
@@ -222,9 +253,11 @@ pub async fn run_healthcheck(
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                return Err("応答読み取りがタイムアウトしました。".into());
+                return Err(CliError::HealthcheckFailed(
+                    "応答読み取りがタイムアウトしました。".into(),
+                ));
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(CliError::Io(e)),
         }
     }
 
@@ -235,25 +268,27 @@ pub async fn run_healthcheck(
         tracing::debug!("ヘルスチェック成功: {trimmed}。");
         Ok(())
     } else {
-        Err(format!("ヘルスチェック失敗 (ステータスコード {status_code}): '{trimmed}'。").into())
+        Err(CliError::HealthcheckFailed(format!(
+            "ヘルスチェック失敗 (ステータスコード {status_code}): '{trimmed}'。"
+        )))
     }
 }
 
 /// HTTP ステータス行を検証し、ステータスコードを抽出する。
-fn parse_http_status_line(
-    status_line: &str,
-) -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
+fn parse_http_status_line(status_line: &str) -> Result<u16, CliError> {
     let trimmed = status_line.trim_matches(|c| c == '\r' || c == '\n');
     let parts: Vec<&str> = trimmed.split_whitespace().collect();
     if parts.len() < 2 || !parts[0].starts_with("HTTP/") {
-        return Err(format!("不正な HTTP ステータス行です: '{trimmed}'。").into());
+        return Err(CliError::HealthcheckFailed(format!(
+            "不正な HTTP ステータス行です: '{trimmed}'。"
+        )));
     }
 
     let status_code = parts[1].parse::<u16>().map_err(|e| {
-        format!(
+        CliError::HealthcheckFailed(format!(
             "ステータスコードのパースに失敗しました: '{}' ({e})。",
             parts[1]
-        )
+        ))
     })?;
 
     Ok(status_code)
@@ -449,7 +484,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
-            "タイムアウト秒数には 1 以上の値を指定してください。"
+            "ヘルスチェック失敗: タイムアウト秒数には 1 以上の値を指定してください。"
         );
     }
 

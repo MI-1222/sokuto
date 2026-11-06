@@ -165,12 +165,13 @@ impl SessionConfigBuilder {
         self
     }
 
-    /// 設定内容を検証し、[`SessionConfig`] を構築する。
+    /// 設定内容から [`SessionConfig`] を構築する。
     ///
     /// `Auto` の場合はデフォルトの優先リストを、特定プロバイダの場合は
     /// `[指定プロバイダ, CPU]` というフォールバック順序を設定する。
     /// なお、指定プロバイダが `CPU` の場合は重複登録を防ぐため `[CPU]` のみを設定する。
-    pub fn build(self) -> Result<SessionConfig, CliError> {
+    #[must_use]
+    pub fn build(self) -> SessionConfig {
         let mut session_config = SessionConfig {
             pool_size: self.pool_size.max(1),
             intra_threads: self.intra_threads,
@@ -190,17 +191,18 @@ impl SessionConfigBuilder {
             };
         }
 
-        Ok(session_config)
+        session_config
     }
 }
 
 /// CLI 引数から [`SessionConfig`] を直接構築するヘルパー関数。
+#[must_use]
 pub fn build_session_config(
     pool_size: usize,
     intra_threads: Option<usize>,
     inter_threads: Option<usize>,
     provider: Option<impl Into<ExecutionProvider>>,
-) -> Result<SessionConfig, CliError> {
+) -> SessionConfig {
     SessionConfigBuilder::new()
         .pool_size(pool_size)
         .intra_threads(intra_threads)
@@ -286,7 +288,7 @@ mod tests {
 
     #[test]
     fn test_builder_defaults() {
-        let config = SessionConfigBuilder::new().build().unwrap();
+        let config = SessionConfigBuilder::new().build();
         assert_eq!(config.pool_size, 1);
         assert_eq!(config.intra_threads, None);
         assert_eq!(config.inter_threads, Some(1));
@@ -297,8 +299,7 @@ mod tests {
         let config = SessionConfigBuilder::new()
             .pool_size(4)
             .provider(ExecutionProviderArg::Auto)
-            .build()
-            .unwrap();
+            .build();
         assert_eq!(config.pool_size, 4);
         assert_eq!(
             config.preferred_providers,
@@ -314,8 +315,7 @@ mod tests {
             .inter_threads(Some(4))
             .provider(ExecutionProvider::CPU)
             .enable_mem_arena(false)
-            .build()
-            .unwrap();
+            .build();
         assert_eq!(config.pool_size, 1);
         assert_eq!(config.intra_threads, Some(2));
         assert_eq!(config.inter_threads, Some(4));
@@ -327,8 +327,7 @@ mod tests {
     fn test_builder_with_non_cpu_provider() {
         let config = SessionConfigBuilder::new()
             .provider(ExecutionProviderArg::Cuda)
-            .build()
-            .unwrap();
+            .build();
         assert_eq!(
             config.preferred_providers,
             vec![ExecutionProvider::CUDA, ExecutionProvider::CPU]
@@ -340,8 +339,7 @@ mod tests {
         let config = SessionConfigBuilder::new()
             .provider_str("coreml")
             .unwrap()
-            .build()
-            .unwrap();
+            .build();
         assert_eq!(
             config.preferred_providers,
             vec![ExecutionProvider::CoreML, ExecutionProvider::CPU]
@@ -350,7 +348,7 @@ mod tests {
 
     #[test]
     fn test_helper_build_session_config() {
-        let config = build_session_config(2, Some(4), None, Some(ExecutionProvider::CPU)).unwrap();
+        let config = build_session_config(2, Some(4), None, Some(ExecutionProvider::CPU));
         assert_eq!(config.pool_size, 2);
         assert_eq!(config.intra_threads, Some(4));
         assert_eq!(config.inter_threads, Some(1));

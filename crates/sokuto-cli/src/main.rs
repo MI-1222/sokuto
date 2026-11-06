@@ -83,12 +83,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             output_dir,
             per_channel,
             verify,
+            script_path,
         } => {
             let args = QuantizeArgs {
                 model_dir,
                 output_dir,
                 per_channel,
                 verify,
+                script_path,
             };
             tokio::task::spawn_blocking(move || run_quantize(args)).await??;
         }

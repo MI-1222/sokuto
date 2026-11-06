@@ -49,6 +49,7 @@ fn test_run_quantize_bundle_generation() {
         output_dir: temp_output_dir.clone(),
         per_channel: true,
         verify: true,
+        script_path: None,
     };
 
     let result = run_quantize(args);
@@ -75,4 +76,36 @@ fn test_run_quantize_bundle_generation() {
 
     // テスト後クリーンアップ (一時ディレクトリの削除)
     let _ = fs::remove_dir_all(&temp_output_dir);
+}
+
+#[test]
+fn test_run_quantize_with_invalid_custom_script_path() {
+    let temp_base = std::env::temp_dir().join("sokuto_test_invalid_script_env");
+    let dummy_model_dir = temp_base.join("dummy_model");
+    let temp_output_dir = temp_base.join("output");
+
+    let _ = fs::create_dir_all(&dummy_model_dir);
+    let _ = fs::write(dummy_model_dir.join("model.onnx"), b"dummy_onnx");
+    let _ = fs::write(dummy_model_dir.join("tokenizer.json"), b"dummy_tok");
+
+    let args = QuantizeArgs {
+        model_dir: dummy_model_dir,
+        output_dir: temp_output_dir,
+        per_channel: true,
+        verify: true,
+        script_path: Some(PathBuf::from("invalid/path/to/quantize.py")),
+    };
+
+    let result = run_quantize(args);
+    let _ = fs::remove_dir_all(&temp_base);
+
+    assert!(
+        result.is_err(),
+        "存在しないスクリプトパスを指定した場合はエラーとなること。"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("指定された量子化スクリプトが見つかりません"),
+        "適切なエラーメッセージが返されること。"
+    );
 }

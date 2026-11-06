@@ -3,6 +3,7 @@
 //! 最小コンテナ環境など curl が存在しない環境において、
 //! 外部依存なしで HTTP エンドポイントの死活監視・準備状態確認 (Liveness / Readiness) を行う。
 
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
@@ -10,6 +11,9 @@ use tokio::net::TcpStream;
 
 use crate::commands::net::resolve_host_port_with_deadline;
 use crate::error::CliError;
+
+/// 複数アドレスへの接続試行におけるフォールバック開始遅延時間 (RFC 8305 Happy Eyeballs 準拠)。
+const CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
 /// ヘルスチェック実行引数構造体。
 #[derive(Debug, Clone, clap::Args, PartialEq, Eq)]
@@ -130,40 +134,7 @@ pub async fn run_healthcheck(args: HealthcheckArgs) -> Result<(), CliError> {
         )));
     }
 
-    let mut last_err = None;
-    let mut stream = None;
-
-    for addr in socket_addrs {
-        let remaining = check_remaining(deadline, "接続試行がタイムアウトしました。")?;
-
-        match tokio::time::timeout(remaining, TcpStream::connect(&addr)).await {
-            Ok(Ok(s)) => {
-                stream = Some(s);
-                break;
-            }
-            Ok(Err(e)) => {
-                last_err = Some(e);
-            }
-            Err(_) => {
-                last_err = Some(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "接続試行がタイムアウトしました。",
-                ));
-            }
-        }
-    }
-
-    let mut stream = match stream {
-        Some(s) => s,
-        None => {
-            let err_msg = last_err
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "接続先アドレスがありません。".to_string());
-            return Err(CliError::HealthcheckFailed(format!(
-                "{host}:{port} への接続に失敗しました: {err_msg}。"
-            )));
-        }
-    };
+    let mut stream = connect_to_any(&socket_addrs, deadline, &host, port).await?;
 
     let remaining = check_remaining(deadline, "リクエスト送信がタイムアウトしました。")?;
 
@@ -242,6 +213,113 @@ fn check_remaining(deadline: Instant, timeout_msg: &'static str) -> Result<Durat
         Err(CliError::HealthcheckFailed(timeout_msg.into()))
     } else {
         Ok(remaining)
+    }
+}
+
+/// 解決されたソケットアドレス一覧へ接続を試行し、最初に確立された TCP ストリームを返す。
+///
+/// 複数アドレスが存在する場合、RFC 8305 (Happy Eyeballs v2) に基づき、
+/// 先頭アドレスへの接続が一定時間内に完了しない場合に後続アドレスへの並行接続を開始する。
+/// これにより、IPv6 がルーティング不能な環境等において、タイムアウトまで待機することなく
+/// 正常なアドレス (IPv4 等) への迅速なフォールバックを実現する。
+async fn connect_to_any(
+    socket_addrs: &[SocketAddr],
+    deadline: Instant,
+    host: &str,
+    port: u16,
+) -> Result<TcpStream, CliError> {
+    if socket_addrs.is_empty() {
+        return Err(CliError::HealthcheckFailed(format!(
+            "{host}:{port} への接続に失敗しました: 接続先アドレスがありません。"
+        )));
+    }
+
+    // 単一アドレスの場合はフォールバック不要のため直接接続する。
+    if socket_addrs.len() == 1 {
+        let addr = socket_addrs[0];
+        let remaining = check_remaining(deadline, "接続試行がタイムアウトしました。")?;
+        return match tokio::time::timeout(remaining, TcpStream::connect(&addr)).await {
+            Ok(Ok(stream)) => Ok(stream),
+            Ok(Err(err)) => Err(CliError::HealthcheckFailed(format!(
+                "{host}:{port} への接続に失敗しました: {err}。"
+            ))),
+            Err(_) => Err(CliError::HealthcheckFailed(
+                "接続試行がタイムアウトしました。".into(),
+            )),
+        };
+    }
+
+    // 複数アドレスに対する Happy Eyeballs 接続制御。
+    let mut addrs = socket_addrs.iter().copied().peekable();
+    let mut join_set = tokio::task::JoinSet::new();
+    let mut last_err = None;
+
+    let first_addr = addrs.next().unwrap();
+    join_set.spawn(async move { (first_addr, TcpStream::connect(first_addr).await) });
+
+    let sleep = tokio::time::sleep(CONNECTION_ATTEMPT_DELAY);
+    tokio::pin!(sleep);
+
+    let deadline_sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+    tokio::pin!(deadline_sleep);
+
+    let mut has_more = addrs.peek().is_some();
+
+    loop {
+        tokio::select! {
+            _ = &mut deadline_sleep => {
+                return Err(CliError::HealthcheckFailed(
+                    "接続試行がタイムアウトしました。".into(),
+                ));
+            }
+            () = &mut sleep, if has_more => {
+                if let Some(next_addr) = addrs.next() {
+                    join_set.spawn(async move {
+                        (next_addr, TcpStream::connect(next_addr).await)
+                    });
+                    has_more = addrs.peek().is_some();
+                    if has_more {
+                        sleep.as_mut().reset(tokio::time::Instant::now() + CONNECTION_ATTEMPT_DELAY);
+                    }
+                } else {
+                    has_more = false;
+                }
+            }
+            res = join_set.join_next(), if !join_set.is_empty() => {
+                match res {
+                    Some(Ok((_addr, Ok(stream)))) => {
+                        return Ok(stream);
+                    }
+                    Some(Ok((addr, Err(err)))) => {
+                        last_err = Some(format!("{addr}: {err}"));
+                        if has_more {
+                            if let Some(next_addr) = addrs.next() {
+                                join_set.spawn(async move {
+                                    (next_addr, TcpStream::connect(next_addr).await)
+                                });
+                                has_more = addrs.peek().is_some();
+                                if has_more {
+                                    sleep.as_mut().reset(tokio::time::Instant::now() + CONNECTION_ATTEMPT_DELAY);
+                                }
+                            } else {
+                                has_more = false;
+                            }
+                        }
+                    }
+                    Some(Err(join_err)) => {
+                        last_err = Some(join_err.to_string());
+                    }
+                    None => {}
+                }
+            }
+        }
+
+        if join_set.is_empty() && !has_more {
+            let err_msg = last_err.unwrap_or_else(|| "接続先アドレスがありません。".to_string());
+            return Err(CliError::HealthcheckFailed(format!(
+                "{host}:{port} への接続に失敗しました: {err_msg}。"
+            )));
+        }
     }
 }
 
@@ -572,5 +650,89 @@ mod tests {
         assert!(res.is_err());
         let err = res.unwrap_err();
         assert!(err.to_string().contains("タイムアウト。"));
+    }
+
+    #[tokio::test]
+    async fn test_connect_to_any_single_addr() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let res = connect_to_any(&[addr], deadline, "127.0.0.1", addr.port()).await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_connect_to_any_fallback_on_immediate_error() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ok_addr = listener.local_addr().unwrap();
+
+        // 接続不可なポートを取得 (バインド直後にクローズ)。
+        let unused_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_addr = unused_listener.local_addr().unwrap();
+        drop(unused_listener);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        // 先頭が接続不可アドレスで、2つ目が正常アドレスのケース。
+        let res = connect_to_any(
+            &[closed_addr, ok_addr],
+            deadline,
+            "127.0.0.1",
+            ok_addr.port(),
+        )
+        .await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_connect_to_any_all_failed() {
+        use std::net::TcpListener;
+
+        let l1 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr1 = l1.local_addr().unwrap();
+        drop(l1);
+
+        let l2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr2 = l2.local_addr().unwrap();
+        drop(l2);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let res = connect_to_any(&[addr1, addr2], deadline, "127.0.0.1", addr1.port()).await;
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err().to_string();
+        assert!(err_msg.contains("への接続に失敗しました:"));
+    }
+
+    #[tokio::test]
+    async fn test_connect_to_any_past_deadline() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let past_deadline = Instant::now() - Duration::from_millis(10);
+        let res = connect_to_any(&[addr], past_deadline, "127.0.0.1", addr.port()).await;
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("接続試行がタイムアウトしました。")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connect_to_any_empty_addrs() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let res = connect_to_any(&[], deadline, "localhost", 80).await;
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("接続先アドレスがありません。")
+        );
     }
 }

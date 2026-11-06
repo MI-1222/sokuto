@@ -241,7 +241,7 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), CliError> {
         .inter_threads(args.inter_threads)
         .provider_opt(args.provider)
         .enable_mem_arena(args.enable_mem_arena())
-        .build()?;
+        .build();
 
     let onnx_path = args.model_dir.join("model.onnx");
     let tok_path = args.model_dir.join("tokenizer.json");

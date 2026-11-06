@@ -68,7 +68,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), CliError> {
         .intra_threads(args.intra_threads)
         .inter_threads(args.inter_threads)
         .provider_opt(args.provider)
-        .build()?;
+        .build();
 
     let onnx_path = args.model_dir.join("model.onnx");
     let tok_path = args.model_dir.join("tokenizer.json");

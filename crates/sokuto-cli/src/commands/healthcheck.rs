@@ -132,17 +132,7 @@ pub async fn run_healthcheck(args: HealthcheckArgs) -> Result<(), CliError> {
     let mut stream = None;
 
     for addr in socket_addrs {
-        let now = Instant::now();
-        let Some(remaining) = deadline.checked_duration_since(now) else {
-            return Err(CliError::HealthcheckFailed(
-                "接続試行がタイムアウトしました。".into(),
-            ));
-        };
-        if remaining.is_zero() {
-            return Err(CliError::HealthcheckFailed(
-                "接続試行がタイムアウトしました。".into(),
-            ));
-        }
+        let remaining = check_remaining(deadline, "接続試行がタイムアウトしました。")?;
 
         match tokio::time::timeout(remaining, TcpStream::connect(&addr)).await {
             Ok(Ok(s)) => {
@@ -173,15 +163,7 @@ pub async fn run_healthcheck(args: HealthcheckArgs) -> Result<(), CliError> {
         }
     };
 
-    let now = Instant::now();
-    let remaining = deadline.checked_duration_since(now).ok_or_else(|| {
-        CliError::HealthcheckFailed("リクエスト送信がタイムアウトしました。".into())
-    })?;
-    if remaining.is_zero() {
-        return Err(CliError::HealthcheckFailed(
-            "リクエスト送信がタイムアウトしました。".into(),
-        ));
-    }
+    let remaining = check_remaining(deadline, "リクエスト送信がタイムアウトしました。")?;
 
     let user_agent = concat!("sokuto-healthcheck/", env!("CARGO_PKG_VERSION"));
     let request = format!(
@@ -204,17 +186,7 @@ pub async fn run_healthcheck(args: HealthcheckArgs) -> Result<(), CliError> {
 
     loop {
         status_line.clear();
-        let now = Instant::now();
-        let Some(remaining) = deadline.checked_duration_since(now) else {
-            return Err(CliError::HealthcheckFailed(
-                "応答読み取りがタイムアウトしました。".into(),
-            ));
-        };
-        if remaining.is_zero() {
-            return Err(CliError::HealthcheckFailed(
-                "応答読み取りがタイムアウトしました。".into(),
-            ));
-        }
+        let remaining = check_remaining(deadline, "応答読み取りがタイムアウトしました。")?;
 
         let mut handle = (&mut reader).take(MAX_STATUS_LINE_LEN as u64);
         let read_res = tokio::time::timeout(remaining, handle.read_line(&mut status_line)).await;
@@ -256,6 +228,18 @@ pub async fn run_healthcheck(args: HealthcheckArgs) -> Result<(), CliError> {
         Err(CliError::HealthcheckFailed(format!(
             "ヘルスチェック失敗 (ステータスコード {status_code}): '{trimmed}'。"
         )))
+    }
+}
+
+/// デッドラインまでの残余時間を算出し、期限切れの場合はエラーを返す。
+fn check_remaining(deadline: Instant, timeout_msg: &'static str) -> Result<Duration, CliError> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .unwrap_or_default();
+    if remaining.is_zero() {
+        Err(CliError::HealthcheckFailed(timeout_msg.into()))
+    } else {
+        Ok(remaining)
     }
 }
 
@@ -551,5 +535,19 @@ mod tests {
         assert!(result.is_ok());
 
         let _ = server_handle.join();
+    }
+
+    #[test]
+    fn test_check_remaining() {
+        let future = Instant::now() + Duration::from_secs(10);
+        let res = check_remaining(future, "タイムアウト。");
+        assert!(res.is_ok());
+        assert!(res.unwrap() > Duration::from_secs(8));
+
+        let past = Instant::now() - Duration::from_secs(1);
+        let res = check_remaining(past, "タイムアウト。");
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(err.to_string().contains("タイムアウト。"));
     }
 }

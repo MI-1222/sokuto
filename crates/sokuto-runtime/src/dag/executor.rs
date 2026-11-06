@@ -559,7 +559,17 @@ fn matches_condition(
     {
         match prop {
             "value" | "answer" => {
-                let target_str = cond.value.as_ref().and_then(|v| v.as_str()).unwrap_or("");
+                let num_str;
+                let target_str = match &cond.value {
+                    Some(serde_json::Value::String(s)) => s.as_str(),
+                    Some(serde_json::Value::Bool(true)) => "true",
+                    Some(serde_json::Value::Bool(false)) => "false",
+                    Some(serde_json::Value::Number(n)) => {
+                        num_str = n.to_string();
+                        num_str.as_str()
+                    }
+                    _ => "",
+                };
                 return match cond.op {
                     NodeConditionOp::Eq => ctx_val.value == target_str,
                     NodeConditionOp::Neq => ctx_val.value != target_str,
@@ -649,5 +659,33 @@ mod tests {
 
         let target = evaluate_conditions(&conditions, Some(&answer), &context);
         assert_eq!(target, Some("continue_flow".to_string()));
+    }
+
+    #[test]
+    fn test_evaluate_conditions_context_bool_and_number() {
+        let mut context = IndexMap::new();
+        context.insert(
+            "fraud_check".to_string(),
+            NodeContextValue::new("true", 0.99),
+        );
+        context.insert("risk_score".to_string(), NodeContextValue::new("3", 0.85));
+
+        let conditions = vec![
+            NodeCondition {
+                field: "fraud_check.value".to_string(),
+                op: NodeConditionOp::Eq,
+                value: Some(serde_json::json!(true)),
+                target_node: "escalate_fraud".to_string(),
+            },
+            NodeCondition {
+                field: "risk_score.value".to_string(),
+                op: NodeConditionOp::Eq,
+                value: Some(serde_json::json!(3)),
+                target_node: "high_risk_flow".to_string(),
+            },
+        ];
+
+        let target = evaluate_conditions(&conditions, None, &context);
+        assert_eq!(target, Some("escalate_fraud".to_string()));
     }
 }

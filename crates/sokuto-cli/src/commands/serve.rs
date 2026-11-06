@@ -8,10 +8,11 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::commands::session_config::SessionConfigBuilder;
+pub use crate::commands::session_config::parse_provider;
 use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_runtime::engine::{
-    CacheCompressionMode, DualSessionEngine, ExecutionProvider, InferenceEngine, SessionConfig,
-    StateCacheManager,
+    CacheCompressionMode, DualSessionEngine, InferenceEngine, StateCacheManager,
 };
 use sokuto_runtime::tokenizer::JevTokenizer;
 use sokuto_server::metrics::setup_metrics_recorder;
@@ -34,20 +35,6 @@ pub struct ServeArgs {
     pub intra_threads: Option<usize>,
     /// 複数オペレータ間の並列スレッド数 (inter-op)。
     pub inter_threads: Option<usize>,
-}
-
-/// 文字列から Execution Provider をパースする。
-pub fn parse_provider(name: &str) -> Result<ExecutionProvider, String> {
-    match name.to_lowercase().as_str() {
-        "auto" => Ok(ExecutionProvider::Auto),
-        "coreml" => Ok(ExecutionProvider::CoreML),
-        "cuda" => Ok(ExecutionProvider::CUDA),
-        "tensorrt" => Ok(ExecutionProvider::TensorRT),
-        "cpu" => Ok(ExecutionProvider::CPU),
-        other => Err(format!(
-            "未知の Execution Provider です: '{other}'。利用可能: auto, coreml, cuda, tensorrt, cpu。"
-        )),
-    }
 }
 
 /// モデルディレクトリの完全性を検証する。
@@ -97,20 +84,12 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error 
     }
 
     // 2. セッション設定の構築
-    let mut session_config = SessionConfig {
-        pool_size: args.pool_size.max(1),
-        intra_threads: args.intra_threads,
-        inter_threads: args.inter_threads.or(Some(1)),
-        ..Default::default()
-    };
-
-    if let Some(ref provider_str) = args.provider {
-        let provider = parse_provider(provider_str)?;
-        session_config.preferred_providers = match provider {
-            ExecutionProvider::Auto => SessionConfig::default().preferred_providers,
-            other => vec![other, ExecutionProvider::CPU],
-        };
-    }
+    let session_config = SessionConfigBuilder::new()
+        .pool_size(args.pool_size)
+        .intra_threads(args.intra_threads)
+        .inter_threads(args.inter_threads)
+        .provider_opt(args.provider.as_deref())
+        .build()?;
 
     let onnx_path = args.model_dir.join("model.onnx");
     let tok_path = args.model_dir.join("tokenizer.json");

@@ -15,10 +15,11 @@ use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_core::decision::evaluate_question;
 use sokuto_core::schema::Question;
 use sokuto_runtime::engine::coarse::CoarseToFineConfig;
-use sokuto_runtime::engine::{BatchScratchpad, ExecutionProvider, InferenceEngine, SessionConfig};
+use sokuto_runtime::engine::{BatchScratchpad, InferenceEngine};
 use sokuto_runtime::tokenizer::JevTokenizer;
 
-use crate::commands::serve::{parse_provider, validate_model_dir};
+use crate::commands::serve::validate_model_dir;
+use crate::commands::session_config::SessionConfigBuilder;
 
 /// ベンチマーク実行構成パラメータ。
 #[derive(Debug, Clone)]
@@ -160,20 +161,13 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
     }
 
     // 2. セッション設定の構築
-    let mut session_config = SessionConfig {
-        pool_size: args.pool_size.max(1),
-        intra_threads: args.intra_threads,
-        inter_threads: args.inter_threads.or(Some(1)),
-        enable_mem_arena: args.enable_mem_arena,
-        ..Default::default()
-    };
-    if let Some(ref provider_str) = args.provider {
-        let provider = parse_provider(provider_str)?;
-        session_config.preferred_providers = match provider {
-            ExecutionProvider::Auto => SessionConfig::default().preferred_providers,
-            other => vec![other, ExecutionProvider::CPU],
-        };
-    }
+    let session_config = SessionConfigBuilder::new()
+        .pool_size(args.pool_size)
+        .intra_threads(args.intra_threads)
+        .inter_threads(args.inter_threads)
+        .provider_opt(args.provider.as_deref())
+        .enable_mem_arena(args.enable_mem_arena)
+        .build()?;
 
     let onnx_path = args.model_dir.join("model.onnx");
     let tok_path = args.model_dir.join("tokenizer.json");

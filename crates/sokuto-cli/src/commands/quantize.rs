@@ -328,19 +328,22 @@ mod tests {
 
     #[test]
     fn test_find_pyproject_root() {
-        let cwd = std::env::current_dir().expect("カレントディレクトリの取得に成功。");
-        let train_pyproject = cwd.join("train").join("export").join("quantize.py");
-        if train_pyproject.exists() {
-            let found = find_pyproject_root(&train_pyproject);
-            assert!(
-                found.is_some(),
-                "train/export/quantize.py から pyproject.toml を検出できること。"
-            );
-            assert!(
-                found.unwrap().ends_with("train"),
-                "検出されたプロジェクトルートが train であること。"
-            );
-        }
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = find_project_root(manifest_dir).expect("プロジェクトルートの特定に成功。");
+        let train_pyproject = root.join("train").join("export").join("quantize.py");
+        assert!(
+            train_pyproject.exists(),
+            "train/export/quantize.py が存在すること。"
+        );
+        let found = find_pyproject_root(&train_pyproject);
+        assert!(
+            found.is_some(),
+            "train/export/quantize.py から pyproject.toml を検出できること。"
+        );
+        assert!(
+            found.unwrap().ends_with("train"),
+            "検出されたプロジェクトルートが train であること。"
+        );
     }
 
     #[test]

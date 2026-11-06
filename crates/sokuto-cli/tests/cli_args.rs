@@ -48,6 +48,7 @@ fn test_parse_serve_defaults() {
             assert_eq!(args.session.provider, None);
             assert_eq!(args.session.intra_threads, None);
             assert_eq!(args.session.inter_threads, None);
+            assert!(!args.no_mem_arena);
         }
         _ => panic!("Serve コマンドがパースされること。"),
     }
@@ -72,6 +73,7 @@ fn test_parse_serve_custom_options() {
         "4",
         "--inter-threads",
         "2",
+        "--no-mem-arena",
     ];
     let cli = Cli::try_parse_from(args).expect("引数パースに成功すること。");
 
@@ -84,6 +86,7 @@ fn test_parse_serve_custom_options() {
             assert_eq!(args.session.provider, Some(ExecutionProviderArg::Cpu));
             assert_eq!(args.session.intra_threads, Some(4));
             assert_eq!(args.session.inter_threads, Some(2));
+            assert!(args.no_mem_arena);
         }
         _ => panic!("Serve コマンドがパースされること。"),
     }

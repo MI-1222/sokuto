@@ -20,7 +20,7 @@ pub struct HealthcheckArgs {
     pub url: String,
 
     /// 接続および応答タイムアウト秒数。
-    #[arg(short, long, default_value_t = 3)]
+    #[arg(short, long, default_value_t = 3, value_parser = clap::value_parser!(u64).range(1..))]
     pub timeout_secs: u64,
 }
 
@@ -86,6 +86,55 @@ fn parse_http_url(url: &str) -> Result<(String, u16, String), String> {
     Ok((host, port, path))
 }
 
+/// ホスト名およびポート番号からソケットアドレスを解決する。
+///
+/// IP アドレス文字列（IPv4 または `[::1]` などの IPv6 リテラル）の場合は DNS 問い合わせを行わずに即座にパースし、
+/// ホスト名の場合は別スレッドとタイムアウト付きチャネルを用いて指定期限 (`deadline`) 内での解決を保証する。
+fn resolve_socket_addrs(
+    host: &str,
+    port: u16,
+    deadline: Instant,
+) -> Result<Vec<std::net::SocketAddr>, Box<dyn std::error::Error + Send + Sync>> {
+    let ip_str = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
+        return Ok(vec![std::net::SocketAddr::new(ip, port)]);
+    }
+
+    let now = Instant::now();
+    let remaining = deadline
+        .checked_duration_since(now)
+        .ok_or("名前解決がタイムアウトしました。")?;
+    if remaining.is_zero() {
+        return Err("名前解決がタイムアウトしました。".into());
+    }
+
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let host_port = format!("{host}:{port}");
+    std::thread::Builder::new()
+        .name("dns-resolve".to_string())
+        .spawn(move || {
+            let res = host_port
+                .to_socket_addrs()
+                .map(|iter| iter.collect::<Vec<_>>());
+            let _ = tx.send(res);
+        })
+        .map_err(|e| format!("名前解決スレッドの起動に失敗しました: {e}"))?;
+
+    match rx.recv_timeout(remaining) {
+        Ok(res) => Ok(res?),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(format!("ホスト名 '{host}' の名前解決がタイムアウトしました。").into())
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(format!("ホスト名 '{host}' の名前解決スレッドが予期せず終了しました。").into())
+        }
+    }
+}
+
 /// HTTP GET リクエストを送信し、ステータスコード 200 OK であるかを判定する。
 ///
 /// # 引数
@@ -93,11 +142,15 @@ fn parse_http_url(url: &str) -> Result<(String, u16, String), String> {
 pub fn run_healthcheck(
     args: HealthcheckArgs,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if args.timeout_secs == 0 {
+        return Err("タイムアウト秒数には 1 以上の値を指定してください。".into());
+    }
+
     let (host, port, path) = parse_http_url(&args.url)?;
     let timeout = Duration::from_secs(args.timeout_secs);
     let deadline = Instant::now() + timeout;
 
-    let socket_addrs: Vec<_> = format!("{host}:{port}").to_socket_addrs()?.collect();
+    let socket_addrs = resolve_socket_addrs(&host, port, deadline)?;
     if socket_addrs.is_empty() {
         return Err(format!("ホスト名のアドレス解決に失敗しました: {host}:{port}。").into());
     }
@@ -389,5 +442,58 @@ mod tests {
         assert!(result.is_ok());
 
         let _ = server_handle.join();
+    }
+
+    #[test]
+    fn test_run_healthcheck_timeout_secs_zero() {
+        let args = HealthcheckArgs {
+            url: "http://127.0.0.1:3000/ready".to_string(),
+            timeout_secs: 0,
+        };
+        let result = run_healthcheck(args);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "タイムアウト秒数には 1 以上の値を指定してください。"
+        );
+    }
+
+    #[test]
+    fn test_healthcheck_args_clap_validation() {
+        use clap::Parser;
+
+        #[derive(Debug, Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: HealthcheckArgs,
+        }
+
+        // 0 はバリデーションエラーとなる
+        let res = TestCli::try_parse_from(["test", "--timeout-secs", "0"]);
+        assert!(res.is_err());
+
+        // 1 以上は正常にパースできる
+        let parsed = TestCli::try_parse_from(["test", "--timeout-secs", "1"]).unwrap();
+        assert_eq!(parsed.args.timeout_secs, 1);
+    }
+
+    #[test]
+    fn test_resolve_socket_addrs() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        // IPv4 アドレス
+        let addrs = resolve_socket_addrs("127.0.0.1", 8080, deadline).unwrap();
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0], "127.0.0.1:8080".parse().unwrap());
+
+        // IPv6 アドレス (ブラケット付き)
+        let addrs = resolve_socket_addrs("[::1]", 8080, deadline).unwrap();
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0], "[::1]:8080".parse().unwrap());
+
+        // 期限切れ
+        let expired_deadline = Instant::now() - Duration::from_millis(10);
+        let err = resolve_socket_addrs("localhost", 8080, expired_deadline);
+        assert!(err.is_err());
     }
 }

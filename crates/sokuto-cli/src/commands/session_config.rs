@@ -195,22 +195,6 @@ impl SessionConfigBuilder {
     }
 }
 
-/// CLI 引数から [`SessionConfig`] を直接構築するヘルパー関数。
-#[must_use]
-pub fn build_session_config(
-    pool_size: usize,
-    intra_threads: Option<usize>,
-    inter_threads: Option<usize>,
-    provider: Option<impl Into<ExecutionProvider>>,
-) -> SessionConfig {
-    SessionConfigBuilder::new()
-        .pool_size(pool_size)
-        .intra_threads(intra_threads)
-        .inter_threads(inter_threads)
-        .provider_opt(provider)
-        .build()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,13 +328,5 @@ mod tests {
             config.preferred_providers,
             vec![ExecutionProvider::CoreML, ExecutionProvider::CPU]
         );
-    }
-
-    #[test]
-    fn test_helper_build_session_config() {
-        let config = build_session_config(2, Some(4), None, Some(ExecutionProvider::CPU));
-        assert_eq!(config.pool_size, 2);
-        assert_eq!(config.intra_threads, Some(4));
-        assert_eq!(config.inter_threads, Some(1));
     }
 }

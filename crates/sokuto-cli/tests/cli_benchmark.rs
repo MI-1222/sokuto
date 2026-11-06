@@ -27,8 +27,8 @@ fn test_run_benchmark_fast_smoke() {
             provider: Some(ExecutionProviderArg::Cpu),
             intra_threads: None,
             inter_threads: None,
+            no_mem_arena: false,
         },
-        no_mem_arena: false,
         json: false,
     };
 
@@ -54,8 +54,8 @@ fn test_run_benchmark_json_output() {
             provider: Some(ExecutionProviderArg::Cpu),
             intra_threads: None,
             inter_threads: None,
+            no_mem_arena: false,
         },
-        no_mem_arena: false,
         json: true,
     };
 

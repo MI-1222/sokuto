@@ -98,20 +98,9 @@ pub struct BenchmarkArgs {
     #[command(flatten)]
     pub session: SessionArgs,
 
-    /// CPU メモリアリーナを無効化する (OS アロケータ mimalloc に都度返却)。
-    #[arg(long, default_value_t = false)]
-    pub no_mem_arena: bool,
-
     /// CI 連携用 JSON 形式出力フラグ。
     #[arg(long)]
     pub json: bool,
-}
-
-impl BenchmarkArgs {
-    /// CPU メモリアリーナが有効かどうかを判定する。
-    pub fn enable_mem_arena(&self) -> bool {
-        !self.no_mem_arena
-    }
 }
 
 /// 単一シナリオの計測統計サマリー。
@@ -236,11 +225,7 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), CliError> {
     validate_model_dir(&args.model_dir)?;
 
     // 2. セッション設定の構築
-    let session_config = args
-        .session
-        .to_builder()
-        .enable_mem_arena(args.enable_mem_arena())
-        .build();
+    let session_config = args.session.build_config();
 
     let artifact_paths = ModelArtifactPaths::resolve(&args.model_dir);
 
@@ -574,8 +559,8 @@ mod tests {
                 provider: None,
                 intra_threads: None,
                 inter_threads: None,
+                no_mem_arena: false,
             },
-            no_mem_arena: false,
             json: false,
         };
 

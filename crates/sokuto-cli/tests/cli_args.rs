@@ -162,6 +162,27 @@ fn test_parse_benchmark_unknown_provider_fails() {
 }
 
 #[test]
+fn test_parse_benchmark_iterations_zero_fails() {
+    // 0 はバリデーションエラーとなる
+    let args_zero = ["sokuto", "benchmark", "-n", "0"];
+    let result_zero = Cli::try_parse_from(args_zero);
+    assert!(
+        result_zero.is_err(),
+        "iterations に 0 を指定した場合はパースエラーとなること。"
+    );
+
+    // 1 以上は正常にパースできる
+    let args_valid = ["sokuto", "benchmark", "-n", "1"];
+    let cli = Cli::try_parse_from(args_valid).expect("iterations=1 は正常にパースできること。");
+    match cli.command {
+        Commands::Benchmark(b_args) => {
+            assert_eq!(b_args.iterations, 1);
+        }
+        _ => panic!("Benchmark コマンドであること。"),
+    }
+}
+
+#[test]
 fn test_parse_serve_unknown_provider_fails() {
     let args = ["sokuto", "serve", "--provider", "invalid_backend"];
     let result = Cli::try_parse_from(args);

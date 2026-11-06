@@ -151,14 +151,8 @@ pub async fn resolve_host_port(host: &str, port: u16) -> Result<Vec<SocketAddr>,
 /// # エラー
 /// 名前解決に失敗した場合、または対応アドレスが存在しない場合に [`NetError`] を返す。
 pub async fn resolve_single_socket_addr(host: &str, port: u16) -> Result<SocketAddr, NetError> {
-    let addrs = resolve_host_port(host, port).await?;
-    addrs
-        .into_iter()
-        .next()
-        .ok_or_else(|| NetError::NoAddressesFound {
-            host: host.to_string(),
-            port,
-        })
+    let mut addrs = resolve_host_port(host, port).await?;
+    Ok(addrs.swap_remove(0))
 }
 
 #[cfg(test)]

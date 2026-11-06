@@ -4,8 +4,10 @@
 //! ファイル出力の完全性を検証する。
 
 use serde_json::Value;
+use sokuto_cli::commands::export_openapi::run_export_openapi;
 use sokuto_server::openapi::export_openapi_json;
 use std::fs;
+use std::path::PathBuf;
 
 #[test]
 fn test_export_openapi_json_structure() {
@@ -45,4 +47,22 @@ fn test_export_openapi_file_output() {
 
     // テスト後クリーンアップ
     let _ = fs::remove_file(&temp_file);
+}
+
+#[test]
+fn test_run_export_openapi_current_dir_relative_path() {
+    let filename = format!("test_openapi_export_{}.json", std::process::id());
+    let path = PathBuf::from(&filename);
+
+    let result = run_export_openapi(Some(path.clone()));
+    assert!(
+        result.is_ok(),
+        "カレントディレクトリ直下へのファイル出力に成功。"
+    );
+
+    assert!(path.exists(), "ファイルが正常に生成されていること。");
+    let content = fs::read_to_string(&path).expect("出力ファイルが読み出せること。");
+    assert!(!content.is_empty(), "ファイル内容が空でないこと。");
+
+    let _ = fs::remove_file(&path);
 }

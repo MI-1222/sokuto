@@ -106,7 +106,12 @@ pub fn run_healthcheck(
     loop {
         match stream.read(&mut buffer) {
             Ok(0) => break,
-            Ok(n) => response_bytes.extend_from_slice(&buffer[..n]),
+            Ok(n) => {
+                response_bytes.extend_from_slice(&buffer[..n]);
+                if response_bytes.contains(&b'\n') {
+                    break;
+                }
+            }
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
@@ -163,5 +168,40 @@ mod tests {
 
         let err = parse_http_url("https://localhost:3000/health");
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_run_healthcheck_immediate_return_without_close() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server_handle = thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                // HTTP 200 OK を送信するが、ソケットを close せず待機する。
+                let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+                let _ = socket.write_all(response.as_bytes());
+                // クライアントが切断または早期脱出するまで少し待つ。
+                thread::sleep(Duration::from_millis(500));
+            }
+        });
+
+        let args = HealthcheckArgs {
+            url: format!("http://127.0.0.1:{port}/health"),
+            timeout_secs: 5,
+        };
+
+        let start = std::time::Instant::now();
+        let result = run_healthcheck(args);
+        let elapsed = start.elapsed();
+
+        assert!(result.is_ok());
+        // 5秒のタイムアウトを待たずに即座 (500ms 未満) に脱出できたことを検証。
+        assert!(elapsed < Duration::from_millis(400));
+
+        let _ = server_handle.join();
     }
 }

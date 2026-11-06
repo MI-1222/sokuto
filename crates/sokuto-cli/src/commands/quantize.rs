@@ -263,35 +263,33 @@ fn find_pyproject_root(start_path: &Path) -> Option<PathBuf> {
 fn find_project_root(
     start_dir: &Path,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let mut current = if start_dir.is_absolute() {
+    let find_root = |mut current: PathBuf| {
+        loop {
+            if current.join("Cargo.toml").exists() && current.join("crates").exists() {
+                return Some(current);
+            }
+            if let Some(parent) = current.parent() {
+                current = parent.to_path_buf();
+            } else {
+                return None;
+            }
+        }
+    };
+
+    let start_path = if start_dir.is_absolute() {
         start_dir.to_path_buf()
     } else {
         std::env::current_dir()?.join(start_dir)
     };
 
-    loop {
-        if current.join("Cargo.toml").exists() && current.join("crates").exists() {
-            return Ok(current);
-        }
-        if let Some(parent) = current.parent() {
-            current = parent.to_path_buf();
-        } else {
-            break;
-        }
+    if let Some(root) = find_root(start_path) {
+        return Ok(root);
     }
 
     // カレントディレクトリ起点でも探索
     let cwd = std::env::current_dir()?;
-    let mut current = cwd;
-    loop {
-        if current.join("Cargo.toml").exists() && current.join("crates").exists() {
-            return Ok(current);
-        }
-        if let Some(parent) = current.parent() {
-            current = parent.to_path_buf();
-        } else {
-            break;
-        }
+    if let Some(root) = find_root(cwd) {
+        return Ok(root);
     }
 
     Err(

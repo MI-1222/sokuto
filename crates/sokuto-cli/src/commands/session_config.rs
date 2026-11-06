@@ -96,6 +96,7 @@ impl SessionConfigBuilder {
     /// プロバイダ文字列が指定されている場合は [`parse_provider`] でパースし、
     /// `Auto` の場合はデフォルトの優先リストを、特定プロバイダの場合は
     /// `[指定プロバイダ, CPU]` というフォールバック順序を設定する。
+    /// なお、指定プロバイダが `CPU` の場合は重複登録を防ぐため `[CPU]` のみを設定する。
     pub fn build(self) -> Result<SessionConfig, String> {
         let mut session_config = SessionConfig {
             pool_size: self.pool_size.max(1),
@@ -112,6 +113,7 @@ impl SessionConfigBuilder {
             let provider = parse_provider(provider_str)?;
             session_config.preferred_providers = match provider {
                 ExecutionProvider::Auto => SessionConfig::default().preferred_providers,
+                ExecutionProvider::CPU => vec![ExecutionProvider::CPU],
                 other => vec![other, ExecutionProvider::CPU],
             };
         }
@@ -193,9 +195,18 @@ mod tests {
         assert_eq!(config.intra_threads, Some(2));
         assert_eq!(config.inter_threads, Some(4));
         assert!(!config.enable_mem_arena);
+        assert_eq!(config.preferred_providers, vec![ExecutionProvider::CPU]);
+    }
+
+    #[test]
+    fn test_builder_with_non_cpu_provider() {
+        let config = SessionConfigBuilder::new()
+            .provider("cuda")
+            .build()
+            .unwrap();
         assert_eq!(
             config.preferred_providers,
-            vec![ExecutionProvider::CPU, ExecutionProvider::CPU]
+            vec![ExecutionProvider::CUDA, ExecutionProvider::CPU]
         );
     }
 

@@ -229,8 +229,23 @@ pub async fn run_healthcheck(
     }
 
     let trimmed = status_line.trim_matches(|c| c == '\r' || c == '\n');
+    let status_code = parse_http_status_line(trimmed)?;
+
+    if (200..=299).contains(&status_code) {
+        tracing::debug!("ヘルスチェック成功: {trimmed}。");
+        Ok(())
+    } else {
+        Err(format!("ヘルスチェック失敗 (ステータスコード {status_code}): '{trimmed}'。").into())
+    }
+}
+
+/// HTTP ステータス行を検証し、ステータスコードを抽出する。
+fn parse_http_status_line(
+    status_line: &str,
+) -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
+    let trimmed = status_line.trim_matches(|c| c == '\r' || c == '\n');
     let parts: Vec<&str> = trimmed.split_whitespace().collect();
-    if parts.len() < 2 {
+    if parts.len() < 2 || !parts[0].starts_with("HTTP/") {
         return Err(format!("不正な HTTP ステータス行です: '{trimmed}'。").into());
     }
 
@@ -241,12 +256,7 @@ pub async fn run_healthcheck(
         )
     })?;
 
-    if status_code == 200 {
-        tracing::debug!("ヘルスチェック成功: {trimmed}。");
-        Ok(())
-    } else {
-        Err(format!("ヘルスチェック失敗 (ステータスコード {status_code}): '{trimmed}'。").into())
-    }
+    Ok(status_code)
 }
 
 #[cfg(test)]
@@ -482,5 +492,66 @@ mod tests {
         let expired_deadline = Instant::now() - Duration::from_millis(10);
         let err = resolve_socket_addrs("localhost", 8080, expired_deadline).await;
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_parse_http_status_line() {
+        // 正常な HTTP ステータス行
+        assert_eq!(parse_http_status_line("HTTP/1.1 200 OK").unwrap(), 200);
+        assert_eq!(
+            parse_http_status_line("HTTP/1.1 204 No Content").unwrap(),
+            204
+        );
+        assert_eq!(parse_http_status_line("HTTP/2 200").unwrap(), 200);
+        assert_eq!(
+            parse_http_status_line("HTTP/1.0 503 Service Unavailable\r\n").unwrap(),
+            503
+        );
+
+        // 非 HTTP サービスの応答 (HTTP/ から始まらない)
+        let err = parse_http_status_line("SSH-2.0-OpenSSH_8.9").unwrap_err();
+        assert!(err.to_string().contains("不正な HTTP ステータス行です"));
+
+        let err = parse_http_status_line("220 Service ready").unwrap_err();
+        assert!(err.to_string().contains("不正な HTTP ステータス行です"));
+
+        // トークン不足
+        let err = parse_http_status_line("HTTP/1.1").unwrap_err();
+        assert!(err.to_string().contains("不正な HTTP ステータス行です"));
+
+        // ステータスコードが数値でない
+        let err = parse_http_status_line("HTTP/1.1 BAD OK").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ステータスコードのパースに失敗しました")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_healthcheck_204_no_content() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server_handle = thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                let response = "HTTP/1.1 204 No Content\r\n\r\n";
+                socket.write_all(response.as_bytes()).unwrap();
+                socket.flush().unwrap();
+            }
+        });
+
+        let args = HealthcheckArgs {
+            url: format!("http://127.0.0.1:{port}/ready"),
+            timeout_secs: 5,
+        };
+
+        let result = run_healthcheck(args).await;
+        assert!(result.is_ok());
+
+        let _ = server_handle.join();
     }
 }

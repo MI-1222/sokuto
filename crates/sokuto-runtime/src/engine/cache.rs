@@ -22,7 +22,7 @@ use ort::session::Session;
 use ort::value::{Tensor, Value};
 use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_core::contract::model_spec::{
-    ModelInputDimensions, TENSOR_ATTENTION_MASK, TENSOR_INPUT_IDS, TENSOR_LOGITS,
+    ModelInputDimensions, OP_INDEX_PADDING, TENSOR_ATTENTION_MASK, TENSOR_INPUT_IDS, TENSOR_LOGITS,
     TENSOR_OP_INDICES, TENSOR_QUERY_IDS, TENSOR_QUERY_MASK, TENSOR_STATE_HIDDEN_STATES,
     TENSOR_STATE_MASK,
 };
@@ -1073,14 +1073,8 @@ impl DualSessionEngine {
             )));
         }
 
-        // 2. `op_indices` の範囲外検証（クエリ系列長基準、パディング-1は許容）。
-        for (i, &idx) in op_indices.iter().enumerate() {
-            if idx != -1 && (idx < 0 || idx >= query_seq_len as i64) {
-                return Err(RuntimeError::InvalidTensorData(format!(
-                    "op_indices[{i}] = {idx} が有効範囲 (-1 または 0..{query_seq_len}) の範囲外です。"
-                )));
-            }
-        }
+        // 2. `op_indices` の範囲外検証（クエリ系列長基準、パディング -1 は許容）。
+        crate::engine::session::validate_op_indices(op_indices, query_seq_len)?;
 
         let mut session = self.acquire_query_session()?;
 
@@ -1259,7 +1253,7 @@ impl DualSessionEngine {
 
             let mut batch_query_ids = vec![pad_id; chunk_len * max_q_len];
             let mut batch_query_mask = vec![0i64; chunk_len * max_q_len];
-            let mut batch_op_indices = vec![-1i64; chunk_len * max_opts];
+            let mut batch_op_indices = vec![OP_INDEX_PADDING; chunk_len * max_opts];
             let batch_state_mask = cached_state.state_mask_for_batch(chunk_len);
 
             for (i, (_, _, t)) in chunk.iter().enumerate() {

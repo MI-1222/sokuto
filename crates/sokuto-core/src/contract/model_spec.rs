@@ -14,6 +14,9 @@ pub const TENSOR_ATTENTION_MASK: &str = "attention_mask";
 /// オプションマーカー位置インデックステンソル名 (`int64[batch_size, num_options]`)。
 pub const TENSOR_OP_INDICES: &str = "op_indices";
 
+/// 候補インデックステンソルにおけるパディング(未選択スロット)ダミー値。
+pub const OP_INDEX_PADDING: i64 = -1;
+
 /// 決定ヘッド出力ロジットテンソル名 (`float32[batch_size, num_options]`)。
 pub const TENSOR_LOGITS: &str = "logits";
 

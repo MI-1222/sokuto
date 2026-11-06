@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_core::contract::model_spec::{
-    ModelInputDimensions, TENSOR_ATTENTION_MASK, TENSOR_INPUT_IDS, TENSOR_LOGITS, TENSOR_OP_INDICES,
+    ModelInputDimensions, OP_INDEX_PADDING, TENSOR_ATTENTION_MASK, TENSOR_INPUT_IDS, TENSOR_LOGITS,
+    TENSOR_OP_INDICES,
 };
 use sokuto_core::decision::evaluate_question;
 use sokuto_core::gating::GatingConfig;
@@ -298,14 +299,8 @@ impl InferenceEngine {
             )));
         }
 
-        // 2. op_indices の範囲外インデックスチェック (Gather 層クラッシュ・セグフォ防止)
-        for (i, &idx) in op_indices.iter().enumerate() {
-            if idx < 0 || idx >= seq_len as i64 {
-                return Err(RuntimeError::InvalidTensorData(format!(
-                    "op_indices[{i}] = {idx} が系列長 (0..{seq_len}) の範囲外です。"
-                )));
-            }
-        }
+        // 2. op_indices の範囲外インデックスチェック (Gather 層クラッシュ・セグフォ防止、パディング -1 は許容)
+        validate_op_indices(op_indices, seq_len)?;
 
         // 3. 入力 ORT TensorRef をゼロコピー借用ビューで構築 (.to_vec() 排除)
         let input_ids_tensor = TensorRef::from_array_view(([batch_size, seq_len], input_ids))
@@ -758,4 +753,40 @@ pub(crate) fn create_session_builder(
     )?;
 
     Ok((builder, provider))
+}
+
+/// 候補インデックス列 (`op_indices`) の範囲外アクセスを検証する共通関数。
+///
+/// パディング値 (`OP_INDEX_PADDING = -1`) は許容し、それ以外のインデックスが系列長 `0..seq_len` の範囲内にあることを確認する。
+pub fn validate_op_indices(op_indices: &[i64], seq_len: usize) -> Result<()> {
+    for (i, &idx) in op_indices.iter().enumerate() {
+        if idx != OP_INDEX_PADDING && (idx < 0 || idx >= seq_len as i64) {
+            return Err(RuntimeError::InvalidTensorData(format!(
+                "op_indices[{i}] = {idx} が有効範囲 (-1 または 0..{seq_len}) の範囲外です。"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_op_indices_semantics() {
+        let seq_len = 32;
+
+        // 有効なインデックス列 (-1 パディングおよび 0..32 の範囲内)
+        let valid_indices = vec![0, 5, 15, 31, OP_INDEX_PADDING, OP_INDEX_PADDING];
+        assert!(validate_op_indices(&valid_indices, seq_len).is_ok());
+
+        // -2 以下の負値は不正
+        let invalid_neg = vec![0, -2, 10];
+        assert!(validate_op_indices(&invalid_neg, seq_len).is_err());
+
+        // 系列長以上のインデックスは不正
+        let invalid_oob = vec![0, 5, 32];
+        assert!(validate_op_indices(&invalid_oob, seq_len).is_err());
+    }
 }

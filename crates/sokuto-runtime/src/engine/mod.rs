@@ -33,4 +33,4 @@ pub use gating::{
     resolve_gating_config,
 };
 pub use provider::register_execution_providers;
-pub use session::InferenceEngine;
+pub use session::{InferenceEngine, validate_op_indices};

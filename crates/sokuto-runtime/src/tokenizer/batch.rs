@@ -5,7 +5,7 @@
 //! ならびに ONNX Runtime 入力テンソル平坦化バッファの生成を提供する。
 
 use indexmap::IndexMap;
-use sokuto_core::contract::model_spec::ModelInputDimensions;
+use sokuto_core::contract::model_spec::{ModelInputDimensions, OP_INDEX_PADDING};
 use sokuto_core::schema::Question;
 
 use crate::error::{Result, RuntimeError};
@@ -19,7 +19,7 @@ pub struct BatchTokenizedQuestions {
     /// 平坦化されたアテンションマスクテンソル用データ (`[batch_size * sequence_length]`)。
     pub attention_mask: Vec<i64>,
     /// 平坦化された候補出現位置インデックステンソル用データ (`[batch_size * num_options]`)。
-    /// パディング領域には Gather 層の境界外アクセスを防ぐためダミー値 0 が設定される。
+    /// パディング領域には未選択スロットを表す -1 (`OP_INDEX_PADDING`) が設定される。
     pub op_indices: Vec<i64>,
     /// バッチテンソルの次元情報 (`batch_size`, `sequence_length`, `num_options`)。
     pub dims: ModelInputDimensions,
@@ -60,7 +60,7 @@ impl JevTokenizer {
     /// 1. `state` を `encode_state` により 1 度だけトークナイズし、トークン ID 列を共有する。
     /// 2. 各質問に対して独立した State 優先トランケーションを適用し、個別トークナイズを実行する。
     /// 3. バッチ内の最大系列長 $L_{\\max}$ および最大候補数 $K_{\\max}$ を算出する。
-    /// 4. パディングトークンおよび安全なダミー候補インデックス (0) を用いて平坦化バッファを構築する。
+    /// 4. パディングトークンおよび未選択スロット (-1) を用いて平坦化バッファを構築する。
     ///
     /// # 引数
     /// - `state`: 共通文脈テキスト。
@@ -136,8 +136,8 @@ impl JevTokenizer {
 
         let mut input_ids = vec![pad_id; total_tokens];
         let mut attention_mask = vec![0i64; total_tokens];
-        // Gather 層の範囲外アクセスを防ぐため、パディング候補スロットは 0 で埋める。
-        let mut op_indices = vec![0i64; total_options];
+        // パディング候補スロットは未選択スロットとして -1 で埋める。
+        let mut op_indices = vec![OP_INDEX_PADDING; total_options];
 
         for (i, tokenized) in tokenized_list.into_iter().enumerate() {
             let token_offset = i * max_seq_len;
@@ -239,11 +239,11 @@ mod tests {
         let l_max = batch.dims.sequence_length;
         let k_max = batch.dims.num_options;
 
-        // 行 1 (q1) の検証: 2 択なので候補スロット 2, 3 はパディング (0)
-        assert_ne!(batch.op_indices[0], 0);
-        assert_ne!(batch.op_indices[1], 0);
-        assert_eq!(batch.op_indices[2], 0);
-        assert_eq!(batch.op_indices[3], 0);
+        // 行 1 (q1) の検証: 2 択なので候補スロット 2, 3 はパディング (-1)
+        assert_ne!(batch.op_indices[0], OP_INDEX_PADDING);
+        assert_ne!(batch.op_indices[1], OP_INDEX_PADDING);
+        assert_eq!(batch.op_indices[2], OP_INDEX_PADDING);
+        assert_eq!(batch.op_indices[3], OP_INDEX_PADDING);
 
         // 系列長の末尾がパディングされていることの検証 (q1 は q2 より短い)
         let q1_tokens = &batch.input_ids[0..l_max];
@@ -261,7 +261,7 @@ mod tests {
 
         // 行 2 (q2) の検証: 4 択すべて有効
         for k in 0..4 {
-            assert_ne!(batch.op_indices[k_max + k], 0);
+            assert_ne!(batch.op_indices[k_max + k], OP_INDEX_PADDING);
         }
     }
 }

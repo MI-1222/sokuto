@@ -5,8 +5,8 @@
 
 use std::path::PathBuf;
 
-use sokuto_cli::ExecutionProviderArg;
 use sokuto_cli::commands::benchmark::{BenchmarkArgs, BenchmarkScenario, run_benchmark};
+use sokuto_cli::{ExecutionProviderArg, SessionArgs};
 
 #[test]
 fn test_run_benchmark_fast_smoke() {
@@ -21,11 +21,13 @@ fn test_run_benchmark_fast_smoke() {
         model_dir,
         iterations: 2,
         warmup: 1,
-        provider: Some(ExecutionProviderArg::Cpu),
         scenario: BenchmarkScenario::Single,
-        pool_size: 1,
-        intra_threads: None,
-        inter_threads: None,
+        session: SessionArgs {
+            pool_size: 1,
+            provider: Some(ExecutionProviderArg::Cpu),
+            intra_threads: None,
+            inter_threads: None,
+        },
         no_mem_arena: false,
         json: false,
     };
@@ -46,11 +48,13 @@ fn test_run_benchmark_json_output() {
         model_dir,
         iterations: 1,
         warmup: 1,
-        provider: Some(ExecutionProviderArg::Cpu),
         scenario: BenchmarkScenario::Scratchpad,
-        pool_size: 1,
-        intra_threads: None,
-        inter_threads: None,
+        session: SessionArgs {
+            pool_size: 1,
+            provider: Some(ExecutionProviderArg::Cpu),
+            intra_threads: None,
+            inter_threads: None,
+        },
         no_mem_arena: false,
         json: true,
     };

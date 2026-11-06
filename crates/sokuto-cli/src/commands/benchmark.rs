@@ -16,7 +16,7 @@ use sokuto_runtime::engine::{BatchScratchpad, InferenceEngine};
 use sokuto_runtime::tokenizer::JevTokenizer;
 
 use crate::commands::model_dir::{ModelArtifactPaths, load_calibration_config, validate_model_dir};
-use crate::commands::session_config::{ExecutionProviderArg, SessionConfigBuilder};
+pub use crate::commands::session_config::{ExecutionProviderArg, SessionArgs, SessionConfigArgs};
 use crate::error::CliError;
 
 /// ベンチマーク実行対象シナリオ。
@@ -90,25 +90,13 @@ pub struct BenchmarkArgs {
     #[arg(short = 'w', long, default_value_t = 10)]
     pub warmup: usize,
 
-    /// 優先 Execution Provider。
-    #[arg(long)]
-    pub provider: Option<ExecutionProviderArg>,
-
     /// 実行対象シナリオ (all, single, batch, coarse, scratchpad)。
     #[arg(short = 's', long, default_value = "all")]
     pub scenario: BenchmarkScenario,
 
-    /// セッションプールサイズ。
-    #[arg(long, default_value_t = 1)]
-    pub pool_size: usize,
-
-    /// 単一オペレータ内の並列スレッド数 (intra-op)。
-    #[arg(long)]
-    pub intra_threads: Option<usize>,
-
-    /// 複数オペレータ間の並列スレッド数 (inter-op)。
-    #[arg(long)]
-    pub inter_threads: Option<usize>,
+    /// ONNX Runtime セッション構成引数。
+    #[command(flatten)]
+    pub session: SessionArgs,
 
     /// CPU メモリアリーナを無効化する (OS アロケータ mimalloc に都度返却)。
     #[arg(long, default_value_t = false)]
@@ -246,11 +234,9 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), CliError> {
     validate_model_dir(&args.model_dir)?;
 
     // 2. セッション設定の構築
-    let session_config = SessionConfigBuilder::new()
-        .pool_size(args.pool_size)
-        .intra_threads(args.intra_threads)
-        .inter_threads(args.inter_threads)
-        .provider_opt(args.provider)
+    let session_config = args
+        .session
+        .to_builder()
         .enable_mem_arena(args.enable_mem_arena())
         .build();
 
@@ -580,11 +566,13 @@ mod tests {
             model_dir: PathBuf::from("models/default"),
             iterations: 0,
             warmup: 0,
-            provider: None,
             scenario: BenchmarkScenario::Single,
-            pool_size: 1,
-            intra_threads: None,
-            inter_threads: None,
+            session: SessionArgs {
+                pool_size: 1,
+                provider: None,
+                intra_threads: None,
+                inter_threads: None,
+            },
             no_mem_arena: false,
             json: false,
         };

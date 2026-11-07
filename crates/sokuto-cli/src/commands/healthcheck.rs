@@ -325,21 +325,20 @@ async fn connect_to_any(
 /// HTTP ステータス行を検証し、ステータスコードを抽出する。
 fn parse_http_status_line(status_line: &str) -> Result<u16, CliError> {
     let trimmed = status_line.trim_matches(|c| c == '\r' || c == '\n');
-    let parts: Vec<&str> = trimmed.split_whitespace().collect();
-    if parts.len() < 2 || !parts[0].starts_with("HTTP/") {
-        return Err(CliError::HealthcheckFailed(format!(
+    let mut parts = trimmed.split_whitespace();
+
+    match (parts.next(), parts.next()) {
+        (Some(proto), Some(code_str)) if proto.starts_with("HTTP/") => {
+            code_str.parse::<u16>().map_err(|e| {
+                CliError::HealthcheckFailed(format!(
+                    "ステータスコードのパースに失敗しました: '{code_str}' ({e})。"
+                ))
+            })
+        }
+        _ => Err(CliError::HealthcheckFailed(format!(
             "不正な HTTP ステータス行です: '{trimmed}'。"
-        )));
+        ))),
     }
-
-    let status_code = parts[1].parse::<u16>().map_err(|e| {
-        CliError::HealthcheckFailed(format!(
-            "ステータスコードのパースに失敗しました: '{}' ({e})。",
-            parts[1]
-        ))
-    })?;
-
-    Ok(status_code)
 }
 
 #[cfg(test)]

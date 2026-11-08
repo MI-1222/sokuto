@@ -68,4 +68,63 @@ pub enum CoreError {
         /// エラー詳細メッセージ。
         message: String,
     },
+
+    /// バッチサイズが 0 または仕様制約外である場合のエラー。
+    #[error("バッチサイズは 1 以上である必要がありますが、{batch_size} が指定されました。")]
+    InvalidBatchSize {
+        /// 指定されたバッチサイズ。
+        batch_size: usize,
+    },
+
+    /// 入力系列長が仕様制約外である場合のエラー。
+    #[error(
+        "入力系列長は {min}〜{max} の範囲内である必要がありますが、{length} が指定されました。"
+    )]
+    InvalidSequenceLength {
+        /// 指定された系列長。
+        length: usize,
+        /// 許容される最小系列長。
+        min: usize,
+        /// 許容される最大系列長。
+        max: usize,
+    },
+
+    /// モデルテンソルにおけるオプションマーカー数([OP]数)が仕様制約外である場合のエラー。
+    #[error(
+        "モデルオプション数は {min}〜{max} の範囲内である必要がありますが、{count} が指定されました。"
+    )]
+    InvalidOptionCount {
+        /// 指定されたオプション数。
+        count: usize,
+        /// 許容される最小オプション数。
+        min: usize,
+        /// 許容される最大オプション数。
+        max: usize,
+    },
+
+    /// テンソルの形状(shape)が期待される仕様と不一致である場合のエラー。
+    #[error("テンソル '{tensor}' の形状が不正です。期待値: {expected:?}、実際: {actual:?}。")]
+    InvalidTensorShape {
+        /// 対象のテンソル名。
+        tensor: &'static str,
+        /// 期待される形状。
+        expected: Vec<usize>,
+        /// 実際に渡された形状。
+        actual: Vec<usize>,
+    },
+
+    /// テンソル間で特定の次元サイズ(バッチサイズなど)や次元数が不一致である場合のエラー。
+    #[error(
+        "テンソル '{tensor}' の {dimension} が不一致です。期待値: {expected}、実際: {actual}。"
+    )]
+    DimensionMismatch {
+        /// 対象のテンソル名。
+        tensor: &'static str,
+        /// 不一致となった次元または属性名(例: "batch_size", "rank")。
+        dimension: &'static str,
+        /// 期待される値。
+        expected: usize,
+        /// 実際の値。
+        actual: usize,
+    },
 }

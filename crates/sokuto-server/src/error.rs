@@ -103,6 +103,11 @@ impl IntoResponse for ServerError {
                     CoreError::InvalidCriteriaType { .. } => "invalid_criteria_type",
                     CoreError::InvalidChoiceCount { .. } => "invalid_choice_count",
                     CoreError::InvalidScoreLevelCount { .. } => "invalid_score_level_count",
+                    CoreError::InvalidBatchSize { .. } => "invalid_batch_size",
+                    CoreError::InvalidSequenceLength { .. } => "invalid_sequence_length",
+                    CoreError::InvalidOptionCount { .. } => "invalid_option_count",
+                    CoreError::InvalidTensorShape { .. } => "invalid_tensor_shape",
+                    CoreError::DimensionMismatch { .. } => "dimension_mismatch",
                     _ => "schema_validation_error",
                 };
                 (

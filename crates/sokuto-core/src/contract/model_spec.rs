@@ -59,19 +59,21 @@ impl ModelInputDimensions {
     /// 新規次元情報を構築し、仕様制約を満たしているか検証する。
     pub fn new(batch_size: usize, sequence_length: usize, num_options: usize) -> Result<Self> {
         if batch_size == 0 {
-            return Err(CoreError::MathError {
-                message: "バッチサイズは 1 以上である必要があります。".to_string(),
-            });
+            return Err(CoreError::InvalidBatchSize { batch_size });
         }
         if sequence_length == 0 || sequence_length > MAX_SEQUENCE_LENGTH {
-            return Err(CoreError::MathError {
-                message: format!(
-                    "入力系列長は 1〜{MAX_SEQUENCE_LENGTH} の範囲内である必要がありますが、{sequence_length} が指定されました。"
-                ),
+            return Err(CoreError::InvalidSequenceLength {
+                length: sequence_length,
+                min: 1,
+                max: MAX_SEQUENCE_LENGTH,
             });
         }
         if !(MIN_NUM_OPTIONS..=MAX_NUM_OPTIONS).contains(&num_options) {
-            return Err(CoreError::InvalidChoiceCount { count: num_options });
+            return Err(CoreError::InvalidOptionCount {
+                count: num_options,
+                min: MIN_NUM_OPTIONS,
+                max: MAX_NUM_OPTIONS,
+            });
         }
 
         Ok(Self {
@@ -88,32 +90,34 @@ impl ModelInputDimensions {
         op_indices_shape: &[usize],
     ) -> Result<Self> {
         if input_ids_shape.len() != 2 {
-            return Err(CoreError::MathError {
-                message: format!(
-                    "{TENSOR_INPUT_IDS} は 2 次元テンソル [batch, seq_len] である必要があります: {input_ids_shape:?}。"
-                ),
+            return Err(CoreError::DimensionMismatch {
+                tensor: TENSOR_INPUT_IDS,
+                dimension: "rank",
+                expected: 2,
+                actual: input_ids_shape.len(),
             });
         }
         if attention_mask_shape != input_ids_shape {
-            return Err(CoreError::MathError {
-                message: format!(
-                    "{TENSOR_ATTENTION_MASK} の形状 {attention_mask_shape:?} は {TENSOR_INPUT_IDS} の形状 {input_ids_shape:?} と一致する必要があります。"
-                ),
+            return Err(CoreError::InvalidTensorShape {
+                tensor: TENSOR_ATTENTION_MASK,
+                expected: input_ids_shape.to_vec(),
+                actual: attention_mask_shape.to_vec(),
             });
         }
         if op_indices_shape.len() != 2 {
-            return Err(CoreError::MathError {
-                message: format!(
-                    "{TENSOR_OP_INDICES} は 2 次元テンソル [batch, num_options] である必要があります: {op_indices_shape:?}。"
-                ),
+            return Err(CoreError::DimensionMismatch {
+                tensor: TENSOR_OP_INDICES,
+                dimension: "rank",
+                expected: 2,
+                actual: op_indices_shape.len(),
             });
         }
         if op_indices_shape[0] != input_ids_shape[0] {
-            return Err(CoreError::MathError {
-                message: format!(
-                    "{TENSOR_OP_INDICES} のバッチサイズ {} は {TENSOR_INPUT_IDS} のバッチサイズ {} と一致する必要があります。",
-                    op_indices_shape[0], input_ids_shape[0]
-                ),
+            return Err(CoreError::DimensionMismatch {
+                tensor: TENSOR_OP_INDICES,
+                dimension: "batch_size",
+                expected: input_ids_shape[0],
+                actual: op_indices_shape[0],
             });
         }
 
@@ -123,18 +127,18 @@ impl ModelInputDimensions {
     /// 出力 logits テンソルの形状が入力次元と整合しているか検証する。
     pub fn validate_output_shape(&self, logits_shape: &[usize]) -> Result<()> {
         if logits_shape.len() != 2 {
-            return Err(CoreError::MathError {
-                message: format!(
-                    "{TENSOR_LOGITS} は 2 次元テンソル [batch, num_options] である必要があります: {logits_shape:?}。"
-                ),
+            return Err(CoreError::DimensionMismatch {
+                tensor: TENSOR_LOGITS,
+                dimension: "rank",
+                expected: 2,
+                actual: logits_shape.len(),
             });
         }
         if logits_shape[0] != self.batch_size || logits_shape[1] != self.num_options {
-            return Err(CoreError::MathError {
-                message: format!(
-                    "{TENSOR_LOGITS} の形状 {logits_shape:?} は期待される形状 [{}, {}] と一致しません。",
-                    self.batch_size, self.num_options
-                ),
+            return Err(CoreError::InvalidTensorShape {
+                tensor: TENSOR_LOGITS,
+                expected: vec![self.batch_size, self.num_options],
+                actual: logits_shape.to_vec(),
             });
         }
         Ok(())
@@ -163,17 +167,126 @@ mod tests {
         assert!(dims.validate_output_shape(&[2, 4]).is_ok());
 
         // 出力 logits の形状不一致エラー
-        assert!(dims.validate_output_shape(&[2, 5]).is_err());
+        let err = dims.validate_output_shape(&[2, 5]).unwrap_err();
+        assert_eq!(
+            err,
+            CoreError::InvalidTensorShape {
+                tensor: TENSOR_LOGITS,
+                expected: vec![2, 4],
+                actual: vec![2, 5],
+            }
+        );
     }
 
     #[test]
     fn test_tensor_shape_validation_mismatch() {
         // attention_mask の系列長不一致
         let res = ModelInputDimensions::validate_tensor_shapes(&[1, 64], &[1, 32], &[1, 3]);
-        assert!(res.is_err());
+        assert_eq!(
+            res.unwrap_err(),
+            CoreError::InvalidTensorShape {
+                tensor: TENSOR_ATTENTION_MASK,
+                expected: vec![1, 64],
+                actual: vec![1, 32],
+            }
+        );
 
         // バッチサイズ不一致
         let res2 = ModelInputDimensions::validate_tensor_shapes(&[2, 64], &[2, 64], &[1, 3]);
-        assert!(res2.is_err());
+        assert_eq!(
+            res2.unwrap_err(),
+            CoreError::DimensionMismatch {
+                tensor: TENSOR_OP_INDICES,
+                dimension: "batch_size",
+                expected: 2,
+                actual: 1,
+            }
+        );
+
+        // 入力テンソルの次元数(ランク)不正
+        let res3 = ModelInputDimensions::validate_tensor_shapes(&[64], &[64], &[1, 3]);
+        assert_eq!(
+            res3.unwrap_err(),
+            CoreError::DimensionMismatch {
+                tensor: TENSOR_INPUT_IDS,
+                dimension: "rank",
+                expected: 2,
+                actual: 1,
+            }
+        );
+
+        // op_indices の次元数(ランク)不正
+        let res4 = ModelInputDimensions::validate_tensor_shapes(&[1, 64], &[1, 64], &[1, 3, 2]);
+        assert_eq!(
+            res4.unwrap_err(),
+            CoreError::DimensionMismatch {
+                tensor: TENSOR_OP_INDICES,
+                dimension: "rank",
+                expected: 2,
+                actual: 3,
+            }
+        );
+
+        // logits の次元数(ランク)不正
+        let dims = ModelInputDimensions::new(1, 64, 3).unwrap();
+        let res5 = dims.validate_output_shape(&[1, 3, 2]);
+        assert_eq!(
+            res5.unwrap_err(),
+            CoreError::DimensionMismatch {
+                tensor: TENSOR_LOGITS,
+                dimension: "rank",
+                expected: 2,
+                actual: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn test_model_input_dimensions_validation() {
+        // バッチサイズ 0 の拒絶
+        assert_eq!(
+            ModelInputDimensions::new(0, 128, 4).unwrap_err(),
+            CoreError::InvalidBatchSize { batch_size: 0 }
+        );
+
+        // 系列長 0 の拒絶
+        assert_eq!(
+            ModelInputDimensions::new(1, 0, 4).unwrap_err(),
+            CoreError::InvalidSequenceLength {
+                length: 0,
+                min: 1,
+                max: MAX_SEQUENCE_LENGTH,
+            }
+        );
+
+        // 系列長超過の拒絶
+        assert_eq!(
+            ModelInputDimensions::new(1, MAX_SEQUENCE_LENGTH + 1, 4).unwrap_err(),
+            CoreError::InvalidSequenceLength {
+                length: MAX_SEQUENCE_LENGTH + 1,
+                min: 1,
+                max: MAX_SEQUENCE_LENGTH,
+            }
+        );
+
+        // オプション数 0 の拒絶 (Score/Noul等の文脈にも適した専用エラー)
+        assert_eq!(
+            ModelInputDimensions::new(1, 128, 0).unwrap_err(),
+            CoreError::InvalidOptionCount {
+                count: 0,
+                min: MIN_NUM_OPTIONS,
+                max: MAX_NUM_OPTIONS,
+            }
+        );
+
+        // オプション数上限超過の拒絶
+        assert_eq!(
+            ModelInputDimensions::new(1, 128, MAX_NUM_OPTIONS + 1).unwrap_err(),
+            CoreError::InvalidOptionCount {
+                count: MAX_NUM_OPTIONS + 1,
+                min: MIN_NUM_OPTIONS,
+                max: MAX_NUM_OPTIONS,
+            }
+        );
     }
 }

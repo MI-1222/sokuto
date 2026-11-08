@@ -403,8 +403,21 @@ pub fn evaluate_answer_gating_with_energy(
         None
     };
 
+    // 質問種別の特定(question 定義からの取得、または answer の格納フィールドからのフォールバック導出)。
+    let question_type = question.map(|q| q.question_type).or_else(|| {
+        if answer.choice.is_some() {
+            Some(QuestionType::Choice)
+        } else if answer.score.is_some() {
+            Some(QuestionType::Score)
+        } else if answer.noul.is_some() {
+            Some(QuestionType::Noul)
+        } else {
+            None
+        }
+    });
+
     // 分布エントロピー・散らばり指標の直接算出。
-    let entropy = match question.map(|q| q.question_type) {
+    let entropy = match question_type {
         Some(QuestionType::Choice) => {
             if let Some(probs) = &answer.probabilities {
                 let p_vals: Vec<f64> = probs.values().copied().collect();
@@ -430,14 +443,11 @@ pub fn evaluate_answer_gating_with_energy(
                 }
             })
         }
-        _ => None,
+        None => None,
     };
 
-    // OOD 判定 (Pre-filter / Circuit Breaker): Choice 型かつ ood_enabled
-    let is_choice = question
-        .map(|q| q.question_type == QuestionType::Choice)
-        .unwrap_or(false)
-        || answer.choice.is_some();
+    // OOD 判定 (Pre-filter / Circuit Breaker): Choice 型かつ ood_enabled。
+    let is_choice = question_type == Some(QuestionType::Choice);
 
     let (is_ood, ood_reason) = if config.ood_enabled && is_choice {
         if let Some(e) = energy {
@@ -746,6 +756,7 @@ mod tests {
         assert_eq!(meta.route, DecisionRoute::AutoExecute);
         assert!((meta.confidence - 0.92).abs() < EPSILON);
         assert!((meta.margin.unwrap() - 0.80).abs() < EPSILON);
+        assert!(meta.entropy.is_some());
         assert!(meta.escalation.is_none());
     }
 
@@ -942,5 +953,36 @@ mod tests {
 
         assert_eq!(meta.route, DecisionRoute::AutoExecute);
         assert!(!meta.is_ood);
+    }
+
+    #[test]
+    fn test_evaluate_answer_gating_entropy_fallback_without_question() {
+        let config = GatingConfig::default();
+
+        // 1. Choice 型: question = None でも answer.choice からフォールバックしてエントロピーが算出される。
+        let mut choice_probs = IndexMap::new();
+        choice_probs.insert("opt_a".to_string(), 0.50);
+        choice_probs.insert("opt_b".to_string(), 0.50);
+        let ans_choice = Answer::choice("opt_a", choice_probs, 0.50);
+        let meta_choice = evaluate_answer_gating(&ans_choice, Some("q_choice"), None, &config);
+        assert!(meta_choice.entropy.is_some());
+        // 2 候補均等分布の正規化エントロピーは 1.0。
+        assert!((meta_choice.entropy.unwrap() - 1.0).abs() < EPSILON);
+
+        // 2. Score 型: question = None でも answer.score からフォールバックして分散指標が算出される。
+        let mut score_probs = IndexMap::new();
+        score_probs.insert("1".to_string(), 0.2);
+        score_probs.insert("2".to_string(), 0.8);
+        let ans_score = Answer::score(1.8, score_probs, 0.70);
+        let meta_score = evaluate_answer_gating(&ans_score, Some("q_score"), None, &config);
+        assert!(meta_score.entropy.is_some());
+        assert!((meta_score.entropy.unwrap() - 0.30).abs() < EPSILON);
+
+        // 3. Noul 型: question = None でも answer.noul からフォールバックして二値エントロピーが算出される。
+        let ans_noul = Answer::noul(0.50);
+        let meta_noul = evaluate_answer_gating(&ans_noul, Some("q_noul"), None, &config);
+        assert!(meta_noul.entropy.is_some());
+        // P=0.50 の二値エントロピーは 1.0。
+        assert!((meta_noul.entropy.unwrap() - 1.0).abs() < EPSILON);
     }
 }

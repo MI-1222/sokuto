@@ -14,6 +14,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
+use crate::math::top_margin_iter;
 use crate::schema::{Answer, Question, QuestionType};
 
 /// デフォルトの高確信度閾値 (自動実行境界)。
@@ -376,26 +377,7 @@ pub fn evaluate_answer_gating_with_energy(
 
     // ゼロアロケーション走査による上位 2 候補の確率マージン (Top-Margin) 算出。
     let margin = if let Some(probs) = &answer.probabilities {
-        let k = probs.len();
-        if k <= 1 {
-            Some(1.0)
-        } else {
-            let mut max1 = -f64::INFINITY;
-            let mut max2 = -f64::INFINITY;
-            for &p in probs.values() {
-                if p > max1 {
-                    max2 = max1;
-                    max1 = p;
-                } else if p > max2 {
-                    max2 = p;
-                }
-            }
-            if max1.is_finite() && max2.is_finite() {
-                Some((max1 - max2).abs().clamp(0.0, 1.0))
-            } else {
-                None
-            }
-        }
+        top_margin_iter(probs.values()).ok()
     } else if let Some(p_true) = answer.noul {
         let p_false = (1.0 - p_true).clamp(0.0, 1.0);
         Some((p_true - p_false).abs().clamp(0.0, 1.0))

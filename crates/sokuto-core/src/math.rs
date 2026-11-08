@@ -2,6 +2,8 @@
 //!
 //! 確率較正、ソフトマックス、エントロピー確信度、およびスコア期待値の計算ユーティリティを提供する。
 
+use std::borrow::Borrow;
+
 use crate::error::{CoreError, Result};
 
 /// ロジット列から温度付きソフトマックス確率分布を計算し、指定されたバッファへ書き込む。
@@ -191,46 +193,34 @@ pub fn normalized_entropy(probabilities: &[f64]) -> Result<f64> {
     Ok(h_norm.clamp(0.0, 1.0))
 }
 
-/// 確率分布から上位2候補の確率差(Top-Margin) $M(p) \in [0.0, 1.0]$ を算出する。
+/// 任意の確率値イテレータから上位2候補の確率差(Top-Margin) $M(p) \in [0.0, 1.0]$ を単一パス走査で算出する。
 ///
 /// # 数理仕様
 /// $$M(p) = \begin{cases} 1.0 & (K = 1) \\ p_{(1)} - p_{(2)} & (K \ge 2) \end{cases}$$
 ///
-/// - $O(K)$ 単一パス走査により、ヒープメモリ割り当て(アロケーション)ゼロで計算する。
+/// - $O(K)$ 単一パス走査により、ヒープメモリ割り当て(ゼロアロケーション)で計算する。
+/// - $K=0$ の場合は空配列エラーとして `CoreError::MathError` を返却する。
 /// - $K=1$ の特異点では $1.0$(他候補なし・完全なマージン)を即座に返却する。
 /// - 同率1位(タイ)の場合は $M(p) = 0.0$ となる。
+/// - 非有限値(NaNまたは無限大)や負の確率値が含まれる場合は `CoreError::MathError` を返却する。
 /// - 戻り値は `[0.0, 1.0]` の閉区間にクランプされる。
 ///
 /// # 引数
-/// - `probabilities`: 各候補の確率分布スライス(`f64`)。
+/// - `iter`: 確率値(`f64` または `&f64`)を提供するイテレータ。
 ///
 /// # 戻り値
-/// - 成功時は `[0.0, 1.0]` にクランプされた Top-Margin、不正時は `CoreError::MathError`。
-pub fn top_margin(probabilities: &[f64]) -> Result<f64> {
-    let k = probabilities.len();
-    if k == 0 {
-        return Err(CoreError::MathError {
-            message: "確率分布配列が空です。".to_string(),
-        });
-    }
-    if k == 1 {
-        if !probabilities[0].is_finite() {
-            return Err(CoreError::MathError {
-                message: "確率値に非有限値(NaNまたは無限大)が含まれています。".to_string(),
-            });
-        }
-        if probabilities[0] < 0.0 {
-            return Err(CoreError::MathError {
-                message: format!("負の確率値が含まれています: {}。", probabilities[0]),
-            });
-        }
-        return Ok(1.0);
-    }
-
+/// - 成功時は `[0.0, 1.0]` にクランプされた Top-Margin、不正時または空時は `CoreError::MathError`。
+pub fn top_margin_iter<I>(iter: I) -> Result<f64>
+where
+    I: IntoIterator,
+    I::Item: Borrow<f64>,
+{
+    let mut count: usize = 0;
     let mut max1 = f64::NEG_INFINITY;
     let mut max2 = f64::NEG_INFINITY;
 
-    for &p in probabilities {
+    for item in iter {
+        let p = *item.borrow();
         if !p.is_finite() {
             return Err(CoreError::MathError {
                 message: "確率値に非有限値(NaNまたは無限大)が含まれています。".to_string(),
@@ -242,6 +232,7 @@ pub fn top_margin(probabilities: &[f64]) -> Result<f64> {
             });
         }
 
+        count += 1;
         if p > max1 {
             max2 = max1;
             max1 = p;
@@ -250,8 +241,37 @@ pub fn top_margin(probabilities: &[f64]) -> Result<f64> {
         }
     }
 
-    let margin = max1 - max2;
-    Ok(margin.clamp(0.0, 1.0))
+    match count {
+        0 => Err(CoreError::MathError {
+            message: "確率分布配列が空です。".to_string(),
+        }),
+        1 => Ok(1.0),
+        _ => {
+            let margin = max1 - max2;
+            Ok(margin.clamp(0.0, 1.0))
+        }
+    }
+}
+
+/// 確率分布から上位2候補の確率差(Top-Margin) $M(p) \in [0.0, 1.0]$ を算出する。
+///
+/// # 数理仕様
+/// $$M(p) = \begin{cases} 1.0 & (K = 1) \\ p_{(1)} - p_{(2)} & (K \ge 2) \end{cases}$$
+///
+/// - [`top_margin_iter`] を呼び出すゼロコストラッパーとして動作する。
+/// - $O(K)$ 単一パス走査により、ヒープメモリ割り当て(アロケーション)ゼロで計算する。
+/// - $K=1$ の特異点では $1.0$(他候補なし・完全なマージン)を即座に返却する。
+/// - 同率1位(タイ)の場合は $M(p) = 0.0$ となる。
+/// - 戻り値は `[0.0, 1.0]` の閉区間にクランプされる。
+///
+/// # 引数
+/// - `probabilities`: 各候補の確率分布スライス(`f64`)。
+///
+/// # 戻り値
+/// - 成功時は `[0.0, 1.0]` にクランプされた Top-Margin、不正時は `CoreError::MathError`。
+#[inline]
+pub fn top_margin(probabilities: &[f64]) -> Result<f64> {
+    top_margin_iter(probabilities)
 }
 
 /// 確率分布から、正規化エントロピーと Top-Margin を統合した複合確信度スコア $S_{\text{confidence}} \in [0.0, 1.0]$ を算出する。
@@ -1075,6 +1095,28 @@ mod tests {
         assert!(top_margin(&[0.5, f64::NAN]).is_err());
         assert!(top_margin(&[f64::INFINITY, 0.0]).is_err());
         assert!(top_margin(&[f64::NAN]).is_err());
+    }
+
+    #[test]
+    fn test_top_margin_iter() {
+        // 1. K=1 の特異点: 競合候補が存在しないため 1.0 を返却する。
+        assert_eq!(top_margin_iter([1.0]).unwrap(), 1.0);
+        assert_eq!(top_margin_iter(&[1.0][..]).unwrap(), 1.0);
+
+        // 2. イテレータ (値および参照) の透過的サポート。
+        let p_clear = vec![0.7, 0.2, 0.1];
+        assert!((top_margin_iter(p_clear.iter()).unwrap() - 0.5).abs() < 1e-6);
+        assert!((top_margin_iter(p_clear.clone()).unwrap() - 0.5).abs() < 1e-6);
+        assert!((top_margin_iter(p_clear.into_iter()).unwrap() - 0.5).abs() < 1e-6);
+
+        // 3. 空イテレータの異常系。
+        let empty: [f64; 0] = [];
+        assert!(top_margin_iter(empty).is_err());
+        assert!(top_margin_iter(std::iter::empty::<f64>()).is_err());
+
+        // 4. 非有限値・負値の異常系。
+        assert!(top_margin_iter([0.5, f64::NAN]).is_err());
+        assert!(top_margin_iter([-0.1, 0.8]).is_err());
     }
 
     #[test]

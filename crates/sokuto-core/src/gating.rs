@@ -437,16 +437,6 @@ pub fn evaluate_answer_gating_with_energy(
 ) -> GatingMetadata {
     let conf = answer.effective_confidence().unwrap_or(0.0).clamp(0.0, 1.0);
 
-    // ゼロアロケーション走査による上位 2 候補の確率マージン (Top-Margin) 算出。
-    let margin = if let Some(probs) = &answer.probabilities {
-        top_margin_iter(probs.values()).ok()
-    } else if let Some(p_true) = answer.noul {
-        let p_false = (1.0 - p_true).clamp(0.0, 1.0);
-        Some((p_true - p_false).abs().clamp(0.0, 1.0))
-    } else {
-        None
-    };
-
     // 質問種別の特定(question 定義からの取得、または answer の格納フィールドからのフォールバック導出)。
     let question_type = question.map(|q| q.question_type).or_else(|| {
         if answer.choice.is_some() {
@@ -459,6 +449,23 @@ pub fn evaluate_answer_gating_with_energy(
             None
         }
     });
+
+    let is_choice = question_type == Some(QuestionType::Choice);
+
+    let margin = match question_type {
+        Some(QuestionType::Choice) => {
+            if let Some(probs) = &answer.probabilities {
+                top_margin_iter(probs.values()).ok()
+            } else {
+                None
+            }
+        }
+        Some(QuestionType::Noul) => answer.noul.map(|p_true| {
+            let p_false = (1.0 - p_true).clamp(0.0, 1.0);
+            (p_true - p_false).abs().clamp(0.0, 1.0)
+        }),
+        _ => None,
+    };
 
     // ゼロアロケーション走査による分布エントロピー・散らばり指標の直接算出。
     let entropy = match question_type {
@@ -488,9 +495,6 @@ pub fn evaluate_answer_gating_with_energy(
         }
         None => None,
     };
-
-    // OOD 判定 (Pre-filter / Circuit Breaker): Choice 型かつ ood_enabled。
-    let is_choice = question_type == Some(QuestionType::Choice);
 
     let (is_ood, ood_reason) = if config.ood_enabled && is_choice {
         if let Some(e) = energy {
@@ -547,21 +551,31 @@ pub fn evaluate_answer_gating_with_energy(
             }),
         )
     } else if conf >= config.high_threshold - EPSILON {
-        if let Some(m) = margin {
-            if m < config.top_margin_threshold - EPSILON {
-                (
-                    DecisionRoute::ConfirmOrEscalate,
-                    format!(
-                        "実効確信度({:.3} >= {:.3})は高水準ですが、上位2候補の確率差({:.3} < {:.3})が僅差のため確認要求に降格しました。",
-                        conf, config.high_threshold, m, config.top_margin_threshold
-                    ),
-                )
+        if is_choice {
+            if let Some(m) = margin {
+                if m < config.top_margin_threshold - EPSILON {
+                    (
+                        DecisionRoute::ConfirmOrEscalate,
+                        format!(
+                            "実効確信度({:.3} >= {:.3})は高水準ですが、上位2候補の確率差({:.3} < {:.3})が僅差のため確認要求に降格しました。",
+                            conf, config.high_threshold, m, config.top_margin_threshold
+                        ),
+                    )
+                } else {
+                    (
+                        DecisionRoute::AutoExecute,
+                        format!(
+                            "実効確信度({:.3} >= {:.3})および上位候補マージン({:.3} >= {:.3})を満たすため自動実行が承認されました。",
+                            conf, config.high_threshold, m, config.top_margin_threshold
+                        ),
+                    )
+                }
             } else {
                 (
                     DecisionRoute::AutoExecute,
                     format!(
-                        "実効確信度({:.3} >= {:.3})および上位候補マージン({:.3} >= {:.3})を満たすため自動実行が承認されました。",
-                        conf, config.high_threshold, m, config.top_margin_threshold
+                        "実効確信度({:.3} >= {:.3})が高水準であるため自動実行が承認されました。",
+                        conf, config.high_threshold
                     ),
                 )
             }
@@ -1021,5 +1035,26 @@ mod tests {
         assert!(meta_noul.entropy.is_some());
         // P=0.50 の二値エントロピーは 1.0。
         assert!((meta_noul.entropy.unwrap() - 1.0).abs() < EPSILON);
+    }
+
+    #[test]
+    fn test_evaluate_answer_gating_score_adjacent_levels_not_demoted_by_margin() {
+        // Score 型において、隣接する 2 段階に確率が集中している低分散・高確信度ケース。
+        // 上位 2 段階の確率差 (Margin) は 0.00 となるが、Score 型は順序尺度であるため
+        // Top-Margin による確認要求降格を行わず、分散確信度に基づいて AutoExecute となることを検証する。
+        let mut score_probs = IndexMap::new();
+        score_probs.insert("1".to_string(), 0.0);
+        score_probs.insert("2".to_string(), 0.0);
+        score_probs.insert("3".to_string(), 0.5);
+        score_probs.insert("4".to_string(), 0.5);
+        let ans_score = Answer::score(3.5, score_probs, 0.88);
+
+        let config = GatingConfig::default();
+        let meta = evaluate_answer_gating(&ans_score, Some("q_score"), None, &config);
+
+        assert_eq!(meta.route, DecisionRoute::AutoExecute);
+        assert_eq!(meta.margin, None);
+        assert!(meta.escalation.is_none());
+        assert!(meta.reason.contains("実効確信度"));
     }
 }

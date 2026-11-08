@@ -284,7 +284,7 @@ fn test_validation_gating_config_valid() {
     assert_eq!(gating.low_threshold, 0.45);
 }
 
-/// StateBatchRequest と SystemOneRequest の共通 DecisionRequest トレイトおよび変換テスト。
+/// StateBatchRequest と SystemOneRequest の共通 DecisionRequest トレイトおよび型エイリアス互換性テスト。
 #[test]
 fn test_decision_request_trait_and_conversion() {
     use sokuto_core::schema::{DecisionRequest, StateBatchRequest};
@@ -305,8 +305,8 @@ fn test_decision_request_trait_and_conversion() {
     assert!(DecisionRequest::validate(&batch_req).is_ok());
     assert_eq!(batch_req.questions().len(), 1);
 
-    // From 変換テスト。
-    let s1_req: SystemOneRequest = batch_req.into();
+    // 型エイリアスとしての完全互換性 (SystemOneRequest としての扱い) を検証。
+    let s1_req: SystemOneRequest = batch_req;
     assert_eq!(s1_req.questions.len(), 1);
     assert!(s1_req.validate().is_ok());
 }

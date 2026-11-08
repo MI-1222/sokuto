@@ -301,19 +301,9 @@ impl SystemOneRequest {
     }
 
     /// モデル名を指定してリクエストを作成する。
-    pub fn with_model(
-        model: impl Into<String>,
-        state: impl Into<serde_json::Value>,
-        questions: IndexMap<String, Question>,
-    ) -> Self {
-        Self {
-            model: Some(model.into()),
-            state: state.into(),
-            questions,
-            gating: None,
-            auto_hierarchical: None,
-            state_hash: None,
-        }
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
     }
 
     /// 透過的粗密階層ルーティングの有効/無効を指定してリクエストを作成する。
@@ -511,99 +501,9 @@ impl SystemOneResponse {
 }
 
 /// 単一 `State` に対する一括バッチ質問リクエストペイロード (`POST /v1/systemone/state-batch`)。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub struct StateBatchRequest {
-    /// 使用するローカルモデル識別子 (任意)。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-
-    /// 判断の材料となる単一の長文コンテキストデータ。
-    #[cfg_attr(feature = "openapi", schema(value_type = Object))]
-    pub state: serde_json::Value,
-
-    /// 評価対象となる複数質問群のマップ (キーは質問識別子)。
-    pub questions: IndexMap<String, Question>,
-
-    /// 確信度ゲーティング処理の設定パラメータ (任意)。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gating: Option<GatingConfig>,
-
-    /// 候補数 $K > 16$ の `Choice` 質問に対する透過的粗密階層ルーティングの制御フラグ (任意)。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auto_hierarchical: Option<bool>,
-
-    /// クライアント側事前計算または以前取得した `State` キャッシュキー (任意)。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state_hash: Option<String>,
-}
-
-impl StateBatchRequest {
-    /// 新規バッチリクエストを作成する。
-    pub fn new(state: impl Into<serde_json::Value>, questions: IndexMap<String, Question>) -> Self {
-        Self {
-            model: None,
-            state: state.into(),
-            questions,
-            gating: None,
-            auto_hierarchical: None,
-            state_hash: None,
-        }
-    }
-
-    /// `State` キャッシュキーを指定してバッチリクエストを作成する。
-    pub fn with_state_hash(mut self, state_hash: impl Into<String>) -> Self {
-        self.state_hash = Some(state_hash.into());
-        self
-    }
-
-    /// モデル名を指定してバッチリクエストを作成する。
-    pub fn with_model(mut self, model: impl Into<String>) -> Self {
-        self.model = Some(model.into());
-        self
-    }
-
-    /// ゲーティング設定を指定してバッチリクエストを作成する。
-    pub fn with_gating(mut self, gating: GatingConfig) -> Self {
-        self.gating = Some(gating);
-        self
-    }
-
-    /// 粗密階層ルーティング制御フラグを指定してバッチリクエストを作成する。
-    pub fn with_auto_hierarchical(mut self, auto_hierarchical: bool) -> Self {
-        self.auto_hierarchical = Some(auto_hierarchical);
-        self
-    }
-
-    /// リクエスト全体の整合性を検証する。
-    pub fn validate(&self) -> Result<()> {
-        DecisionRequest::validate(self)
-    }
-}
-
-impl DecisionRequest for StateBatchRequest {
-    fn questions(&self) -> &IndexMap<String, Question> {
-        &self.questions
-    }
-
-    fn gating(&self) -> Option<&GatingConfig> {
-        self.gating.as_ref()
-    }
-}
-
-impl From<StateBatchRequest> for SystemOneRequest {
-    /// `StateBatchRequest` から `SystemOneRequest` への変換を提供する。
-    fn from(req: StateBatchRequest) -> Self {
-        Self {
-            model: req.model,
-            state: req.state,
-            questions: req.questions,
-            gating: req.gating,
-            auto_hierarchical: req.auto_hierarchical,
-            state_hash: req.state_hash,
-        }
-    }
-}
+///
+/// `SystemOneRequest` と同一の構造・振る舞いを持つ型エイリアスである。
+pub type StateBatchRequest = SystemOneRequest;
 
 /// 単一 `State` に対する一括バッチ質問レスポンスペイロード (`POST /v1/systemone/state-batch`)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

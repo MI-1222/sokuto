@@ -9,7 +9,7 @@ use std::time::Instant;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
-use sokuto_core::schema::{StateBatchRequest, StateBatchResponse, SystemOneRequest};
+use sokuto_core::schema::{StateBatchRequest, StateBatchResponse};
 
 use crate::error::{ErrorResponse, ServerError};
 use crate::metrics::{record_http_duration, record_http_request};
@@ -48,10 +48,8 @@ pub async fn state_batch_handler(
         .map(str::to_string)
         .or_else(|| req.state_hash.clone());
 
-    let s1_req = SystemOneRequest::from(req);
-
     let inference_service = InferenceService::new(state);
-    let output = inference_service.execute(s1_req, client_hash_str).await?;
+    let output = inference_service.execute(req, client_hash_str).await?;
 
     let resp_headers = output.to_headers();
     let hex_key_opt = output.state_key.map(|k| format!("{:016x}", k));

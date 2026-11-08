@@ -73,13 +73,31 @@ pub fn evaluate_choice_with_buf(
         });
     }
 
+    if probs_buf.len() != logits.len() {
+        return Err(CoreError::MathError {
+            message: format!(
+                "出力バッファ長({out_len})がロジット長({logits_len})と一致しません。",
+                out_len = probs_buf.len(),
+                logits_len = logits.len()
+            ),
+        });
+    }
+
     // 候補数 1 の特異点処理。
     if k == 1 {
+        if !temperature.is_finite() || temperature <= 0.0 {
+            return Err(CoreError::MathError {
+                message: format!(
+                    "温度パラメータは正の有限実数である必要があります: {temperature}。"
+                ),
+            });
+        }
         if !logits[0].is_finite() {
             return Err(CoreError::MathError {
                 message: "ロジットに非有限値(NaNまたは無限大)が含まれています。".to_string(),
             });
         }
+        probs_buf[0] = 1.0;
         let (first_key, _) = map
             .get_index(0)
             .expect("k == 1 なので必ず先頭要素が存在する。");
@@ -356,6 +374,24 @@ mod tests {
         assert_eq!(answer.confidence, Some(1.0));
         let probs = answer.probabilities.unwrap();
         assert_eq!(probs["only_one"], 1.0);
+
+        // K=1 特異点において作業バッファ probs_buf が 1.0 に更新されることを検証する。
+        let mut probs_buf = vec![0.0];
+        let answer_buf = evaluate_choice_with_buf(&logits, &criteria, 1.0, &mut probs_buf).unwrap();
+        assert_eq!(answer_buf.choice.as_deref(), Some("only_one"));
+        assert_eq!(probs_buf[0], 1.0);
+
+        // バッファ長不一致の検証。
+        let mut empty_buf = vec![];
+        assert!(evaluate_choice_with_buf(&logits, &criteria, 1.0, &mut empty_buf).is_err());
+        let mut long_buf = vec![0.0, 0.0];
+        assert!(evaluate_choice_with_buf(&logits, &criteria, 1.0, &mut long_buf).is_err());
+
+        // 温度異常の検証。
+        let mut buf = vec![0.0];
+        assert!(evaluate_choice_with_buf(&logits, &criteria, 0.0, &mut buf).is_err());
+        assert!(evaluate_choice_with_buf(&logits, &criteria, -1.0, &mut buf).is_err());
+        assert!(evaluate_choice_with_buf(&logits, &criteria, f64::NAN, &mut buf).is_err());
     }
 
     #[test]

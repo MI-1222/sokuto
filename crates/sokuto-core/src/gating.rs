@@ -9,6 +9,7 @@
 //! - **`Fallback` ($< 0.50$)**: 安全弁フォールバック(情報不足・一様迷い時のデフォルト動作・棄却)。
 
 use std::fmt;
+use std::ops::{Deref, DerefMut};
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -66,14 +67,31 @@ impl fmt::Display for DecisionRoute {
     }
 }
 
-/// ゲーティング判定の設定パラメータ。
+/// デフォルトの真偽値 (true)。
+fn default_true() -> bool {
+    true
+}
+
+fn default_high_threshold() -> f64 {
+    DEFAULT_HIGH_CONFIDENCE_THRESHOLD
+}
+
+fn default_low_threshold() -> f64 {
+    DEFAULT_LOW_CONFIDENCE_THRESHOLD
+}
+
+fn default_top_margin_threshold() -> f64 {
+    DEFAULT_TOP_MARGIN_THRESHOLD
+}
+
+fn default_energy_threshold() -> f64 {
+    DEFAULT_ENERGY_THRESHOLD
+}
+
+/// 確信度ゲーティングおよび OOD 判定で用いる各種閾値パラメータ。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub struct GatingConfig {
-    /// ゲーティング処理を有効化するかどうか。
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-
+pub struct GatingThresholds {
     /// 自動実行 (AutoExecute) と判定するための確信度下限値 (デフォルト: 0.70)。
     #[serde(default = "default_high_threshold")]
     pub high_threshold: f64,
@@ -120,30 +138,9 @@ pub struct GatingConfig {
     pub ood_min_margin: Option<f64>,
 }
 
-fn default_true() -> bool {
-    true
-}
-
-fn default_high_threshold() -> f64 {
-    DEFAULT_HIGH_CONFIDENCE_THRESHOLD
-}
-
-fn default_low_threshold() -> f64 {
-    DEFAULT_LOW_CONFIDENCE_THRESHOLD
-}
-
-fn default_top_margin_threshold() -> f64 {
-    DEFAULT_TOP_MARGIN_THRESHOLD
-}
-
-fn default_energy_threshold() -> f64 {
-    DEFAULT_ENERGY_THRESHOLD
-}
-
-impl Default for GatingConfig {
+impl Default for GatingThresholds {
     fn default() -> Self {
         Self {
-            enabled: true,
             high_threshold: DEFAULT_HIGH_CONFIDENCE_THRESHOLD,
             low_threshold: DEFAULT_LOW_CONFIDENCE_THRESHOLD,
             top_margin_threshold: DEFAULT_TOP_MARGIN_THRESHOLD,
@@ -157,7 +154,21 @@ impl Default for GatingConfig {
     }
 }
 
-impl GatingConfig {
+impl GatingThresholds {
+    /// ゲーティング判定設定構造体へ変換する。
+    ///
+    /// # 引数
+    /// - `enabled`: ゲーティング処理を有効化するかどうかの真偽値。
+    ///
+    /// # 戻り値
+    /// - 閾値が反映された `GatingConfig`。
+    pub fn to_gating_config(&self, enabled: bool) -> GatingConfig {
+        GatingConfig {
+            enabled,
+            thresholds: self.clone(),
+        }
+    }
+
     /// 閾値設定値の数学的妥当性を検証する。
     pub fn validate(&self) -> Result<()> {
         if self.high_threshold < 0.0 || self.high_threshold > 1.0 {
@@ -231,6 +242,57 @@ impl GatingConfig {
             });
         }
         Ok(())
+    }
+}
+
+/// ゲーティング判定の設定パラメータ。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct GatingConfig {
+    /// ゲーティング処理を有効化するかどうか。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// ゲーティング判定用閾値パラメータ群。
+    #[serde(flatten)]
+    pub thresholds: GatingThresholds,
+}
+
+impl Default for GatingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            thresholds: GatingThresholds::default(),
+        }
+    }
+}
+
+impl Deref for GatingConfig {
+    type Target = GatingThresholds;
+
+    fn deref(&self) -> &Self::Target {
+        &self.thresholds
+    }
+}
+
+impl DerefMut for GatingConfig {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.thresholds
+    }
+}
+
+impl GatingConfig {
+    /// 有効フラグと閾値設定から新規 `GatingConfig` を生成する。
+    pub fn new(enabled: bool, thresholds: GatingThresholds) -> Self {
+        Self {
+            enabled,
+            thresholds,
+        }
+    }
+
+    /// 閾値設定値の数学的妥当性を検証する。
+    pub fn validate(&self) -> Result<()> {
+        self.thresholds.validate()
     }
 }
 
@@ -709,17 +771,22 @@ mod tests {
 
         let invalid_config = GatingConfig {
             enabled: true,
-            high_threshold: 0.30,
-            low_threshold: 0.50,
-            top_margin_threshold: 0.15,
-            ood_enabled: true,
-            energy_threshold: -1.0,
-            ..GatingConfig::default()
+            thresholds: GatingThresholds {
+                high_threshold: 0.30,
+                low_threshold: 0.50,
+                top_margin_threshold: 0.15,
+                ood_enabled: true,
+                energy_threshold: -1.0,
+                ..GatingThresholds::default()
+            },
         };
         assert!(invalid_config.validate().is_err());
 
         let invalid_energy_config = GatingConfig {
-            energy_threshold: f64::NAN,
+            thresholds: GatingThresholds {
+                energy_threshold: f64::NAN,
+                ..GatingThresholds::default()
+            },
             ..GatingConfig::default()
         };
         assert!(invalid_energy_config.validate().is_err());
@@ -921,7 +988,10 @@ mod tests {
         let answer = Answer::choice("tech_support", probs, 0.90);
 
         let config = GatingConfig {
-            ood_enabled: false,
+            thresholds: GatingThresholds {
+                ood_enabled: false,
+                ..Default::default()
+            },
             ..Default::default()
         };
 

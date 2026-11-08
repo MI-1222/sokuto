@@ -306,12 +306,14 @@ mod tests {
         // 2. 明示指定された場合はそれを優先
         let explicit = GatingConfig {
             enabled: false,
-            high_threshold: 0.90,
-            low_threshold: 0.40,
-            top_margin_threshold: 0.20,
-            ood_enabled: true,
-            energy_threshold: -1.0,
-            ..GatingConfig::default()
+            thresholds: GatingThresholds {
+                high_threshold: 0.90,
+                low_threshold: 0.40,
+                top_margin_threshold: 0.20,
+                ood_enabled: true,
+                energy_threshold: -1.0,
+                ..GatingThresholds::default()
+            },
         };
         let resolved_explicit = resolve_gating_config(Some(&explicit), &calib);
         assert!(!resolved_explicit.enabled);

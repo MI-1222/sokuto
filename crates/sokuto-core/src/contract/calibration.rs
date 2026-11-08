@@ -7,10 +7,9 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
-use crate::gating::{
-    DEFAULT_ENERGY_THRESHOLD, DEFAULT_HIGH_CONFIDENCE_THRESHOLD, DEFAULT_LOW_CONFIDENCE_THRESHOLD,
-    DEFAULT_TOP_MARGIN_THRESHOLD, GatingConfig,
-};
+use crate::gating::GatingConfig;
+
+pub use crate::gating::GatingThresholds;
 use crate::schema::QuestionType;
 
 /// 候補数バケットに基づく温度係数マップ。
@@ -49,109 +48,6 @@ impl Default for TemperatureMap {
             choice,
             score,
             noul: 1.0,
-        }
-    }
-}
-
-/// ゲーティング判定用閾値設定構造体。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GatingThresholds {
-    /// 高確信度下限閾値 (自動実行境界)。
-    #[serde(default = "default_high_threshold")]
-    pub high_threshold: f64,
-
-    /// 中確信度下限閾値 (確認要求境界)。
-    #[serde(default = "default_low_threshold")]
-    pub low_threshold: f64,
-
-    /// 上位2候補確率マージン閾値。
-    #[serde(default = "default_top_margin_threshold")]
-    pub top_margin_threshold: f64,
-
-    /// OOD 安全弁を有効化するかどうか (デフォルト: true)。
-    #[serde(default = "default_true")]
-    pub ood_enabled: bool,
-
-    /// OOD 判定用の正規化自由エネルギー閾値 (デフォルト: -1.0)。
-    #[serde(default = "default_energy_threshold")]
-    pub energy_threshold: f64,
-
-    /// OOD 自由エネルギー算出専用の温度パラメータ。
-    ///
-    /// Softmax 確率較正温度とは独立に、低発火・高コントラストな自由エネルギーを算出するために使用する。
-    /// 未指定時は各バケットの Softmax 温度にフォールバックする。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub energy_temperature: Option<f64>,
-
-    /// ハイブリッド OOD 判定用の緩和正規化自由エネルギー閾値 (任意)。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub loose_energy_threshold: Option<f64>,
-
-    /// ハイブリッド OOD 判定用の最小確信度閾値 (任意)。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ood_min_confidence: Option<f64>,
-
-    /// ハイブリッド OOD 判定用の最小マージン閾値 (任意)。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ood_min_margin: Option<f64>,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_high_threshold() -> f64 {
-    DEFAULT_HIGH_CONFIDENCE_THRESHOLD
-}
-
-fn default_low_threshold() -> f64 {
-    DEFAULT_LOW_CONFIDENCE_THRESHOLD
-}
-
-fn default_top_margin_threshold() -> f64 {
-    DEFAULT_TOP_MARGIN_THRESHOLD
-}
-
-fn default_energy_threshold() -> f64 {
-    DEFAULT_ENERGY_THRESHOLD
-}
-
-impl Default for GatingThresholds {
-    fn default() -> Self {
-        Self {
-            high_threshold: DEFAULT_HIGH_CONFIDENCE_THRESHOLD,
-            low_threshold: DEFAULT_LOW_CONFIDENCE_THRESHOLD,
-            top_margin_threshold: DEFAULT_TOP_MARGIN_THRESHOLD,
-            ood_enabled: true,
-            energy_threshold: DEFAULT_ENERGY_THRESHOLD,
-            energy_temperature: None,
-            loose_energy_threshold: None,
-            ood_min_confidence: None,
-            ood_min_margin: None,
-        }
-    }
-}
-
-impl GatingThresholds {
-    /// ゲーティング判定設定構造体へ変換する。
-    ///
-    /// # 引数
-    /// - `enabled`: ゲーティング処理を有効化するかどうかの真偽値。
-    ///
-    /// # 戻り値
-    /// - 閾値が反映された `GatingConfig`。
-    pub fn to_gating_config(&self, enabled: bool) -> GatingConfig {
-        GatingConfig {
-            enabled,
-            high_threshold: self.high_threshold,
-            low_threshold: self.low_threshold,
-            top_margin_threshold: self.top_margin_threshold,
-            ood_enabled: self.ood_enabled,
-            energy_threshold: self.energy_threshold,
-            energy_temperature: self.energy_temperature,
-            loose_energy_threshold: self.loose_energy_threshold,
-            ood_min_confidence: self.ood_min_confidence,
-            ood_min_margin: self.ood_min_margin,
         }
     }
 }
@@ -284,6 +180,10 @@ fn matches_bucket(expr: &str, count: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gating::{
+        DEFAULT_HIGH_CONFIDENCE_THRESHOLD, DEFAULT_LOW_CONFIDENCE_THRESHOLD,
+        DEFAULT_TOP_MARGIN_THRESHOLD,
+    };
 
     #[test]
     fn test_bucket_matching() {

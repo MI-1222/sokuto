@@ -13,7 +13,7 @@ use http_body_util::BodyExt;
 use indexmap::IndexMap;
 use serde_json::Value;
 use sokuto_core::contract::calibration::CalibrationConfig;
-use sokuto_core::gating::{DecisionRoute, GatingConfig};
+use sokuto_core::gating::{DecisionRoute, GatingConfig, GatingThresholds};
 use sokuto_core::schema::{Criteria, Question, SystemOneRequest, SystemOneResponse};
 use sokuto_runtime::engine::{CoarseToFineConfig, InferenceEngine, SessionConfig};
 use sokuto_runtime::tokenizer::JevTokenizer;
@@ -99,12 +99,14 @@ async fn test_gating_auto_execute_routing() {
     // テスト用ダミーモデルの実効確信度 (約0.0034) に基づき、AutoExecute 領域 (>= 0.002) を指定
     let auto_gating = GatingConfig {
         enabled: true,
-        high_threshold: 0.002,
-        low_threshold: 0.001,
-        top_margin_threshold: 0.0,
-        ood_enabled: false,
-        energy_threshold: 100.0,
-        ..GatingConfig::default()
+        thresholds: GatingThresholds {
+            high_threshold: 0.002,
+            low_threshold: 0.001,
+            top_margin_threshold: 0.0,
+            ood_enabled: false,
+            energy_threshold: 100.0,
+            ..GatingThresholds::default()
+        },
     };
 
     let req_payload = SystemOneRequest::new(
@@ -173,12 +175,14 @@ async fn test_gating_confirm_or_escalate_with_system2_context() {
     // テストモデルの確信度 (~0.9968) が確認要求境界 [0.00005, 0.998) に入るよう閾値を設定
     let strict_gating = GatingConfig {
         enabled: true,
-        high_threshold: 0.998,
-        low_threshold: 0.00005,
-        top_margin_threshold: 0.90,
-        ood_enabled: false,
-        energy_threshold: 100.0,
-        ..GatingConfig::default()
+        thresholds: GatingThresholds {
+            high_threshold: 0.998,
+            low_threshold: 0.00005,
+            top_margin_threshold: 0.90,
+            ood_enabled: false,
+            energy_threshold: 100.0,
+            ..GatingThresholds::default()
+        },
     };
 
     let mut req_payload = SystemOneRequest::new(

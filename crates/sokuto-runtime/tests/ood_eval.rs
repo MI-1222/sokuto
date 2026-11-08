@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 use sokuto_core::contract::calibration::CalibrationConfig;
-use sokuto_core::gating::GatingConfig;
+use sokuto_core::gating::{GatingConfig, GatingThresholds};
 use sokuto_core::schema::{Answer, Question};
 use sokuto_runtime::engine::coarse::CoarseToFineConfig;
 use sokuto_runtime::engine::{InferenceEngine, SessionConfig};
@@ -373,13 +373,15 @@ fn analyze_model_energy_distribution(
     // ゲーティング閾値は十分に高く設定し、すべてのサンプルで素の energy 値を取得する
     let gating_config = GatingConfig {
         enabled: true,
-        high_threshold: 0.70,
-        low_threshold: 0.35,
-        top_margin_threshold: 0.15,
-        ood_enabled: true,
-        energy_temperature: None,
-        energy_threshold: 100.0,
-        ..GatingConfig::default()
+        thresholds: GatingThresholds {
+            high_threshold: 0.70,
+            low_threshold: 0.35,
+            top_margin_threshold: 0.15,
+            ood_enabled: true,
+            energy_temperature: None,
+            energy_threshold: 100.0,
+            ..GatingThresholds::default()
+        },
     };
 
     println!("\n================================================================================");

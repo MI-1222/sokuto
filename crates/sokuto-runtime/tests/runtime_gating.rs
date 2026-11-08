@@ -97,12 +97,14 @@ fn test_single_question_gating() {
     // 2. 明示的な GatingConfig による上書き (AutoExecute の誘導)
     let auto_gating = GatingConfig {
         enabled: true,
-        high_threshold: 0.001,
-        low_threshold: 0.0005,
-        top_margin_threshold: 0.0,
-        ood_enabled: false,
-        energy_threshold: 100.0,
-        ..GatingConfig::default()
+        thresholds: GatingThresholds {
+            high_threshold: 0.001,
+            low_threshold: 0.0005,
+            top_margin_threshold: 0.0,
+            ood_enabled: false,
+            energy_threshold: 100.0,
+            ..GatingThresholds::default()
+        },
     };
     let answer_auto = engine
         .evaluate_question_coarse_to_fine_with_gating(
@@ -164,12 +166,14 @@ fn test_batch_and_chunked_gating() {
     // 確信度境界を厳格にして ConfirmOrEscalate を誘導
     let strict_gating = GatingConfig {
         enabled: true,
-        high_threshold: 0.9999,
-        low_threshold: 0.00001,
-        top_margin_threshold: 0.9999,
-        ood_enabled: false,
-        energy_threshold: 100.0,
-        ..GatingConfig::default()
+        thresholds: GatingThresholds {
+            high_threshold: 0.9999,
+            low_threshold: 0.00001,
+            top_margin_threshold: 0.9999,
+            ood_enabled: false,
+            energy_threshold: 100.0,
+            ..GatingThresholds::default()
+        },
     };
 
     // 通常バッチ推論でのゲーティング
@@ -259,12 +263,14 @@ fn test_coarse_to_fine_gating_and_reconstruction() {
 
     let gating_config = GatingConfig {
         enabled: true,
-        high_threshold: 0.70,
-        low_threshold: 0.35,
-        top_margin_threshold: 0.15,
-        ood_enabled: true,
-        energy_threshold: -1.0,
-        ..GatingConfig::default()
+        thresholds: GatingThresholds {
+            high_threshold: 0.70,
+            low_threshold: 0.35,
+            top_margin_threshold: 0.15,
+            ood_enabled: true,
+            energy_threshold: -1.0,
+            ..GatingThresholds::default()
+        },
     };
 
     let answers = engine
@@ -329,12 +335,14 @@ fn test_runtime_energy_ood_circuit_breaker() {
     // 正規化エネルギー閾値を -50.0 (非常に低い値) に設定すると、通常の推論ロジットでも energy > threshold となり OOD 検知される
     let strict_ood_config = GatingConfig {
         enabled: true,
-        high_threshold: 0.10, // 確信度条件は緩い
-        low_threshold: 0.05,
-        top_margin_threshold: 0.0,
-        ood_enabled: true,
-        energy_threshold: -50.0, // 極めて厳しいエネルギー閾値 -> 強制 OOD
-        ..GatingConfig::default()
+        thresholds: GatingThresholds {
+            high_threshold: 0.10, // 確信度条件は緩い
+            low_threshold: 0.05,
+            top_margin_threshold: 0.0,
+            ood_enabled: true,
+            energy_threshold: -50.0, // 極めて厳しいエネルギー閾値 -> 強制 OOD
+            ..GatingThresholds::default()
+        },
     };
 
     let answer_ood = engine
@@ -379,12 +387,14 @@ fn test_runtime_energy_ood_circuit_breaker() {
     // 2. ood_enabled = false で OOD 安全弁を無効化したケース
     let disabled_ood_config = GatingConfig {
         enabled: true,
-        high_threshold: 0.10,
-        low_threshold: 0.05,
-        top_margin_threshold: 0.0,
-        ood_enabled: false,
-        energy_threshold: -50.0,
-        ..GatingConfig::default()
+        thresholds: GatingThresholds {
+            high_threshold: 0.10,
+            low_threshold: 0.05,
+            top_margin_threshold: 0.0,
+            ood_enabled: false,
+            energy_threshold: -50.0,
+            ..GatingThresholds::default()
+        },
     };
 
     let answer_disabled = engine

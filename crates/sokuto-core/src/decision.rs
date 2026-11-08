@@ -70,6 +70,11 @@ pub fn evaluate_choice_with_buf(
 
     // 候補数 1 の特異点処理。
     if k == 1 {
+        if !logits[0].is_finite() {
+            return Err(CoreError::MathError {
+                message: "ロジットに非有限値(NaNまたは無限大)が含まれています。".to_string(),
+            });
+        }
         let (first_key, _) = map
             .get_index(0)
             .expect("k == 1 なので必ず先頭要素が存在する。");
@@ -369,6 +374,20 @@ mod tests {
         // 不正な criteria 種別 (List や None)
         assert!(evaluate_choice(&logits, &Criteria::List(vec!["A".to_string()]), 1.0).is_err());
         assert!(evaluate_choice(&logits, &Criteria::None, 1.0).is_err());
+
+        // K=1 特異点における非有限値(NaN, Inf, -Inf)のエラー検出。
+        assert!(matches!(
+            evaluate_choice(&[f64::NAN], &criteria, 1.0),
+            Err(CoreError::MathError { .. })
+        ));
+        assert!(matches!(
+            evaluate_choice(&[f64::INFINITY], &criteria, 1.0),
+            Err(CoreError::MathError { .. })
+        ));
+        assert!(matches!(
+            evaluate_choice(&[f64::NEG_INFINITY], &criteria, 1.0),
+            Err(CoreError::MathError { .. })
+        ));
     }
 
     #[test]

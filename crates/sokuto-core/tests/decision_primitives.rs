@@ -6,7 +6,7 @@
 use indexmap::IndexMap;
 use serde_json::json;
 use sokuto_core::{
-    CalibrationConfig, Criteria, Question, SystemOneResponse, Usage, evaluate_choice,
+    CalibrationConfig, CoreError, Criteria, Question, SystemOneResponse, Usage, evaluate_choice,
     evaluate_noul, evaluate_question, evaluate_score,
 };
 
@@ -45,10 +45,25 @@ fn test_choice_comprehensive() {
     // 3. 単一候補 (K=1) のエッジケース: 確信度 1.0、確率 1.0
     let mut single_map = IndexMap::new();
     single_map.insert("only".to_string(), "唯一の選択肢".to_string());
-    let ans_single = evaluate_choice(&[5.0], &Criteria::Map(single_map), 1.0).unwrap();
+    let criteria_single = Criteria::Map(single_map);
+    let ans_single = evaluate_choice(&[5.0], &criteria_single, 1.0).unwrap();
     assert_eq!(ans_single.choice.as_deref(), Some("only"));
     assert_eq!(ans_single.confidence, Some(1.0));
     assert_eq!(ans_single.probabilities.unwrap()["only"], 1.0);
+
+    // K=1 特異点における非有限値 (NaN, Inf, -Inf) のエラー検出。
+    assert!(matches!(
+        evaluate_choice(&[f64::NAN], &criteria_single, 1.0),
+        Err(CoreError::MathError { .. })
+    ));
+    assert!(matches!(
+        evaluate_choice(&[f64::INFINITY], &criteria_single, 1.0),
+        Err(CoreError::MathError { .. })
+    ));
+    assert!(matches!(
+        evaluate_choice(&[f64::NEG_INFINITY], &criteria_single, 1.0),
+        Err(CoreError::MathError { .. })
+    ));
 }
 
 /// Score プリミティブの総合評価テスト。

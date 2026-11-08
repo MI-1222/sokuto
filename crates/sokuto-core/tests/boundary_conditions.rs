@@ -153,6 +153,20 @@ mod structural_bounds {
         let probs = answer.probabilities.unwrap();
         assert_eq!(probs.len(), 1);
         assert_eq!(probs.get("only").copied(), Some(1.0));
+
+        // K=1 特異点における非有限値 (NaN, ±Inf) のバリデーション。
+        assert!(matches!(
+            evaluate_choice(&[f64::NAN], &criteria, 1.0),
+            Err(CoreError::MathError { .. })
+        ));
+        assert!(matches!(
+            evaluate_choice(&[f64::INFINITY], &criteria, 1.0),
+            Err(CoreError::MathError { .. })
+        ));
+        assert!(matches!(
+            evaluate_choice(&[f64::NEG_INFINITY], &criteria, 1.0),
+            Err(CoreError::MathError { .. })
+        ));
     }
 
     #[test]

@@ -398,6 +398,11 @@ pub fn expected_score(probabilities: &[f64]) -> Result<f64> {
 
     let mut score = 0.0;
     for (k, &p) in probabilities.iter().enumerate() {
+        if !p.is_finite() {
+            return Err(CoreError::MathError {
+                message: "確率値に非有限値(NaNまたは無限大)が含まれています。".to_string(),
+            });
+        }
         if p < 0.0 {
             return Err(CoreError::MathError {
                 message: format!("負の確率値が含まれています: {p}。"),
@@ -418,6 +423,16 @@ pub fn score_variance(probabilities: &[f64]) -> Result<f64> {
 
     let mut variance = 0.0;
     for (k, &p) in probabilities.iter().enumerate() {
+        if !p.is_finite() {
+            return Err(CoreError::MathError {
+                message: "確率値に非有限値(NaNまたは無限大)が含まれています。".to_string(),
+            });
+        }
+        if p < 0.0 {
+            return Err(CoreError::MathError {
+                message: format!("負の確率値が含まれています: {p}。"),
+            });
+        }
         let diff = (k as f64) - mean;
         variance += diff * diff * p;
     }
@@ -529,6 +544,11 @@ pub fn bimodality_coefficient(probabilities: &[f64]) -> Result<f64> {
     let mut mu4 = 0.0;
 
     for (k, &p) in probabilities.iter().enumerate() {
+        if !p.is_finite() {
+            return Err(CoreError::MathError {
+                message: "確率値に非有限値(NaNまたは無限大)が含まれています。".to_string(),
+            });
+        }
         if p < 0.0 {
             return Err(CoreError::MathError {
                 message: format!("負の確率値が含まれています: {p}。"),
@@ -849,6 +869,53 @@ mod tests {
         let score = expected_score(&probs).unwrap();
         let expected = 0.0 * 0.1 + 1.0 * 0.2 + 2.0 * 0.7;
         assert!((score - expected).abs() < 1e-6);
+
+        // 異常系: 段階数不足
+        assert!(expected_score(&[]).is_err());
+        assert!(expected_score(&[1.0]).is_err());
+
+        // 異常系: 負の確率値
+        assert!(expected_score(&[-0.1, 1.1]).is_err());
+        assert!(expected_score(&[0.5, -0.5]).is_err());
+    }
+
+    #[test]
+    fn test_score_non_finite_inputs() {
+        // 先頭、中間、末尾に非有限値(NaN, +Inf, -Inf)が含まれる場合の捕捉を検証する。
+        let test_cases = vec![
+            vec![f64::NAN, 0.5, 0.5],
+            vec![0.5, f64::NAN, 0.5],
+            vec![0.5, 0.5, f64::NAN],
+            vec![f64::INFINITY, 0.5, 0.5],
+            vec![0.5, f64::INFINITY, 0.5],
+            vec![0.5, 0.5, f64::INFINITY],
+            vec![f64::NEG_INFINITY, 0.5, 0.5],
+            vec![0.5, f64::NEG_INFINITY, 0.5],
+            vec![0.5, 0.5, f64::NEG_INFINITY],
+        ];
+
+        for (i, case) in test_cases.iter().enumerate() {
+            assert!(
+                expected_score(case).is_err(),
+                "expected_score ケース {i} で非有限値がすり抜けました: {case:?}。"
+            );
+            assert!(
+                score_variance(case).is_err(),
+                "score_variance ケース {i} で非有限値がすり抜けました: {case:?}。"
+            );
+            assert!(
+                bimodality_coefficient(case).is_err(),
+                "bimodality_coefficient ケース {i} で非有限値がすり抜けました: {case:?}。"
+            );
+            assert!(
+                normalized_variance_confidence(case).is_err(),
+                "normalized_variance_confidence ケース {i} で非有限値がすり抜けました: {case:?}。"
+            );
+            assert!(
+                score_variance_ratio(case).is_err(),
+                "score_variance_ratio ケース {i} で非有限値がすり抜けました: {case:?}。"
+            );
+        }
     }
 
     #[test]

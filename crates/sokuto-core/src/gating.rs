@@ -603,11 +603,7 @@ pub fn evaluate_answer_gating_with_energy(
                     probability: p,
                 })
                 .collect();
-            candidates.sort_by(|a, b| {
-                b.probability
-                    .partial_cmp(&a.probability)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            candidates.sort_by(|a, b| b.probability.total_cmp(&a.probability));
         } else if let Some(p_true) = answer.noul {
             let p_false = (1.0 - p_true).clamp(0.0, 1.0);
             if p_true >= p_false {

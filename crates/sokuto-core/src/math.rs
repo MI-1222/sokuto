@@ -132,43 +132,33 @@ pub fn softmax(logits: &[f64], temperature: f64) -> Result<Vec<f64>> {
     Ok(probs)
 }
 
-/// 確率分布から候補数 $K$ に非依存な正規化シャノンエントロピー $H_{\text{norm}}(p) \in [0.0, 1.0]$ を算出する。
+/// 任意の確率値イテレータから候補数 $K$ に非依存な正規化シャノンエントロピー $H_{\text{norm}}(p) \in [0.0, 1.0]$ を単一パス走査で算出する。
 ///
 /// # 数理仕様
 /// $$H_{\text{norm}}(p) = \begin{cases} 0.0 & (K = 1) \\ \frac{-\sum_{k=1}^K p_k \ln p_k}{\ln K} & (K \ge 2) \end{cases}$$
 ///
+/// - $O(K)$ 単一パス走査により、ヒープメモリ割り当て(ゼロアロケーション)で計算する。
 /// - $p_k \le 0.0$ の要素は情報量 $0 \ln 0 = 0$ として対数計算をスキップする。
+/// - $K=0$ の場合は空配列エラーとして `CoreError::MathError` を返却する。
 /// - $K=1$ の特異点ではゼロ除算を回避し、決定的な $0.0$(不確実性なし)を即座に返却する。
+/// - 非有限値(NaNまたは無限大)や負の確率値が含まれる場合は `CoreError::MathError` を返却する。
 /// - 戻り値は浮動小数点誤差を考慮して `[0.0, 1.0]` の閉区間にクランプされる。
 ///
 /// # 引数
-/// - `probabilities`: 各候補の確率分布スライス(`f64`)。
+/// - `iter`: 各候補の確率値(`f64` または `&f64`)を提供するイテレータ。
 ///
 /// # 戻り値
-/// - 成功時は `[0.0, 1.0]` にクランプされた正規化エントロピー、不正時は `CoreError::MathError`。
-pub fn normalized_entropy(probabilities: &[f64]) -> Result<f64> {
-    let k = probabilities.len();
-    if k == 0 {
-        return Err(CoreError::MathError {
-            message: "確率分布配列が空です。".to_string(),
-        });
-    }
-    if k == 1 {
-        if !probabilities[0].is_finite() {
-            return Err(CoreError::MathError {
-                message: "確率値に非有限値(NaNまたは無限大)が含まれています。".to_string(),
-            });
-        }
-        if probabilities[0] < 0.0 {
-            return Err(CoreError::MathError {
-                message: format!("負の確率値が含まれています: {}。", probabilities[0]),
-            });
-        }
-        return Ok(0.0);
-    }
-
+/// - 成功時は `[0.0, 1.0]` にクランプされた正規化エントロピー、不正時または空時は `CoreError::MathError`。
+pub fn normalized_entropy_iter<I>(iter: I) -> Result<f64>
+where
+    I: IntoIterator,
+    I::Item: Borrow<f64>,
+{
+    let mut count: usize = 0;
     let mut entropy = 0.0;
-    for &p in probabilities {
+
+    for item in iter {
+        let p = *item.borrow();
         if !p.is_finite() {
             return Err(CoreError::MathError {
                 message: "確率値に非有限値(NaNまたは無限大)が含まれています。".to_string(),
@@ -179,18 +169,47 @@ pub fn normalized_entropy(probabilities: &[f64]) -> Result<f64> {
                 message: format!("負の確率値が含まれています: {p}。"),
             });
         }
+
+        count += 1;
         if p > 0.0 {
             entropy -= p * p.ln();
         }
     }
 
-    let max_entropy = (k as f64).ln();
-    if max_entropy <= 0.0 {
-        return Ok(0.0);
-    }
+    match count {
+        0 => Err(CoreError::MathError {
+            message: "確率分布配列が空です。".to_string(),
+        }),
+        1 => Ok(0.0),
+        _ => {
+            let max_entropy = (count as f64).ln();
+            if max_entropy <= 0.0 {
+                return Ok(0.0);
+            }
 
-    let h_norm = entropy / max_entropy;
-    Ok(h_norm.clamp(0.0, 1.0))
+            let h_norm = entropy / max_entropy;
+            Ok(h_norm.clamp(0.0, 1.0))
+        }
+    }
+}
+
+/// 確率分布から候補数 $K$ に非依存な正規化シャノンエントロピー $H_{\text{norm}}(p) \in [0.0, 1.0]$ を算出する。
+///
+/// # 数理仕様
+/// $$H_{\text{norm}}(p) = \begin{cases} 0.0 & (K = 1) \\ \frac{-\sum_{k=1}^K p_k \ln p_k}{\ln K} & (K \ge 2) \end{cases}$$
+///
+/// - [`normalized_entropy_iter`] を呼び出すゼロコストラッパーとして動作する。
+/// - $p_k \le 0.0$ の要素は情報量 $0 \ln 0 = 0$ として対数計算をスキップする。
+/// - $K=1$ の特異点ではゼロ除算を回避し、決定的な $0.0$(不確実性なし)を即座に返却する。
+/// - 戻り値は浮動小数点誤差を考慮して `[0.0, 1.0]` の閉区間にクランプされる。
+///
+/// # 引数
+/// - `probabilities`: 各候補の確率分布スライス(`f64`)。
+///
+/// # 戻り値
+/// - 成功時は `[0.0, 1.0]` にクランプされた正規化エントロピー、不正時は `CoreError::MathError`。
+pub fn normalized_entropy(probabilities: &[f64]) -> Result<f64> {
+    normalized_entropy_iter(probabilities)
 }
 
 /// 任意の確率値イテレータから上位2候補の確率差(Top-Margin) $M(p) \in [0.0, 1.0]$ を単一パス走査で算出する。
@@ -1063,6 +1082,28 @@ mod tests {
         assert!(normalized_entropy(&[0.5, f64::NAN]).is_err());
         assert!(normalized_entropy(&[f64::INFINITY, 0.5]).is_err());
         assert!(normalized_entropy(&[f64::NAN]).is_err());
+    }
+
+    #[test]
+    fn test_normalized_entropy_iter() {
+        // 1. K=1 の特異点: 不確実性ゼロのため 0.0 を返却する。
+        assert_eq!(normalized_entropy_iter([1.0]).unwrap(), 0.0);
+        assert_eq!(normalized_entropy_iter(&[1.0][..]).unwrap(), 0.0);
+
+        // 2. イテレータ (値および参照) の透過的サポート。
+        let uniform2 = vec![0.5, 0.5];
+        assert!((normalized_entropy_iter(uniform2.iter()).unwrap() - 1.0).abs() < 1e-6);
+        assert!((normalized_entropy_iter(uniform2.clone()).unwrap() - 1.0).abs() < 1e-6);
+        assert!((normalized_entropy_iter(uniform2.into_iter()).unwrap() - 1.0).abs() < 1e-6);
+
+        // 3. 空イテレータの異常系。
+        let empty: [f64; 0] = [];
+        assert!(normalized_entropy_iter(empty).is_err());
+        assert!(normalized_entropy_iter(std::iter::empty::<f64>()).is_err());
+
+        // 4. 非有限値・負値の異常系。
+        assert!(normalized_entropy_iter([0.5, f64::NAN]).is_err());
+        assert!(normalized_entropy_iter([-0.1, 0.8]).is_err());
     }
 
     #[test]

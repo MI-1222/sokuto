@@ -15,7 +15,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
-use crate::math::top_margin_iter;
+use crate::math::{normalized_entropy_iter, top_margin_iter};
 use crate::schema::{Answer, Question, QuestionType};
 
 /// デフォルトの高確信度閾値 (自動実行境界)。
@@ -460,12 +460,11 @@ pub fn evaluate_answer_gating_with_energy(
         }
     });
 
-    // 分布エントロピー・散らばり指標の直接算出。
+    // ゼロアロケーション走査による分布エントロピー・散らばり指標の直接算出。
     let entropy = match question_type {
         Some(QuestionType::Choice) => {
             if let Some(probs) = &answer.probabilities {
-                let p_vals: Vec<f64> = probs.values().copied().collect();
-                crate::math::normalized_entropy(&p_vals).ok()
+                normalized_entropy_iter(probs.values()).ok()
             } else {
                 None
             }

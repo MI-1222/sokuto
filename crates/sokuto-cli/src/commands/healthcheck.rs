@@ -215,6 +215,32 @@ fn check_remaining(deadline: Instant, timeout_msg: &'static str) -> Result<Durat
     }
 }
 
+/// 次の候補アドレスへの非同期接続タスクを生成し、後続候補が存在するかどうかを返す。
+///
+/// 後続の候補アドレスが存在する場合は、
+/// 指定されたタイマーを接続試行遅延 (`CONNECTION_ATTEMPT_DELAY`) でリセットする。
+fn spawn_next_candidate<I>(
+    addrs: &mut std::iter::Peekable<I>,
+    join_set: &mut tokio::task::JoinSet<(SocketAddr, Result<TcpStream, std::io::Error>)>,
+    mut sleep: std::pin::Pin<&mut tokio::time::Sleep>,
+) -> bool
+where
+    I: Iterator<Item = SocketAddr>,
+{
+    if let Some(next_addr) = addrs.next() {
+        join_set.spawn(async move { (next_addr, TcpStream::connect(next_addr).await) });
+        let has_more = addrs.peek().is_some();
+        if has_more {
+            sleep
+                .as_mut()
+                .reset(tokio::time::Instant::now() + CONNECTION_ATTEMPT_DELAY);
+        }
+        has_more
+    } else {
+        false
+    }
+}
+
 /// 解決されたソケットアドレス一覧へ接続を試行し、最初に確立された TCP ストリームを返す。
 ///
 /// 複数アドレスが存在する場合、RFC 8305 (Happy Eyeballs v2) に基づき、
@@ -272,17 +298,7 @@ async fn connect_to_any(
                 ));
             }
             () = &mut sleep, if has_more => {
-                if let Some(next_addr) = addrs.next() {
-                    join_set.spawn(async move {
-                        (next_addr, TcpStream::connect(next_addr).await)
-                    });
-                    has_more = addrs.peek().is_some();
-                    if has_more {
-                        sleep.as_mut().reset(tokio::time::Instant::now() + CONNECTION_ATTEMPT_DELAY);
-                    }
-                } else {
-                    has_more = false;
-                }
+                has_more = spawn_next_candidate(&mut addrs, &mut join_set, sleep.as_mut());
             }
             res = join_set.join_next(), if !join_set.is_empty() => {
                 match res {
@@ -292,17 +308,8 @@ async fn connect_to_any(
                     Some(Ok((addr, Err(err)))) => {
                         last_err = Some(format!("{addr}: {err}"));
                         if has_more {
-                            if let Some(next_addr) = addrs.next() {
-                                join_set.spawn(async move {
-                                    (next_addr, TcpStream::connect(next_addr).await)
-                                });
-                                has_more = addrs.peek().is_some();
-                                if has_more {
-                                    sleep.as_mut().reset(tokio::time::Instant::now() + CONNECTION_ATTEMPT_DELAY);
-                                }
-                            } else {
-                                has_more = false;
-                            }
+                            has_more =
+                                spawn_next_candidate(&mut addrs, &mut join_set, sleep.as_mut());
                         }
                     }
                     Some(Err(join_err)) => {

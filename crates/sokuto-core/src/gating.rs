@@ -8,7 +8,7 @@
 //! - **`ConfirmOrEscalate` ($0.50 \dots 0.85$ または Margin $< 0.15$)**: 確認/二次検証要求(System 2 LLMへの委託または人手確認)。
 //! - **`Fallback` ($< 0.50$)**: 安全弁フォールバック(情報不足・一様迷い時のデフォルト動作・棄却)。
 
-use std::fmt;
+use std::fmt::{self, Write};
 use std::ops::{Deref, DerefMut};
 
 use indexmap::IndexMap;
@@ -667,38 +667,28 @@ fn build_escalation_prompt(
     if candidates.len() >= 2 {
         let c1 = &candidates[0];
         let c2 = &candidates[1];
-        let p1_str = format!("{:.1}", c1.probability * 100.0);
-        let p2_str = format!("{:.1}", c2.probability * 100.0);
-        let m_str = match margin {
-            Some(m) => format!("(確率差: {:.1}%)", m * 100.0),
-            None => String::new(),
-        };
 
         let mut prompt = String::with_capacity(256);
-        prompt.push_str("質問「");
-        prompt.push_str(q_name);
-        prompt.push_str("」(");
-        prompt.push_str(instructions);
-        prompt.push_str(") について、System 1 の判定では候補「");
-        prompt.push_str(&c1.candidate);
-        prompt.push_str("」(確信度 ");
-        prompt.push_str(&p1_str);
-        prompt.push_str("%) と「");
-        prompt.push_str(&c2.candidate);
-        prompt.push_str("」(確信度 ");
-        prompt.push_str(&p2_str);
-        prompt.push_str("%) の間で迷いが生じています ");
-        prompt.push_str(&m_str);
+        let _ = write!(
+            prompt,
+            "質問「{q_name}」({instructions}) について、System 1 の判定では候補「{}」(確信度 {:.1}%) と「{}」(確信度 {:.1}%) の間で迷いが生じています ",
+            c1.candidate,
+            c1.probability * 100.0,
+            c2.candidate,
+            c2.probability * 100.0
+        );
+        if let Some(m) = margin {
+            let _ = write!(prompt, "(確率差: {:.1}%)", m * 100.0);
+        }
         prompt.push_str("。State コンテキストを精読し、思考連鎖 (Chain-of-Thought) に基づき最適な決定を行ってください。");
         return prompt;
     }
 
     let mut prompt = String::with_capacity(128);
-    prompt.push_str("質問「");
-    prompt.push_str(q_name);
-    prompt.push_str("」(");
-    prompt.push_str(instructions);
-    prompt.push_str(") について、System 1 の判定信頼性が低水準となっています。State コンテキストを精読し、論理的根拠に基づいて決定を下してください。");
+    let _ = write!(
+        prompt,
+        "質問「{q_name}」({instructions}) について、System 1 の判定信頼性が低水準となっています。State コンテキストを精読し、論理的根拠に基づいて決定を下してください。"
+    );
     prompt
 }
 

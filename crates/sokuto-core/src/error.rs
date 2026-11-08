@@ -4,6 +4,14 @@
 
 use thiserror::Error;
 
+/// 質問識別子(任意)に基づき、エラーメッセージ用のプレフィックス文字列を生成する。
+fn question_prefix(id: &Option<String>) -> String {
+    match id {
+        Some(qid) => format!("質問 '{qid}': "),
+        None => String::new(),
+    }
+}
+
 /// `sokuto-core` の標準結果型。
 pub type Result<T> = std::result::Result<T, CoreError>;
 
@@ -11,24 +19,37 @@ pub type Result<T> = std::result::Result<T, CoreError>;
 #[derive(Debug, Error, PartialEq)]
 pub enum CoreError {
     /// 選択肢の数が制限範囲外である場合のエラー(Choice 型は 1〜255 個)。
-    #[error("Choice 型の候補数は 1〜255 個である必要がありますが、{count} 個指定されました。")]
+    #[error(
+        "{prefix}Choice 型の候補数は 1〜255 個である必要がありますが、{count} 個指定されました。",
+        prefix = question_prefix(question_id)
+    )]
     InvalidChoiceCount {
+        /// 対象の質問識別子(任意)。
+        question_id: Option<String>,
         /// 指定された候補数。
         count: usize,
     },
 
     /// スコア評価尺度の段階数が範囲外である場合のエラー(Score 型は 2〜10 段階)。
-    #[error("Score 型の評価尺度数は 2〜10 段階である必要がありますが、{count} 個指定されました。")]
+    #[error(
+        "{prefix}Score 型の評価尺度数は 2〜10 段階である必要がありますが、{count} 個指定されました。",
+        prefix = question_prefix(question_id)
+    )]
     InvalidScoreLevelCount {
+        /// 対象の質問識別子(任意)。
+        question_id: Option<String>,
         /// 指定された段階数。
         count: usize,
     },
 
     /// 質問タイプに対する評価基準(Criteria)の形式が不一致である場合のエラー。
     #[error(
-        "{question_type} 型に対して不正な Criteria 形式が指定されました。期待値: {expected}、実際: {actual}。"
+        "{prefix}{question_type} 型に対して不正な Criteria 形式が指定されました。期待値: {expected}、実際: {actual}。",
+        prefix = question_prefix(question_id)
     )]
     InvalidCriteriaType {
+        /// 対象の質問識別子(任意)。
+        question_id: Option<String>,
         /// 対象の質問タイプ名。
         question_type: String,
         /// 期待される形式名。
@@ -38,8 +59,13 @@ pub enum CoreError {
     },
 
     /// 必須の評価基準(Criteria)が欠落している場合のエラー。
-    #[error("{question_type} 型には Criteria の指定が必須です。")]
+    #[error(
+        "{prefix}{question_type} 型には Criteria の指定が必須です。",
+        prefix = question_prefix(question_id)
+    )]
     MissingCriteria {
+        /// 対象の質問識別子(任意)。
+        question_id: Option<String>,
         /// 対象の質問タイプ名。
         question_type: String,
     },

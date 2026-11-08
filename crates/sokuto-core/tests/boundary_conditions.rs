@@ -195,7 +195,7 @@ mod structural_bounds {
         let err0 = evaluate_choice(&[], &Criteria::Map(empty_map), 1.0);
         assert!(matches!(
             err0,
-            Err(CoreError::InvalidChoiceCount { count: 0 })
+            Err(CoreError::InvalidChoiceCount { count: 0, .. })
         ));
 
         // K = 256 (上限超過異常系)
@@ -208,7 +208,7 @@ mod structural_bounds {
         let err256 = evaluate_choice(&logits256, &Criteria::Map(map256), 1.0);
         assert!(matches!(
             err256,
-            Err(CoreError::InvalidChoiceCount { count: 256 })
+            Err(CoreError::InvalidChoiceCount { count: 256, .. })
         ));
     }
 
@@ -230,7 +230,7 @@ mod structural_bounds {
         let err1 = evaluate_score(&[1.0], &crit1, 1.0);
         assert!(matches!(
             err1,
-            Err(CoreError::InvalidScoreLevelCount { count: 1 })
+            Err(CoreError::InvalidScoreLevelCount { count: 1, .. })
         ));
 
         // M = 11 (異常系上限超過)
@@ -239,7 +239,7 @@ mod structural_bounds {
         let err11 = evaluate_score(&logits11, &crit11, 1.0);
         assert!(matches!(
             err11,
-            Err(CoreError::InvalidScoreLevelCount { count: 11 })
+            Err(CoreError::InvalidScoreLevelCount { count: 11, .. })
         ));
     }
 

@@ -133,24 +133,30 @@ impl Question {
     }
 
     /// 質問スキーマの整合性を検証する。
-    pub fn validate(&self, _question_id: &str) -> Result<()> {
+    pub fn validate(&self, question_id: &str) -> Result<()> {
+        let qid = Some(question_id.to_string());
         match self.question_type {
             QuestionType::Choice => {
                 let criteria =
                     self.criteria
                         .as_ref()
                         .ok_or_else(|| CoreError::MissingCriteria {
+                            question_id: qid.clone(),
                             question_type: "choice".to_string(),
                         })?;
                 match criteria {
                     Criteria::Map(map) => {
                         let count = map.len();
                         if count == 0 || count > 255 {
-                            return Err(CoreError::InvalidChoiceCount { count });
+                            return Err(CoreError::InvalidChoiceCount {
+                                question_id: qid,
+                                count,
+                            });
                         }
                     }
                     Criteria::List(_) => {
                         return Err(CoreError::InvalidCriteriaType {
+                            question_id: qid,
                             question_type: "choice".to_string(),
                             expected: "Map (オブジェクト)",
                             actual: "List (配列)",
@@ -158,6 +164,7 @@ impl Question {
                     }
                     Criteria::None => {
                         return Err(CoreError::MissingCriteria {
+                            question_id: qid,
                             question_type: "choice".to_string(),
                         });
                     }
@@ -168,17 +175,22 @@ impl Question {
                     self.criteria
                         .as_ref()
                         .ok_or_else(|| CoreError::MissingCriteria {
+                            question_id: qid.clone(),
                             question_type: "score".to_string(),
                         })?;
                 match criteria {
                     Criteria::List(list) => {
                         let count = list.len();
                         if !(2..=10).contains(&count) {
-                            return Err(CoreError::InvalidScoreLevelCount { count });
+                            return Err(CoreError::InvalidScoreLevelCount {
+                                question_id: qid,
+                                count,
+                            });
                         }
                     }
                     Criteria::Map(_) => {
                         return Err(CoreError::InvalidCriteriaType {
+                            question_id: qid,
                             question_type: "score".to_string(),
                             expected: "List (配列)",
                             actual: "Map (オブジェクト)",
@@ -186,6 +198,7 @@ impl Question {
                     }
                     Criteria::None => {
                         return Err(CoreError::MissingCriteria {
+                            question_id: qid,
                             question_type: "score".to_string(),
                         });
                     }

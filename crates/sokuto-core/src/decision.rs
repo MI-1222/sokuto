@@ -42,6 +42,7 @@ pub fn evaluate_choice_with_buf(
         Criteria::Map(m) => m,
         Criteria::List(_) => {
             return Err(CoreError::InvalidCriteriaType {
+                question_id: None,
                 question_type: "choice".to_string(),
                 expected: "Map (オブジェクト)",
                 actual: "List (配列)",
@@ -49,6 +50,7 @@ pub fn evaluate_choice_with_buf(
         }
         Criteria::None => {
             return Err(CoreError::MissingCriteria {
+                question_id: None,
                 question_type: "choice".to_string(),
             });
         }
@@ -56,7 +58,10 @@ pub fn evaluate_choice_with_buf(
 
     let k = map.len();
     if k == 0 || k > 255 {
-        return Err(CoreError::InvalidChoiceCount { count: k });
+        return Err(CoreError::InvalidChoiceCount {
+            question_id: None,
+            count: k,
+        });
     }
 
     if logits.len() != k {
@@ -147,6 +152,7 @@ pub fn evaluate_score_with_buf(
         Criteria::List(l) => l,
         Criteria::Map(_) => {
             return Err(CoreError::InvalidCriteriaType {
+                question_id: None,
                 question_type: "score".to_string(),
                 expected: "List (配列)",
                 actual: "Map (オブジェクト)",
@@ -154,6 +160,7 @@ pub fn evaluate_score_with_buf(
         }
         Criteria::None => {
             return Err(CoreError::MissingCriteria {
+                question_id: None,
                 question_type: "score".to_string(),
             });
         }
@@ -161,7 +168,10 @@ pub fn evaluate_score_with_buf(
 
     let m = list.len();
     if !(2..=10).contains(&m) {
-        return Err(CoreError::InvalidScoreLevelCount { count: m });
+        return Err(CoreError::InvalidScoreLevelCount {
+            question_id: None,
+            count: m,
+        });
     }
 
     if logits.len() != m {
@@ -255,6 +265,7 @@ pub fn evaluate_question_with_buf(
                     .criteria
                     .as_ref()
                     .ok_or_else(|| CoreError::MissingCriteria {
+                        question_id: Some("evaluate_question".to_string()),
                         question_type: "choice".to_string(),
                     })?;
             let k = criteria.len();
@@ -267,6 +278,7 @@ pub fn evaluate_question_with_buf(
                     .criteria
                     .as_ref()
                     .ok_or_else(|| CoreError::MissingCriteria {
+                        question_id: Some("evaluate_question".to_string()),
                         question_type: "score".to_string(),
                     })?;
             let m = criteria.len();

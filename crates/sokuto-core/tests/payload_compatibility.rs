@@ -151,6 +151,7 @@ fn test_validation_choice_missing_criteria() {
     assert_eq!(
         request.validate().unwrap_err(),
         CoreError::MissingCriteria {
+            question_id: Some("category".to_string()),
             question_type: "choice".to_string(),
         }
     );
@@ -174,6 +175,7 @@ fn test_validation_choice_invalid_criteria_type() {
     assert_eq!(
         request.validate().unwrap_err(),
         CoreError::InvalidCriteriaType {
+            question_id: Some("category".to_string()),
             question_type: "choice".to_string(),
             expected: "Map (オブジェクト)",
             actual: "List (配列)",
@@ -199,7 +201,10 @@ fn test_validation_score_invalid_count() {
     let req_single: SystemOneRequest = serde_json::from_value(payload_single).unwrap();
     assert_eq!(
         req_single.validate().unwrap_err(),
-        CoreError::InvalidScoreLevelCount { count: 1 }
+        CoreError::InvalidScoreLevelCount {
+            question_id: Some("rating".to_string()),
+            count: 1,
+        }
     );
 
     // 段階数が 11 の場合
@@ -217,7 +222,10 @@ fn test_validation_score_invalid_count() {
     let req_eleven: SystemOneRequest = serde_json::from_value(payload_eleven).unwrap();
     assert_eq!(
         req_eleven.validate().unwrap_err(),
-        CoreError::InvalidScoreLevelCount { count: 11 }
+        CoreError::InvalidScoreLevelCount {
+            question_id: Some("rating".to_string()),
+            count: 11,
+        }
     );
 }
 

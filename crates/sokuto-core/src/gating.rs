@@ -418,6 +418,8 @@ pub fn evaluate_answer_gating(
 /// - 通常の確信度・マージン判定に先立ち、Energy-based OOD 安全弁 (Circuit Breaker) を評価する。
 /// - Choice 型において正規化自由エネルギー $E_{\text{norm}}$ が `config.energy_threshold` を超過した場合、
 ///   高確信度判定をショートサーキットし、強制的に `DecisionRoute::Fallback` へ降格する。
+/// - 内部でデフォルトの委託プロンプト案 (`prompt_template`) を自動生成する。
+/// - プロンプト生成をスキップしたい場合は [`evaluate_answer_gating_opts`] を使用する。
 ///
 /// # 引数
 /// - `answer`: 事後較正済みの判定結果。
@@ -434,6 +436,36 @@ pub fn evaluate_answer_gating_with_energy(
     question: Option<&Question>,
     config: &GatingConfig,
     energy: Option<f64>,
+) -> GatingMetadata {
+    evaluate_answer_gating_opts(answer, question_id, question, config, energy, true)
+}
+
+/// 単一の `Answer` に対し、自由エネルギー情報およびプロンプト生成要否を指定して確信度ゲーティング評価を実施する。
+///
+/// # 概要
+/// - `generate_prompt` に `false` を指定した場合、
+///   コア層でのデフォルトエスカレーションプロンプト文字列のヒープ確保をスキップし、
+///   `EscalationContext.prompt_template` を `None` とする。
+/// - ランタイム層等で上位のリッチプロンプト(State 文脈や高度な推論理由等を含むプロンプト)に、
+///   置換される前提の処理において、不要な二重アロケーションを抑止するために使用する。
+///
+/// # 引数
+/// - `answer`: 事後較正済みの判定結果。
+/// - `question_id`: 質問識別子(プロンプト構築用、任意)。
+/// - `question`: 質問定義(指示文やタイプ取得用、任意)。
+/// - `config`: ゲーティング設定。
+/// - `energy`: 算出された正規化自由エネルギー値 (任意)。
+/// - `generate_prompt`: デフォルトプロンプト案文字列を生成するかどうかのフラグ。
+///
+/// # 戻り値
+/// - 導出された `GatingMetadata`。
+pub fn evaluate_answer_gating_opts(
+    answer: &Answer,
+    question_id: Option<&str>,
+    question: Option<&Question>,
+    config: &GatingConfig,
+    energy: Option<f64>,
+    generate_prompt: bool,
 ) -> GatingMetadata {
     let conf = answer.effective_confidence().unwrap_or(0.0).clamp(0.0, 1.0);
 
@@ -642,13 +674,22 @@ pub fn evaluate_answer_gating_with_energy(
         }
 
         let top_candidates = candidates.iter().take(3).cloned().collect();
-        let prompt_template = build_escalation_prompt(question_id, question, &candidates, margin);
+        let prompt_template = if generate_prompt {
+            Some(build_escalation_prompt(
+                question_id,
+                question,
+                &candidates,
+                margin,
+            ))
+        } else {
+            None
+        };
 
         Some(EscalationContext {
             top_candidates,
             margin,
             uncertainty_reason: reason.clone(),
-            prompt_template: Some(prompt_template),
+            prompt_template,
         })
     } else {
         None
@@ -1056,5 +1097,31 @@ mod tests {
         assert_eq!(meta.margin, None);
         assert!(meta.escalation.is_none());
         assert!(meta.reason.contains("実効確信度"));
+    }
+
+    #[test]
+    fn test_evaluate_answer_gating_opts_prompt_suppression() {
+        // ConfirmOrEscalate 境界の判定結果を用意する。
+        let mut choice_probs = IndexMap::new();
+        choice_probs.insert("opt_a".to_string(), 0.60);
+        choice_probs.insert("opt_b".to_string(), 0.40);
+        let ans_choice = Answer::choice("opt_a", choice_probs, 0.60);
+
+        let config = GatingConfig::default();
+
+        // 1. generate_prompt = false の場合: prompt_template のアロケーションが抑止され None となる。
+        let meta_suppressed =
+            evaluate_answer_gating_opts(&ans_choice, Some("q_choice"), None, &config, None, false);
+        assert_eq!(meta_suppressed.route, DecisionRoute::ConfirmOrEscalate);
+        let esc_suppressed = meta_suppressed.escalation.as_ref().unwrap();
+        assert!(esc_suppressed.prompt_template.is_none());
+        assert_eq!(esc_suppressed.top_candidates.len(), 2);
+
+        // 2. generate_prompt = true の場合: デフォルトの prompt_template が生成される。
+        let meta_generated =
+            evaluate_answer_gating_opts(&ans_choice, Some("q_choice"), None, &config, None, true);
+        assert_eq!(meta_generated.route, DecisionRoute::ConfirmOrEscalate);
+        let esc_generated = meta_generated.escalation.as_ref().unwrap();
+        assert!(esc_generated.prompt_template.is_some());
     }
 }

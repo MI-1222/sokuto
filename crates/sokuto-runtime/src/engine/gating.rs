@@ -33,7 +33,7 @@ pub fn resolve_gating_config(
 }
 
 use crate::engine::escalation::build_rich_escalation_prompt;
-use sokuto_core::gating::evaluate_answer_gating_with_energy;
+use sokuto_core::gating::evaluate_answer_gating_opts;
 use sokuto_core::math::normalized_free_energy;
 use sokuto_core::schema::QuestionType;
 
@@ -116,8 +116,9 @@ pub fn apply_gating_to_answer_with_energy(
 ) {
     let config = resolve_gating_config(gating_config, calib_config);
     if config.enabled {
+        // 上位層で rich_escalation_prompt に置換されるため、コア層でのデフォルトプロンプト生成(二重アロケーション)を抑止する。
         let mut meta =
-            evaluate_answer_gating_with_energy(answer, question_id, question, &config, energy);
+            evaluate_answer_gating_opts(answer, question_id, question, &config, energy, false);
         if meta.route != DecisionRoute::AutoExecute {
             let rich_prompt = meta.escalation.as_ref().map(|esc| {
                 build_rich_escalation_prompt(

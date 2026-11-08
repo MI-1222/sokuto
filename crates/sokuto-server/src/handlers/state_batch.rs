@@ -48,14 +48,7 @@ pub async fn state_batch_handler(
         .map(str::to_string)
         .or_else(|| req.state_hash.clone());
 
-    let s1_req = SystemOneRequest {
-        model: req.model,
-        state: req.state,
-        questions: req.questions,
-        gating: req.gating,
-        auto_hierarchical: req.auto_hierarchical,
-        state_hash: req.state_hash,
-    };
+    let s1_req = SystemOneRequest::from(req);
 
     let inference_service = InferenceService::new(state);
     let output = inference_service.execute(s1_req, client_hash_str).await?;

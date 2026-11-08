@@ -199,6 +199,49 @@ impl Question {
     }
 }
 
+/// 質問群マップおよび任意のゲーティング設定の整合性を検証する共通バリデータ。
+///
+/// # 概要
+/// - 質問群が空配列の場合は [`CoreError::EmptyQuestions`] を返却する。
+/// - 含まれる各質問について、種別ごとの基準定義 ([`Question::validate`]) を検証する。
+/// - 確信度ゲーティング設定が存在する場合は、各閾値の妥当性 ([`GatingConfig::validate`]) を検証する。
+///
+/// # 引数
+/// - `questions`: 質問群マップ。
+/// - `gating`: 任意のゲーティング設定。
+///
+/// # 戻り値
+/// - 成功時は `Ok(())`、不整合検出時は [`CoreError`]。
+pub fn validate_request_payload(
+    questions: &IndexMap<String, Question>,
+    gating: Option<&GatingConfig>,
+) -> Result<()> {
+    if questions.is_empty() {
+        return Err(CoreError::EmptyQuestions);
+    }
+    for (question_id, question) in questions {
+        question.validate(question_id)?;
+    }
+    if let Some(gating) = gating {
+        gating.validate()?;
+    }
+    Ok(())
+}
+
+/// 決定プリミティブ質問群とゲーティング設定を保持するリクエストペイロードの共通トレイト。
+pub trait DecisionRequest {
+    /// 評価対象となる質問群のマップへの参照を取得する。
+    fn questions(&self) -> &IndexMap<String, Question>;
+
+    /// 確信度ゲーティング処理の設定パラメータへの参照を取得する。
+    fn gating(&self) -> Option<&GatingConfig>;
+
+    /// リクエスト全体の整合性を検証する。
+    fn validate(&self) -> Result<()> {
+        validate_request_payload(self.questions(), self.gating())
+    }
+}
+
 /// Jev 互換 `POST /v1/systemone` リクエストペイロード。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -280,16 +323,17 @@ impl SystemOneRequest {
 
     /// リクエスト全体の整合性を検証する。
     pub fn validate(&self) -> Result<()> {
-        if self.questions.is_empty() {
-            return Err(CoreError::EmptyQuestions);
-        }
-        for (question_id, question) in &self.questions {
-            question.validate(question_id)?;
-        }
-        if let Some(ref gating) = self.gating {
-            gating.validate()?;
-        }
-        Ok(())
+        DecisionRequest::validate(self)
+    }
+}
+
+impl DecisionRequest for SystemOneRequest {
+    fn questions(&self) -> &IndexMap<String, Question> {
+        &self.questions
+    }
+
+    fn gating(&self) -> Option<&GatingConfig> {
+        self.gating.as_ref()
     }
 }
 
@@ -520,16 +564,31 @@ impl StateBatchRequest {
 
     /// リクエスト全体の整合性を検証する。
     pub fn validate(&self) -> Result<()> {
-        if self.questions.is_empty() {
-            return Err(CoreError::EmptyQuestions);
+        DecisionRequest::validate(self)
+    }
+}
+
+impl DecisionRequest for StateBatchRequest {
+    fn questions(&self) -> &IndexMap<String, Question> {
+        &self.questions
+    }
+
+    fn gating(&self) -> Option<&GatingConfig> {
+        self.gating.as_ref()
+    }
+}
+
+impl From<StateBatchRequest> for SystemOneRequest {
+    /// `StateBatchRequest` から `SystemOneRequest` への変換を提供する。
+    fn from(req: StateBatchRequest) -> Self {
+        Self {
+            model: req.model,
+            state: req.state,
+            questions: req.questions,
+            gating: req.gating,
+            auto_hierarchical: req.auto_hierarchical,
+            state_hash: req.state_hash,
         }
-        for (question_id, question) in &self.questions {
-            question.validate(question_id)?;
-        }
-        if let Some(ref gating) = self.gating {
-            gating.validate()?;
-        }
-        Ok(())
     }
 }
 

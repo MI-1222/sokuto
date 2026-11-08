@@ -13,9 +13,7 @@ use serde::{Deserialize, Serialize};
 use sokuto_runtime::engine::{InferenceEngine, SessionConfig};
 use sokuto_runtime::tokenizer::JevTokenizer;
 
-use crate::commands::model_dir::{
-    MODEL_ONNX_FILENAME, TOKENIZER_JSON_FILENAME, validate_model_dir,
-};
+use crate::commands::model_dir::{ModelArtifactPaths, validate_model_dir};
 use crate::error::CliError;
 
 /// 量子化実行オプション構造体。
@@ -153,21 +151,13 @@ pub fn run_quantize(args: QuantizeArgs) -> Result<(), CliError> {
     }
 
     // 4. 出力先成果物バンドルの完全性検証
-    let quantized_onnx = output_dir_abs.join(MODEL_ONNX_FILENAME);
-    let quantized_tok = output_dir_abs.join(TOKENIZER_JSON_FILENAME);
-
-    if !quantized_onnx.exists() || !quantized_tok.exists() {
-        return Err(CliError::Quantize(format!(
-            "量子化成果物ファイルが不足しています: {} または {}。",
-            quantized_onnx.display(),
-            quantized_tok.display()
-        )));
-    }
+    validate_model_dir(&output_dir_abs)?;
+    let paths = ModelArtifactPaths::resolve(&output_dir_abs);
 
     // 5. Rust ランタイムによるロード可能性の検証 (スモークテスト)
     eprintln!("Rust ランタイムによる量子化モデルの整合性チェックを実行中...");
-    let test_engine = InferenceEngine::new(&quantized_onnx, SessionConfig::cpu_only())?;
-    let _test_tok = JevTokenizer::from_file(&quantized_tok)?;
+    let test_engine = InferenceEngine::new(&paths.model_onnx, SessionConfig::cpu_only())?;
+    let _test_tok = JevTokenizer::from_file(&paths.tokenizer_json)?;
     drop(test_engine);
 
     // 6. メタデータの読み込みとサマリー表示

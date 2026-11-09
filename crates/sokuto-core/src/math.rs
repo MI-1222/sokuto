@@ -293,11 +293,86 @@ pub fn top_margin(probabilities: &[f64]) -> Result<f64> {
     top_margin_iter(probabilities)
 }
 
+/// 任意の確率値イテレータから、正規化エントロピーと Top-Margin を統合した複合確信度スコア $S_{\text{confidence}} \in [0.0, 1.0]$ を単一パス走査で算出する。
+///
+/// # 数理仕様
+/// $$S_{\text{confidence}} = \begin{cases} 1.0 & (K = 1) \\ (1.0 - H_{\text{norm}}(p)) \times M(p) & (K \ge 2) \end{cases}$$
+///
+/// - $O(K)$ 単一パス走査により、要素数 $K$、エントロピー累積値 $-\sum p \ln p$、上位2候補 $p_{(1)}, p_{(2)}$ を同時に集計する。
+/// - 同一スライスの2回走査を回避し、ゼロアロケーションかつキャッシュ局所性を最大化する。
+/// - $K=0$ の場合は空配列エラーとして `CoreError::MathError` を返却する。
+/// - $K=1$ の特異点では $1.0$(不確実性なし・完全確信)を即座に返却する。
+/// - 同率タイブレーク時はマージンが $0.0$ となるため、複合確信度も厳密に $0.0$ に収束する。
+/// - 非有限値(NaNまたは無限大)や負の確率値が含まれる場合は `CoreError::MathError` を返却する。
+/// - 戻り値は浮動小数点誤差を考慮して `[0.0, 1.0]` の閉区間にクランプされる。
+///
+/// # 引数
+/// - `iter`: 確率値(`f64` または `&f64`)を提供するイテレータ。
+///
+/// # 戻り値
+/// - 成功時は `[0.0, 1.0]` にクランプされた複合確信度スコア、不正時または空時は `CoreError::MathError`。
+pub fn composite_confidence_iter<I>(iter: I) -> Result<f64>
+where
+    I: IntoIterator,
+    I::Item: Borrow<f64>,
+{
+    let mut count: usize = 0;
+    let mut entropy = 0.0;
+    let mut max1 = f64::NEG_INFINITY;
+    let mut max2 = f64::NEG_INFINITY;
+
+    for item in iter {
+        let p = *item.borrow();
+        if !p.is_finite() {
+            return Err(CoreError::MathError {
+                message: "確率値に非有限値(NaNまたは無限大)が含まれています。".to_string(),
+            });
+        }
+        if p < 0.0 {
+            return Err(CoreError::MathError {
+                message: format!("負の確率値が含まれています: {p}。"),
+            });
+        }
+
+        count += 1;
+        if p > 0.0 {
+            entropy -= p * p.ln();
+        }
+
+        if p > max1 {
+            max2 = max1;
+            max1 = p;
+        } else if p > max2 {
+            max2 = p;
+        }
+    }
+
+    match count {
+        0 => Err(CoreError::MathError {
+            message: "確率分布配列が空です。".to_string(),
+        }),
+        1 => Ok(1.0),
+        _ => {
+            let max_entropy = (count as f64).ln();
+            let h_norm = if max_entropy <= 0.0 {
+                0.0
+            } else {
+                (entropy / max_entropy).clamp(0.0, 1.0)
+            };
+            let margin = (max1 - max2).clamp(0.0, 1.0);
+            let score = (1.0 - h_norm) * margin;
+            Ok(score.clamp(0.0, 1.0))
+        }
+    }
+}
+
 /// 確率分布から、正規化エントロピーと Top-Margin を統合した複合確信度スコア $S_{\text{confidence}} \in [0.0, 1.0]$ を算出する。
 ///
 /// # 数理仕様
 /// $$S_{\text{confidence}} = (1.0 - H_{\text{norm}}(p)) \times M(p)$$
 ///
+/// - [`composite_confidence_iter`] を呼び出すゼロコストラッパーとして動作する。
+/// - $O(K)$ 単一パス走査により、要素数 $K$、エントロピー累積値、上位2候補のマージンを同時に集計する。
 /// - 分布全体が鋭利であり(平坦度 $H_{\text{norm}}$ が小)、かつ第1位と第2位の差分(マージン $M(p)$)が明瞭な場合にのみ
 ///   高い確信度を出力する。
 /// - $K=1$ の特異点では $1.0$ を返却する。
@@ -309,32 +384,9 @@ pub fn top_margin(probabilities: &[f64]) -> Result<f64> {
 ///
 /// # 戻り値
 /// - 成功時は `[0.0, 1.0]` にクランプされた複合確信度スコア、不正時は `CoreError::MathError`。
+#[inline]
 pub fn composite_confidence(probabilities: &[f64]) -> Result<f64> {
-    let k = probabilities.len();
-    if k == 0 {
-        return Err(CoreError::MathError {
-            message: "確率分布配列が空です。".to_string(),
-        });
-    }
-    if k == 1 {
-        if !probabilities[0].is_finite() {
-            return Err(CoreError::MathError {
-                message: "確率値に非有限値(NaNまたは無限大)が含まれています。".to_string(),
-            });
-        }
-        if probabilities[0] < 0.0 {
-            return Err(CoreError::MathError {
-                message: format!("負の確率値が含まれています: {}。", probabilities[0]),
-            });
-        }
-        return Ok(1.0);
-    }
-
-    let h_norm = normalized_entropy(probabilities)?;
-    let margin = top_margin(probabilities)?;
-
-    let score = (1.0 - h_norm) * margin;
-    Ok(score.clamp(0.0, 1.0))
+    composite_confidence_iter(probabilities)
 }
 
 /// シャノンエントロピーに基づき、0.0〜1.0 の正規化確信度(Confidence)を算出する。
@@ -1269,6 +1321,48 @@ mod tests {
         assert!(composite_confidence(&[]).is_err());
         assert!(composite_confidence(&[-0.1, 1.1]).is_err());
         assert!(composite_confidence(&[0.5, f64::NAN]).is_err());
+    }
+
+    #[test]
+    fn test_composite_confidence_iter() {
+        // 1. K=1 の特異点: 競合候補が存在しないため 1.0 を返却する。
+        assert_eq!(composite_confidence_iter([1.0]).unwrap(), 1.0);
+        assert_eq!(composite_confidence_iter(&[1.0][..]).unwrap(), 1.0);
+
+        // 2. イテレータ (値および参照) の透過的サポート。
+        let p_high = vec![0.85, 0.10, 0.05];
+        let expected = composite_confidence(&p_high).unwrap();
+        assert!((composite_confidence_iter(p_high.iter()).unwrap() - expected).abs() < 1e-12);
+        assert!((composite_confidence_iter(p_high.clone()).unwrap() - expected).abs() < 1e-12);
+        assert!((composite_confidence_iter(p_high.into_iter()).unwrap() - expected).abs() < 1e-12);
+
+        // 3. 空イテレータの異常系。
+        let empty: [f64; 0] = [];
+        assert!(composite_confidence_iter(empty).is_err());
+        assert!(composite_confidence_iter(std::iter::empty::<f64>()).is_err());
+
+        // 4. 非有限値・負値の異常系。
+        assert!(composite_confidence_iter([0.5, f64::NAN]).is_err());
+        assert!(composite_confidence_iter([f64::INFINITY, 0.5]).is_err());
+        assert!(composite_confidence_iter([-0.1, 0.8]).is_err());
+
+        // 5. スライス版とイテレータ版の完全一致検証。
+        let distributions = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.25, 0.25, 0.25, 0.25],
+            vec![0.49, 0.49, 0.02],
+            vec![0.7, 0.2, 0.1],
+            vec![0.98, 0.01, 0.01],
+            vec![0.1, 0.2, 0.3, 0.4],
+        ];
+        for dist in distributions {
+            let slice_res = composite_confidence(&dist).unwrap();
+            let iter_res = composite_confidence_iter(dist.iter()).unwrap();
+            assert!(
+                (slice_res - iter_res).abs() < 1e-12,
+                "スライス版とイテレータ版で計算結果が不一致です: {dist:?}。"
+            );
+        }
     }
 
     #[test]

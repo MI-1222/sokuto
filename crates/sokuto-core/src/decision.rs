@@ -348,16 +348,17 @@ mod tests {
         let logits = vec![1.0, 5.0, 2.0];
         let answer = evaluate_choice(&logits, &criteria, 1.0).unwrap();
 
-        assert_eq!(answer.choice.as_deref(), Some("dog"));
-        assert!(answer.score.is_none());
-        assert!(answer.noul.is_none());
+        assert_eq!(answer.selected(), Some("dog"));
+        assert!(answer.as_score().is_none());
+        assert!(answer.as_noul().is_none());
+        assert!(answer.is_choice());
 
-        let probs = answer.probabilities.unwrap();
+        let probs = answer.probabilities().unwrap();
         assert_eq!(probs.len(), 3);
         assert!(probs["dog"] > probs["bird"]);
         assert!(probs["bird"] > probs["cat"]);
 
-        let conf = answer.confidence.unwrap();
+        let conf = answer.confidence().unwrap();
         assert!(conf > 0.0 && conf <= 1.0);
     }
 
@@ -370,15 +371,15 @@ mod tests {
         let logits = vec![std::f64::consts::PI];
         let answer = evaluate_choice(&logits, &criteria, 1.0).unwrap();
 
-        assert_eq!(answer.choice.as_deref(), Some("only_one"));
-        assert_eq!(answer.confidence, Some(1.0));
-        let probs = answer.probabilities.unwrap();
+        assert_eq!(answer.selected(), Some("only_one"));
+        assert_eq!(answer.confidence(), Some(1.0));
+        let probs = answer.probabilities().unwrap();
         assert_eq!(probs["only_one"], 1.0);
 
         // K=1 特異点において作業バッファ probs_buf が 1.0 に更新されることを検証する。
         let mut probs_buf = vec![0.0];
         let answer_buf = evaluate_choice_with_buf(&logits, &criteria, 1.0, &mut probs_buf).unwrap();
-        assert_eq!(answer_buf.choice.as_deref(), Some("only_one"));
+        assert_eq!(answer_buf.selected(), Some("only_one"));
         assert_eq!(probs_buf[0], 1.0);
 
         // バッファ長不一致の検証。
@@ -406,7 +407,7 @@ mod tests {
         let logits = vec![4.0, 4.0, 1.0];
         let answer = evaluate_choice(&logits, &criteria, 1.0).unwrap();
 
-        assert_eq!(answer.choice.as_deref(), Some("opt_a"));
+        assert_eq!(answer.selected(), Some("opt_a"));
     }
 
     #[test]
@@ -446,17 +447,18 @@ mod tests {
         let logits = vec![0.0, 1.0, 4.0];
         let answer = evaluate_score(&logits, &criteria, 1.0).unwrap();
 
-        assert!(answer.choice.is_none());
-        assert!(answer.noul.is_none());
+        assert!(answer.as_choice().is_none());
+        assert!(answer.as_noul().is_none());
+        assert!(answer.is_score());
 
-        let score = answer.score.unwrap();
+        let score = answer.as_score().unwrap();
         assert!(score > 1.5 && score <= 2.0);
 
-        let probs = answer.probabilities.unwrap();
+        let probs = answer.probabilities().unwrap();
         assert_eq!(probs.len(), 3);
         assert!(probs["高"] > probs["中"]);
 
-        let conf = answer.confidence.unwrap();
+        let conf = answer.confidence().unwrap();
         assert!(conf > 0.0 && conf <= 1.0);
     }
 
@@ -471,7 +473,7 @@ mod tests {
 
         let logits = vec![1.0, 2.0, 3.0];
         let answer = evaluate_score(&logits, &criteria, 1.0).unwrap();
-        let probs = answer.probabilities.unwrap();
+        let probs = answer.probabilities().unwrap();
 
         assert_eq!(probs.len(), 3);
         assert!(probs.contains_key("0"));
@@ -500,12 +502,13 @@ mod tests {
         let logits = vec![3.0, 0.0];
         let answer = evaluate_noul(&logits, 1.0).unwrap();
 
-        assert!(answer.choice.is_none());
-        assert!(answer.score.is_none());
-        assert!(answer.probabilities.is_none());
-        assert!(answer.confidence.is_none());
+        assert!(answer.as_choice().is_none());
+        assert!(answer.as_score().is_none());
+        assert!(answer.probabilities().is_none());
+        assert!(answer.confidence().is_none());
+        assert!(answer.is_noul());
 
-        let prob = answer.noul.unwrap();
+        let prob = answer.as_noul().unwrap();
         assert!(prob > 0.90 && prob <= 1.0);
 
         // 異常系: ロジット数が 2 未満
@@ -522,7 +525,7 @@ mod tests {
         c_map.insert("no".to_string(), "いいえ".to_string());
         let q_choice = Question::new_choice("選択肢を選べ。", c_map);
         let ans_choice = evaluate_question(&q_choice, &[2.0, 0.5], &config).unwrap();
-        assert_eq!(ans_choice.choice.as_deref(), Some("yes"));
+        assert_eq!(ans_choice.selected(), Some("yes"));
 
         // 2. Score のディスパッチ検証
         let q_score = Question::new_score(
@@ -530,11 +533,11 @@ mod tests {
             vec!["1".to_string(), "2".to_string(), "3".to_string()],
         );
         let ans_score = evaluate_question(&q_score, &[0.0, 2.0, 4.0], &config).unwrap();
-        assert!(ans_score.score.unwrap() > 1.0);
+        assert!(ans_score.as_score().unwrap() > 1.0);
 
         // 3. Noul のディスパッチ検証
         let q_noul = Question::new_noul("真偽を判定せよ。");
         let ans_noul = evaluate_question(&q_noul, &[2.5, 0.0], &config).unwrap();
-        assert!(ans_noul.noul.unwrap() > 0.85);
+        assert!(ans_noul.as_noul().unwrap() > 0.85);
     }
 }

@@ -261,23 +261,23 @@ async fn test_systemone_inference_mixed_primitives() {
 
     // 1. Choice 質問の検証
     let ans_choice = response.answers.get("q_category").unwrap();
-    assert!(ans_choice.choice.is_some());
-    assert!(ans_choice.probabilities.is_some());
-    assert!(ans_choice.confidence.is_some());
-    let probs = ans_choice.probabilities.as_ref().unwrap();
+    assert!(ans_choice.is_choice());
+    assert!(ans_choice.probabilities().is_some());
+    assert!(ans_choice.confidence().is_some());
+    let probs = ans_choice.probabilities().unwrap();
     assert_eq!(probs.len(), 3);
 
     // 2. Score 質問の検証
     let ans_score = response.answers.get("q_urgency").unwrap();
-    assert!(ans_score.score.is_some());
-    let score_val = ans_score.score.unwrap();
+    assert!(ans_score.is_score());
+    let score_val = ans_score.as_score().unwrap();
     assert!((1.0..=5.0).contains(&score_val));
-    assert!(ans_score.confidence.is_some());
+    assert!(ans_score.confidence().is_some());
 
     // 3. Noul 質問の検証
     let ans_noul = response.answers.get("q_fraud").unwrap();
-    assert!(ans_noul.noul.is_some());
-    let noul_prob = ans_noul.noul.unwrap();
+    assert!(ans_noul.is_noul());
+    let noul_prob = ans_noul.as_noul().unwrap();
     assert!((0.0..=1.0).contains(&noul_prob));
 
     // 4. トークン使用量の検証

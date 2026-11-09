@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
 use crate::math::{normalized_entropy_iter, top_margin_iter};
-use crate::schema::{Answer, Question, QuestionType};
+use crate::schema::{Answer, AnswerPayload, Question, QuestionType};
 
 /// デフォルトの高確信度閾値 (自動実行境界)。
 pub const DEFAULT_HIGH_CONFIDENCE_THRESHOLD: f64 = 0.70;
@@ -469,63 +469,43 @@ pub fn evaluate_answer_gating_opts(
 ) -> GatingMetadata {
     let conf = answer.effective_confidence().unwrap_or(0.0).clamp(0.0, 1.0);
 
-    // 質問種別の特定(question 定義からの取得、または answer の格納フィールドからのフォールバック導出)。
-    let question_type = question.map(|q| q.question_type).or_else(|| {
-        if answer.choice.is_some() {
-            Some(QuestionType::Choice)
-        } else if answer.score.is_some() {
-            Some(QuestionType::Score)
-        } else if answer.noul.is_some() {
-            Some(QuestionType::Noul)
-        } else {
-            None
-        }
-    });
+    // 質問種別の特定(question 定義からの取得、または answer の payload からの導出)。
+    let question_type = question
+        .map(|q| q.question_type)
+        .unwrap_or_else(|| answer.question_type());
 
-    let is_choice = question_type == Some(QuestionType::Choice);
+    let is_choice = question_type == QuestionType::Choice;
 
-    let margin = match question_type {
-        Some(QuestionType::Choice) => {
-            if let Some(probs) = &answer.probabilities {
-                top_margin_iter(probs.values()).ok()
-            } else {
-                None
-            }
-        }
-        Some(QuestionType::Noul) => answer.noul.map(|p_true| {
+    let margin = match &answer.payload {
+        AnswerPayload::Choice { probabilities, .. } => top_margin_iter(probabilities.values()).ok(),
+        AnswerPayload::Noul { probability } => {
+            let p_true = *probability;
             let p_false = (1.0 - p_true).clamp(0.0, 1.0);
-            (p_true - p_false).abs().clamp(0.0, 1.0)
-        }),
+            Some((p_true - p_false).abs().clamp(0.0, 1.0))
+        }
         _ => None,
     };
 
     // ゼロアロケーション走査による分布エントロピー・散らばり指標の直接算出。
-    let entropy = match question_type {
-        Some(QuestionType::Choice) => {
-            if let Some(probs) = &answer.probabilities {
-                normalized_entropy_iter(probs.values()).ok()
+    let entropy = match &answer.payload {
+        AnswerPayload::Choice { probabilities, .. } => {
+            normalized_entropy_iter(probabilities.values()).ok()
+        }
+        AnswerPayload::Score { confidence, .. } => {
+            // Score 型の場合、confidence は正規化分散確信度 C_var であるため、散らばり指標として正規化分散 (1 - C_var) を記録する。
+            Some((1.0 - confidence).clamp(0.0, 1.0))
+        }
+        AnswerPayload::Noul { probability } => {
+            // Noul 型の場合、二値エントロピー指標 (底 2 のシャノンエントロピー) を記録する。
+            let p_true = *probability;
+            let p_false = (1.0 - p_true).clamp(0.0, 1.0);
+            if p_true > 0.0 && p_false > 0.0 {
+                let h = -(p_true * p_true.ln() + p_false * p_false.ln()) / std::f64::consts::LN_2;
+                Some(h.clamp(0.0, 1.0))
             } else {
-                None
+                Some(0.0)
             }
         }
-        Some(QuestionType::Score) => {
-            // Score 型の場合、confidence は正規化分散確信度 C_var であるため、散らばり指標として正規化分散 (1 - C_var) を記録する。
-            answer.confidence.map(|c| (1.0 - c).clamp(0.0, 1.0))
-        }
-        Some(QuestionType::Noul) => {
-            // Noul 型の場合、二値エントロピー指標 (底 2 のシャノンエントロピー) を記録する。
-            answer.noul.map(|p_true| {
-                let p_false = (1.0 - p_true).clamp(0.0, 1.0);
-                if p_true > 0.0 && p_false > 0.0 {
-                    let h =
-                        -(p_true * p_true.ln() + p_false * p_false.ln()) / std::f64::consts::LN_2;
-                    h.clamp(0.0, 1.0)
-                } else {
-                    0.0
-                }
-            })
-        }
-        None => None,
     };
 
     let (is_ood, ood_reason) = if config.ood_enabled && is_choice {
@@ -641,35 +621,40 @@ pub fn evaluate_answer_gating_opts(
     // エスカレーションコンテキストの遅延生成 (ConfirmOrEscalate または Fallback 時のみアロケーションを実行)。
     let escalation = if route != DecisionRoute::AutoExecute {
         let mut candidates: Vec<CandidateProbability> = Vec::new();
-        if let Some(probs) = &answer.probabilities {
-            candidates = probs
-                .iter()
-                .map(|(k, &p)| CandidateProbability {
-                    candidate: k.clone(),
-                    probability: p,
-                })
-                .collect();
-            candidates.sort_by(|a, b| b.probability.total_cmp(&a.probability));
-        } else if let Some(p_true) = answer.noul {
-            let p_false = (1.0 - p_true).clamp(0.0, 1.0);
-            if p_true >= p_false {
-                candidates.push(CandidateProbability {
-                    candidate: "true".to_string(),
-                    probability: p_true,
-                });
-                candidates.push(CandidateProbability {
-                    candidate: "false".to_string(),
-                    probability: p_false,
-                });
-            } else {
-                candidates.push(CandidateProbability {
-                    candidate: "false".to_string(),
-                    probability: p_false,
-                });
-                candidates.push(CandidateProbability {
-                    candidate: "true".to_string(),
-                    probability: p_true,
-                });
+        match &answer.payload {
+            AnswerPayload::Choice { probabilities, .. }
+            | AnswerPayload::Score { probabilities, .. } => {
+                candidates = probabilities
+                    .iter()
+                    .map(|(k, &p)| CandidateProbability {
+                        candidate: k.clone(),
+                        probability: p,
+                    })
+                    .collect();
+                candidates.sort_by(|a, b| b.probability.total_cmp(&a.probability));
+            }
+            AnswerPayload::Noul { probability } => {
+                let p_true = *probability;
+                let p_false = (1.0 - p_true).clamp(0.0, 1.0);
+                if p_true >= p_false {
+                    candidates.push(CandidateProbability {
+                        candidate: "true".to_string(),
+                        probability: p_true,
+                    });
+                    candidates.push(CandidateProbability {
+                        candidate: "false".to_string(),
+                        probability: p_false,
+                    });
+                } else {
+                    candidates.push(CandidateProbability {
+                        candidate: "false".to_string(),
+                        probability: p_false,
+                    });
+                    candidates.push(CandidateProbability {
+                        candidate: "true".to_string(),
+                        probability: p_true,
+                    });
+                }
             }
         }
 

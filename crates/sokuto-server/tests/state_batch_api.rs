@@ -286,8 +286,8 @@ async fn test_systemone_auto_hierarchical_routing() {
         .answers
         .get("banking_intent")
         .expect("banking_intent の決定結果が存在すること。");
-    assert!(ans.choice.is_some());
-    assert!(ans.probabilities.as_ref().unwrap().len() >= 77);
+    assert!(ans.is_choice());
+    assert!(ans.probabilities().unwrap().len() >= 77);
 }
 
 #[tokio::test]
@@ -340,7 +340,7 @@ async fn test_state_batch_auto_hierarchical_routing() {
         .answers
         .get("banking_intent")
         .expect("banking_intent の決定結果が存在すること。");
-    assert!(ans.choice.is_some());
-    assert!(ans.probabilities.as_ref().unwrap().len() >= 77);
+    assert!(ans.is_choice());
+    assert!(ans.probabilities().unwrap().len() >= 77);
     assert!(res.answers.contains_key("urgent"));
 }

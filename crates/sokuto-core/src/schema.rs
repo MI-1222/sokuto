@@ -6,6 +6,8 @@
 use std::fmt;
 
 use indexmap::IndexMap;
+use serde::de::Deserializer;
+use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
@@ -340,33 +342,222 @@ impl DecisionRequest for SystemOneRequest {
     }
 }
 
+/// 単一の質問に対する判定結果ペイロード。
+///
+/// Jev の3大プリミティブ(Choice / Score / Noul)に対応する排他的な直和型である。
+/// 不正な状態(排他フィールドの競合や必須データの欠落)を型レベルで排除する。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum AnswerPayload {
+    /// Choice 型: 採択候補ラベル、確率分布マップ、および正規化確信度。
+    Choice {
+        /// 採択候補ラベル。
+        selected: String,
+        /// 候補ごとの確率分布マップ。
+        probabilities: IndexMap<String, f64>,
+        /// 分布の尖り度に基づく正規化確信度(0.0 <= C <= 1.0)。
+        confidence: f64,
+    },
+    /// Score 型: 加重平均スコア値、各評価段階の確率分布マップ、および正規化確信度。
+    Score {
+        /// 加重平均スコア値。
+        value: f64,
+        /// 各評価段階の確率分布マップ。
+        probabilities: IndexMap<String, f64>,
+        /// 分布の尖り度に基づく正規化確信度(0.0 <= C <= 1.0)。
+        confidence: f64,
+    },
+    /// Noul 型: 言明真実確率値。
+    Noul {
+        /// 言明真実確率値(0.0 <= P <= 1.0)。
+        probability: f64,
+    },
+}
+
+impl AnswerPayload {
+    /// 対応する質問種別 (`QuestionType`) を取得する。
+    pub fn question_type(&self) -> QuestionType {
+        match self {
+            Self::Choice { .. } => QuestionType::Choice,
+            Self::Score { .. } => QuestionType::Score,
+            Self::Noul { .. } => QuestionType::Noul,
+        }
+    }
+
+    /// Choice の採択候補ラベルを取得する。
+    pub fn choice(&self) -> Option<&str> {
+        match self {
+            Self::Choice { selected, .. } => Some(selected.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Score の加重平均値を取得する。
+    pub fn score(&self) -> Option<f64> {
+        match self {
+            Self::Score { value, .. } => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// Noul の真実確率値を取得する。
+    pub fn noul(&self) -> Option<f64> {
+        match self {
+            Self::Noul { probability } => Some(*probability),
+            _ => None,
+        }
+    }
+
+    /// 確率分布マップの参照を取得する。
+    pub fn probabilities(&self) -> Option<&IndexMap<String, f64>> {
+        match self {
+            Self::Choice { probabilities, .. } | Self::Score { probabilities, .. } => {
+                Some(probabilities)
+            }
+            Self::Noul { .. } => None,
+        }
+    }
+
+    /// 確率分布マップの可変参照を取得する。
+    pub fn probabilities_mut(&mut self) -> Option<&mut IndexMap<String, f64>> {
+        match self {
+            Self::Choice { probabilities, .. } | Self::Score { probabilities, .. } => {
+                Some(probabilities)
+            }
+            Self::Noul { .. } => None,
+        }
+    }
+
+    /// 確率分布マップを更新する。Choice / Score 型の場合に適用される。
+    pub fn set_probabilities(&mut self, new_probabilities: IndexMap<String, f64>) {
+        match self {
+            Self::Choice { probabilities, .. } | Self::Score { probabilities, .. } => {
+                *probabilities = new_probabilities;
+            }
+            Self::Noul { .. } => {}
+        }
+    }
+
+    /// 正規化確信度を取得する。
+    pub fn confidence(&self) -> Option<f64> {
+        match self {
+            Self::Choice { confidence, .. } | Self::Score { confidence, .. } => Some(*confidence),
+            Self::Noul { .. } => None,
+        }
+    }
+
+    /// 実効確信度(Effective Confidence)を取得する。
+    ///
+    /// Choice / Score は `confidence` をそのまま返し、Noul は真偽の尖り度 $|2P - 1.0|$ を算出する。
+    pub fn effective_confidence(&self) -> f64 {
+        match self {
+            Self::Choice { confidence, .. } | Self::Score { confidence, .. } => *confidence,
+            Self::Noul { probability } => (2.0 * probability - 1.0).abs().clamp(0.0, 1.0),
+        }
+    }
+}
+
 /// 単一の質問に対する判定結果。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+///
+/// Jev 公式互換のフラット JSON 表現(`choice`, `score`, `noul`, `probabilities`, `confidence`, `gating`)と
+/// 型安全な直和型表現(`AnswerPayload`)を透過的に相互変換する。
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Answer {
-    /// Choice 型の採択候補ラベル。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub choice: Option<String>,
-
-    /// Score 型の加重平均スコア値。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub score: Option<f64>,
-
-    /// Noul 型の言明真実確率値(0.0 <= P <= 1.0)。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub noul: Option<f64>,
-
-    /// 各候補または各段階レベルの確率分布マップ。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub probabilities: Option<IndexMap<String, f64>>,
-
-    /// 分布の尖り度に基づく正規化確信度(0.0 <= C <= 1.0)。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub confidence: Option<f64>,
+    /// 判定ペイロード(Choice / Score / Noul の直和型)。
+    pub payload: AnswerPayload,
 
     /// 確信度ゲーティングによるルーティングおよび監査メタデータ(任意)。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gating: Option<GatingMetadata>,
+}
+
+impl Serialize for Answer {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("Answer", 6)?;
+        match &self.payload {
+            AnswerPayload::Choice {
+                selected,
+                probabilities,
+                confidence,
+            } => {
+                state.serialize_field("choice", selected)?;
+                state.serialize_field("probabilities", probabilities)?;
+                state.serialize_field("confidence", confidence)?;
+            }
+            AnswerPayload::Score {
+                value,
+                probabilities,
+                confidence,
+            } => {
+                state.serialize_field("score", value)?;
+                state.serialize_field("probabilities", probabilities)?;
+                state.serialize_field("confidence", confidence)?;
+            }
+            AnswerPayload::Noul { probability } => {
+                state.serialize_field("noul", probability)?;
+            }
+        }
+        if let Some(ref gating) = self.gating {
+            state.serialize_field("gating", gating)?;
+        }
+        state.end()
+    }
+}
+
+#[derive(Deserialize)]
+struct AnswerFlatHelper {
+    #[serde(default)]
+    choice: Option<String>,
+    #[serde(default)]
+    score: Option<f64>,
+    #[serde(default)]
+    noul: Option<f64>,
+    #[serde(default)]
+    probabilities: Option<IndexMap<String, f64>>,
+    #[serde(default)]
+    confidence: Option<f64>,
+    #[serde(default)]
+    gating: Option<GatingMetadata>,
+}
+
+impl<'de> Deserialize<'de> for Answer {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let helper = AnswerFlatHelper::deserialize(deserializer)?;
+        let payload = match (helper.choice, helper.score, helper.noul) {
+            (Some(selected), None, None) => AnswerPayload::Choice {
+                selected,
+                probabilities: helper.probabilities.unwrap_or_default(),
+                confidence: helper.confidence.unwrap_or(0.0),
+            },
+            (None, Some(value), None) => AnswerPayload::Score {
+                value,
+                probabilities: helper.probabilities.unwrap_or_default(),
+                confidence: helper.confidence.unwrap_or(0.0),
+            },
+            (None, None, Some(probability)) => AnswerPayload::Noul { probability },
+            (None, None, None) => {
+                return Err(serde::de::Error::custom(
+                    "Answer must contain exactly one of 'choice', 'score', or 'noul'.",
+                ));
+            }
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "Answer contains conflicting fields: 'choice', 'score', and 'noul' are mutually exclusive.",
+                ));
+            }
+        };
+
+        Ok(Answer {
+            payload,
+            gating: helper.gating,
+        })
+    }
 }
 
 impl Answer {
@@ -377,11 +568,11 @@ impl Answer {
         confidence: f64,
     ) -> Self {
         Self {
-            choice: Some(selected.into()),
-            score: None,
-            noul: None,
-            probabilities: Some(probabilities),
-            confidence: Some(confidence),
+            payload: AnswerPayload::Choice {
+                selected: selected.into(),
+                probabilities,
+                confidence,
+            },
             gating: None,
         }
     }
@@ -389,11 +580,11 @@ impl Answer {
     /// Score 判定結果を生成する。
     pub fn score(value: f64, probabilities: IndexMap<String, f64>, confidence: f64) -> Self {
         Self {
-            choice: None,
-            score: Some(value),
-            noul: None,
-            probabilities: Some(probabilities),
-            confidence: Some(confidence),
+            payload: AnswerPayload::Score {
+                value,
+                probabilities,
+                confidence,
+            },
             gating: None,
         }
     }
@@ -401,11 +592,7 @@ impl Answer {
     /// Noul 判定結果を生成する。
     pub fn noul(probability: f64) -> Self {
         Self {
-            choice: None,
-            score: None,
-            noul: Some(probability),
-            probabilities: None,
-            confidence: None,
+            payload: AnswerPayload::Noul { probability },
             gating: None,
         }
     }
@@ -421,23 +608,86 @@ impl Answer {
         self.gating.as_ref().map(|g| g.route)
     }
 
+    /// 対応する質問種別 (`QuestionType`) を取得する。
+    pub fn question_type(&self) -> QuestionType {
+        self.payload.question_type()
+    }
+
     /// ゲーティング処理等に向けた実効確信度(Effective Confidence)を取得する。
     ///
     /// # 概要
     /// - Choice / Score 型の場合は、構造体に保持されている `confidence` 値をそのまま返却する。
-    /// - Noul 型の場合は、Jev 公式スキーマでは `confidence` フィールドが `None` となる規約があるため、
-    ///   真実確率 $P(\text{true})$ から尖り度 $|2P - 1.0|$ を即座に算出して返却する。
+    /// - Noul 型の場合は、真実確率 $P(\text{true})$ から尖り度 $|2P - 1.0|$ を即座に算出して返却する。
     ///
     /// # 戻り値
-    /// - 判定結果に対応する 0.0〜1.0 の確信度実数値。判定結果が存在しない場合は `None`。
+    /// - 判定結果に対応する 0.0〜1.0 の確信度実数値。
     pub fn effective_confidence(&self) -> Option<f64> {
-        if let Some(conf) = self.confidence {
-            return Some(conf);
-        }
-        if let Some(p) = self.noul {
-            return Some((2.0 * p - 1.0).abs().clamp(0.0, 1.0));
-        }
-        None
+        Some(self.payload.effective_confidence())
+    }
+
+    /// Choice の採択候補ラベルを取得する。
+    pub fn selected(&self) -> Option<&str> {
+        self.payload.choice()
+    }
+
+    /// Choice の採択候補ラベルを取得する (`selected` の別名)。
+    pub fn as_choice(&self) -> Option<&str> {
+        self.payload.choice()
+    }
+
+    /// Score の加重平均スコア値を取得する。
+    pub fn score_value(&self) -> Option<f64> {
+        self.payload.score()
+    }
+
+    /// Score の加重平均スコア値を取得する (`score_value` の別名)。
+    pub fn as_score(&self) -> Option<f64> {
+        self.payload.score()
+    }
+
+    /// Noul の真実確率値を取得する。
+    pub fn noul_probability(&self) -> Option<f64> {
+        self.payload.noul()
+    }
+
+    /// Noul の真実確率値を取得する (`noul_probability` の別名)。
+    pub fn as_noul(&self) -> Option<f64> {
+        self.payload.noul()
+    }
+
+    /// 確率分布マップの参照を取得する。
+    pub fn probabilities(&self) -> Option<&IndexMap<String, f64>> {
+        self.payload.probabilities()
+    }
+
+    /// 確率分布マップの可変参照を取得する。
+    pub fn probabilities_mut(&mut self) -> Option<&mut IndexMap<String, f64>> {
+        self.payload.probabilities_mut()
+    }
+
+    /// 正規化確信度を取得する。
+    pub fn confidence(&self) -> Option<f64> {
+        self.payload.confidence()
+    }
+
+    /// 確率分布マップを更新する。Choice / Score 型の場合に適用される。
+    pub fn set_probabilities(&mut self, probabilities: IndexMap<String, f64>) {
+        self.payload.set_probabilities(probabilities);
+    }
+
+    /// Choice 判定であるかどうか。
+    pub fn is_choice(&self) -> bool {
+        matches!(self.payload, AnswerPayload::Choice { .. })
+    }
+
+    /// Score 判定であるかどうか。
+    pub fn is_score(&self) -> bool {
+        matches!(self.payload, AnswerPayload::Score { .. })
+    }
+
+    /// Noul 判定であるかどうか。
+    pub fn is_noul(&self) -> bool {
+        matches!(self.payload, AnswerPayload::Noul { .. })
     }
 }
 

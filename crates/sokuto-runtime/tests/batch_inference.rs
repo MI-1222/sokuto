@@ -376,19 +376,19 @@ fn test_evaluate_batch_questions_and_scratchpad_parity() {
 
     // Choice の検証
     let cat_ans = &answers["category"];
-    assert!(cat_ans.choice.is_some());
-    assert!(cat_ans.confidence.unwrap() >= 0.0 && cat_ans.confidence.unwrap() <= 1.0);
-    assert_eq!(cat_ans.probabilities.as_ref().unwrap().len(), 3);
+    assert!(cat_ans.is_choice());
+    assert!(cat_ans.confidence().unwrap() >= 0.0 && cat_ans.confidence().unwrap() <= 1.0);
+    assert_eq!(cat_ans.probabilities().unwrap().len(), 3);
 
     // Score の検証 (3 段階: レベル 0..=2)
     let urg_ans = &answers["urgency"];
-    assert!(urg_ans.score.is_some());
-    assert!(urg_ans.score.unwrap() >= 0.0 && urg_ans.score.unwrap() <= 2.0);
+    assert!(urg_ans.is_score());
+    assert!(urg_ans.as_score().unwrap() >= 0.0 && urg_ans.as_score().unwrap() <= 2.0);
 
     // Noul の検証
     let res_ans = &answers["resolved"];
-    assert!(res_ans.noul.is_some());
-    assert!(res_ans.noul.unwrap() >= 0.0 && res_ans.noul.unwrap() <= 1.0);
+    assert!(res_ans.is_noul());
+    assert!(res_ans.as_noul().unwrap() >= 0.0 && res_ans.as_noul().unwrap() <= 1.0);
 
     // スクラッチパッド再利用版とのパリティ検証
     let mut scratchpad = BatchScratchpad::default();

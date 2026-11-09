@@ -30,24 +30,24 @@ mod distribution_extremes {
         let logits = vec![100.0, -100.0, -100.0];
         let answer = evaluate_choice(&logits, &criteria, 1.0).unwrap();
 
-        assert_eq!(answer.choice.as_deref(), Some("A"));
-        let probs = answer.probabilities.as_ref().unwrap();
+        assert_eq!(answer.selected(), Some("A"));
+        let probs = answer.probabilities().unwrap();
         assert!((probs.get("A").copied().unwrap() - 1.0).abs() < 1e-6);
         assert!(probs.get("B").copied().unwrap() < 1e-6);
         assert!(probs.get("C").copied().unwrap() < 1e-6);
 
-        let conf = answer.confidence.unwrap();
+        let conf = answer.confidence().unwrap();
         assert!((conf - 1.0).abs() < 1e-6);
         assert_eq!(answer.effective_confidence(), Some(1.0));
 
         // 完全アンダーフロー(10000.0)の極限ケース
         let extreme_logits = vec![10000.0, -10000.0, -10000.0];
         let ans_extreme = evaluate_choice(&extreme_logits, &criteria, 1.0).unwrap();
-        let probs_ext = ans_extreme.probabilities.unwrap();
+        let probs_ext = ans_extreme.probabilities().unwrap();
         assert_eq!(probs_ext.get("A").copied(), Some(1.0));
         assert_eq!(probs_ext.get("B").copied(), Some(0.0));
         assert_eq!(probs_ext.get("C").copied(), Some(0.0));
-        assert_eq!(ans_extreme.confidence, Some(1.0));
+        assert_eq!(ans_extreme.confidence(), Some(1.0));
     }
 
     #[test]
@@ -65,14 +65,14 @@ mod distribution_extremes {
         let answer = evaluate_choice(&logits, &criteria, 1.0).unwrap();
 
         // 決定論的タイブレークにより先頭候補が採択される。
-        assert_eq!(answer.choice.as_deref(), Some("opt1"));
+        assert_eq!(answer.selected(), Some("opt1"));
 
-        let probs = answer.probabilities.as_ref().unwrap();
+        let probs = answer.probabilities().unwrap();
         for val in probs.values() {
             assert!((val - 0.25).abs() < 1e-6);
         }
 
-        let conf = answer.confidence.unwrap();
+        let conf = answer.confidence().unwrap();
         assert!(conf < 1e-6);
         assert!((0.0..=1.0).contains(&conf));
         assert!(answer.effective_confidence().unwrap() < 1e-6);
@@ -90,24 +90,24 @@ mod distribution_extremes {
         // 1. ワンホット極限: 単一レベル(k=2)に集中。
         let logits_one_hot = vec![-100.0, -100.0, 100.0, -100.0];
         let ans_one_hot = evaluate_score(&logits_one_hot, &criteria, 1.0).unwrap();
-        assert!((ans_one_hot.score.unwrap() - 2.0).abs() < 1e-6);
-        assert!((ans_one_hot.confidence.unwrap() - 1.0).abs() < 1e-6);
+        assert!((ans_one_hot.as_score().unwrap() - 2.0).abs() < 1e-6);
+        assert!((ans_one_hot.confidence().unwrap() - 1.0).abs() < 1e-6);
 
         // 2. 二峰性両極端分裂極限: レベル 0 とレベル 3 のみに二分。
         // 理論最大分散 V_max = (4-1)^2 / 4 = 2.25。
         // 確信度 C_var = 1.0 - 2.25 / 2.25 = 0.0。
         let logits_bimodal = vec![100.0, -100.0, -100.0, 100.0];
         let ans_bimodal = evaluate_score(&logits_bimodal, &criteria, 1.0).unwrap();
-        assert!((ans_bimodal.score.unwrap() - 1.5).abs() < 1e-6);
-        assert!(ans_bimodal.confidence.unwrap() < 1e-6);
+        assert!((ans_bimodal.as_score().unwrap() - 1.5).abs() < 1e-6);
+        assert!(ans_bimodal.confidence().unwrap() < 1e-6);
         assert_eq!(ans_bimodal.effective_confidence(), Some(0.0));
 
         // 3. 隣接段階分裂: レベル 1 とレベル 2 のみに二分。
         // 分散 Var = 0.25, 確信度 C_var = 1.0 - 0.25 / 2.25 ≈ 0.888889。
         let logits_adjacent = vec![-100.0, 100.0, 100.0, -100.0];
         let ans_adjacent = evaluate_score(&logits_adjacent, &criteria, 1.0).unwrap();
-        assert!((ans_adjacent.score.unwrap() - 1.5).abs() < 1e-6);
-        let conf_adj = ans_adjacent.confidence.unwrap();
+        assert!((ans_adjacent.as_score().unwrap() - 1.5).abs() < 1e-6);
+        let conf_adj = ans_adjacent.confidence().unwrap();
         assert!((conf_adj - (8.0 / 9.0)).abs() < 1e-4);
         assert!(conf_adj > 0.85);
     }
@@ -116,19 +116,19 @@ mod distribution_extremes {
     fn test_noul_extremes() {
         // 1. 真偽等確率(完全な迷い)。
         let ans_tie = evaluate_noul(&[2.5, 2.5], 1.0).unwrap();
-        let prob_tie = ans_tie.noul.unwrap();
+        let prob_tie = ans_tie.as_noul().unwrap();
         assert!((prob_tie - 0.5).abs() < 1e-6);
-        assert!(ans_tie.confidence.is_none());
+        assert!(ans_tie.confidence().is_none());
         assert!((ans_tie.effective_confidence().unwrap() - 0.0).abs() < 1e-6);
 
         // 2. 真方向への絶対的確信。
         let ans_true = evaluate_noul(&[100.0, -100.0], 1.0).unwrap();
-        assert!((ans_true.noul.unwrap() - 1.0).abs() < 1e-6);
+        assert!((ans_true.as_noul().unwrap() - 1.0).abs() < 1e-6);
         assert!((ans_true.effective_confidence().unwrap() - 1.0).abs() < 1e-6);
 
         // 3. 偽方向への絶対的確信。
         let ans_false = evaluate_noul(&[-100.0, 100.0], 1.0).unwrap();
-        assert!((ans_false.noul.unwrap() - 0.0).abs() < 1e-6);
+        assert!((ans_false.as_noul().unwrap() - 0.0).abs() < 1e-6);
         assert!((ans_false.effective_confidence().unwrap() - 1.0).abs() < 1e-6);
     }
 }
@@ -148,9 +148,9 @@ mod structural_bounds {
         let logits = vec![42.0];
         let answer = evaluate_choice(&logits, &criteria, 1.0).unwrap();
 
-        assert_eq!(answer.choice.as_deref(), Some("only"));
-        assert_eq!(answer.confidence, Some(1.0));
-        let probs = answer.probabilities.unwrap();
+        assert_eq!(answer.selected(), Some("only"));
+        assert_eq!(answer.confidence(), Some(1.0));
+        let probs = answer.probabilities().unwrap();
         assert_eq!(probs.len(), 1);
         assert_eq!(probs.get("only").copied(), Some(1.0));
 
@@ -186,8 +186,8 @@ mod structural_bounds {
             logits255.push(i as f64 * 0.01);
         }
         let ans255 = evaluate_choice(&logits255, &Criteria::Map(map255), 1.0).unwrap();
-        assert_eq!(ans255.choice.as_deref(), Some("opt_254"));
-        let sum: f64 = ans255.probabilities.unwrap().values().sum();
+        assert_eq!(ans255.selected(), Some("opt_254"));
+        let sum: f64 = ans255.probabilities().unwrap().values().sum();
         assert!((sum - 1.0).abs() < 1e-5);
 
         // K = 0 (異常系)
@@ -359,12 +359,12 @@ mod non_finite_and_extreme_guards {
 
         // 極小温度: 1e-4 および 1e-9 (有効下限クランプによりオーバーフローせず最大値 One-hot 化する)。
         let ans_micro = evaluate_choice(&logits, &criteria, 1e-9).unwrap();
-        assert_eq!(ans_micro.choice.as_deref(), Some("a"));
-        assert!((ans_micro.confidence.unwrap() - 1.0).abs() < 1e-6);
+        assert_eq!(ans_micro.selected(), Some("a"));
+        assert!((ans_micro.confidence().unwrap() - 1.0).abs() < 1e-6);
 
         // 高温極限: 1000.0 (一様分布へ平滑化され確信度が極小化する)。
         let ans_high = evaluate_choice(&logits, &criteria, 1000.0).unwrap();
-        assert!(ans_high.confidence.unwrap() < 1e-3);
+        assert!(ans_high.confidence().unwrap() < 1e-3);
     }
 }
 
@@ -385,7 +385,7 @@ mod deterministic_and_contract {
         for _ in 0..10 {
             let ans = evaluate_choice(&tied_logits, &criteria, 1.0).unwrap();
             assert_eq!(
-                ans.choice.as_deref(),
+                ans.selected(),
                 Some("first"),
                 "同率タイブレークで先頭候補が採択されませんでした。"
             );
@@ -394,7 +394,7 @@ mod deterministic_and_contract {
         // 全候補が同率の場合でも先頭が確定的に採択される。
         let all_tied = vec![3.0, 3.0, 3.0];
         let ans_all = evaluate_choice(&all_tied, &criteria, 1.0).unwrap();
-        assert_eq!(ans_all.choice.as_deref(), Some("first"));
+        assert_eq!(ans_all.selected(), Some("first"));
     }
 
     #[test]
@@ -409,7 +409,7 @@ mod deterministic_and_contract {
             "同じ".to_string(),
         ]);
         let ans_dup_all = evaluate_score(&logits, &crit_dup_all, 1.0).unwrap();
-        let probs_all = ans_dup_all.probabilities.unwrap();
+        let probs_all = ans_dup_all.probabilities().unwrap();
         assert_eq!(probs_all.len(), 3);
         assert!(probs_all.contains_key("0"));
         assert!(probs_all.contains_key("1"));
@@ -422,7 +422,7 @@ mod deterministic_and_contract {
             "Low".to_string(),
         ]);
         let ans_dup_part = evaluate_score(&logits, &crit_dup_part, 1.0).unwrap();
-        let probs_part = ans_dup_part.probabilities.unwrap();
+        let probs_part = ans_dup_part.probabilities().unwrap();
         assert_eq!(probs_part.len(), 3);
         assert!(probs_part.contains_key("0"));
         assert!(probs_part.contains_key("1"));
@@ -432,7 +432,7 @@ mod deterministic_and_contract {
         let crit_empty =
             Criteria::List(vec!["".to_string(), "Mid".to_string(), "High".to_string()]);
         let ans_empty = evaluate_score(&logits, &crit_empty, 1.0).unwrap();
-        let probs_empty = ans_empty.probabilities.unwrap();
+        let probs_empty = ans_empty.probabilities().unwrap();
         assert_eq!(probs_empty.len(), 3);
         assert!(probs_empty.contains_key("0"));
         assert!(probs_empty.contains_key("1"));
@@ -445,7 +445,7 @@ mod deterministic_and_contract {
             "High".to_string(),
         ]);
         let ans_normal = evaluate_score(&logits, &crit_normal, 1.0).unwrap();
-        let probs_normal = ans_normal.probabilities.unwrap();
+        let probs_normal = ans_normal.probabilities().unwrap();
         assert_eq!(probs_normal.len(), 3);
         assert!(probs_normal.contains_key("Low"));
         assert!(probs_normal.contains_key("Mid"));
@@ -465,7 +465,7 @@ mod deterministic_and_contract {
             ]),
         );
         let ans_choice = evaluate_question(&q_choice, &[10.0, 0.0], &config).unwrap();
-        assert_eq!(ans_choice.choice.as_deref(), Some("red"));
+        assert_eq!(ans_choice.selected(), Some("red"));
         assert!(ans_choice.effective_confidence().unwrap() > 0.99);
 
         // 2. Score
@@ -474,13 +474,13 @@ mod deterministic_and_contract {
             vec!["不満".to_string(), "普通".to_string(), "満足".to_string()],
         );
         let ans_score = evaluate_question(&q_score, &[0.0, 0.0, 10.0], &config).unwrap();
-        assert!((ans_score.score.unwrap() - 2.0).abs() < 1e-3);
+        assert!((ans_score.as_score().unwrap() - 2.0).abs() < 1e-3);
         assert!(ans_score.effective_confidence().unwrap() > 0.99);
 
         // 3. Noul
         let q_noul = Question::new_noul("空は青いか？");
         let ans_noul = evaluate_question(&q_noul, &[5.0, 0.0], &config).unwrap();
-        assert!(ans_noul.noul.unwrap() > 0.99);
+        assert!(ans_noul.as_noul().unwrap() > 0.99);
         assert!(ans_noul.effective_confidence().unwrap() > 0.98);
     }
 }

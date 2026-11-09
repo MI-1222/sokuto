@@ -328,7 +328,7 @@ impl GuardrailPipeline {
                     continue;
                 };
 
-                let Some(ref mut probs) = answer.probabilities else {
+                let Some(probs) = answer.probabilities_mut() else {
                     continue;
                 };
 
@@ -466,7 +466,7 @@ mod tests {
 
         // Score 型の probabilities キーがクライアント送信時の元ラベルに復元されていること
         let ans_score = answers.get("q_score").unwrap();
-        let probs = ans_score.probabilities.as_ref().unwrap();
+        let probs = ans_score.probabilities().unwrap();
         assert_eq!(probs.get("1: 軽微"), Some(&0.1));
         assert_eq!(probs.get("2. 中度"), Some(&0.7));
         assert_eq!(probs.get("(3) 重大"), Some(&0.15));

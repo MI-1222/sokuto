@@ -102,10 +102,10 @@ fn test_hierarchical_routing_with_real_model() {
         .expect("階層推論の実行に成功する。");
 
     let answer = result.answer();
-    assert!(answer.choice.is_some());
+    assert!(answer.is_choice());
 
     // 確率分布の総数が全 77 候補であること
-    let probs = answer.probabilities.as_ref().unwrap();
+    let probs = answer.probabilities().unwrap();
     assert_eq!(probs.len(), 77);
 
     // 確率総和が 1.0 であること
@@ -127,7 +127,7 @@ fn test_hierarchical_routing_with_real_model() {
 
     // Answer への消費変換が可能なこと
     let converted_answer = result.into_answer();
-    assert!(converted_answer.choice.is_some());
+    assert!(converted_answer.is_choice());
 }
 
 #[test]
@@ -221,8 +221,8 @@ fn test_hierarchical_routing_with_dirichlet_calibrator() {
         .expect("Dirichlet 較正付き階層推論の実行に成功する。");
 
     let answer = result.answer();
-    assert!(answer.choice.is_some());
-    assert_eq!(answer.probabilities.as_ref().unwrap().len(), 77);
+    assert!(answer.is_choice());
+    assert_eq!(answer.probabilities().unwrap().len(), 77);
 
     // クラス数不一致のエラーハンドリング検証 (大分類 7 に対し クラス数 3 の較正器)
     let mismatched_calibrator = sokuto_runtime::hierarchical::DirichletCalibrator::identity(3);
@@ -295,8 +295,8 @@ fn test_evaluate_batch_questions_hierarchical() {
         .expect("バッチ階層推論の実行に成功する。");
 
     assert_eq!(batch_results.len(), 2);
-    assert!(batch_results.get("q1").unwrap().answer().choice.is_some());
-    assert!(batch_results.get("q2").unwrap().answer().choice.is_some());
+    assert!(batch_results.get("q1").unwrap().answer().is_choice());
+    assert!(batch_results.get("q2").unwrap().answer().is_choice());
 }
 
 #[test]
@@ -360,6 +360,6 @@ fn test_hierarchical_routing_new_dual_session_engine() {
         .expect("デュアルセッションによる階層推論に成功すること。");
 
     let answer = result.answer();
-    assert!(answer.choice.is_some());
+    assert!(answer.is_choice());
     assert!(result.trace().evaluated_fine_count > 0);
 }

@@ -314,14 +314,7 @@ async fn test_pool_borrow_and_drop_lifecycle() {
 
 #[test]
 fn test_evaluate_conditions_short_circuit() {
-    let answer = Answer {
-        choice: Some("card_payment".to_string()),
-        confidence: Some(0.55),
-        probabilities: None,
-        score: None,
-        noul: None,
-        gating: None,
-    };
+    let answer = Answer::choice("card_payment", IndexMap::new(), 0.55);
     let context = IndexMap::new();
 
     // 確信度不足ガードレールを先頭に配置

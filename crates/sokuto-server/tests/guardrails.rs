@@ -370,7 +370,7 @@ async fn test_guardrail_score_prefix_sanitization_and_key_restoration() {
     let resp_prefixed: SystemOneResponse = serde_json::from_slice(&bytes).unwrap();
 
     let ans_prefixed = resp_prefixed.answers.get("q_score").unwrap();
-    let probs_prefixed = ans_prefixed.probabilities.as_ref().unwrap();
+    let probs_prefixed = ans_prefixed.probabilities().unwrap();
 
     // クライアントがリクエストした元ラベルキーがレスポンスで非破壊維持されていること
     assert!(probs_prefixed.contains_key("1: 軽微"));
@@ -421,10 +421,10 @@ async fn test_guardrail_score_prefix_sanitization_and_key_restoration() {
 
     // サニタイズ前処理により、プレフィックス付きと純粋ラベル時で同一のスコア値・確率値が得られること (記号誘発バイアスゼロ化)
     assert!(
-        (ans_prefixed.score.unwrap() - ans_clean.score.unwrap()).abs() < 1e-4,
+        (ans_prefixed.as_score().unwrap() - ans_clean.as_score().unwrap()).abs() < 1e-4,
         "プレフィックス付与時と純粋ラベル時でスコアが一致すること: prefixed={}, clean={}",
-        ans_prefixed.score.unwrap(),
-        ans_clean.score.unwrap()
+        ans_prefixed.as_score().unwrap(),
+        ans_clean.as_score().unwrap()
     );
 }
 
@@ -501,10 +501,10 @@ async fn test_guardrail_noul_instruction_normalization() {
 
     // 正規化ラッピングにより、簡潔言明時と完全指定時で同一の判定確率が得られること
     assert!(
-        (ans_simple.noul.unwrap() - ans_canonical.noul.unwrap()).abs() < 1e-4,
+        (ans_simple.as_noul().unwrap() - ans_canonical.as_noul().unwrap()).abs() < 1e-4,
         "簡潔言明と完全指定時で真偽確率が一致すること: simple={}, canonical={}",
-        ans_simple.noul.unwrap(),
-        ans_canonical.noul.unwrap()
+        ans_simple.as_noul().unwrap(),
+        ans_canonical.as_noul().unwrap()
     );
 }
 

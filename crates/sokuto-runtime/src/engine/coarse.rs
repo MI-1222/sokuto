@@ -6,7 +6,7 @@
 
 use indexmap::IndexMap;
 use sokuto_core::contract::model_spec::MAX_NUM_OPTIONS;
-use sokuto_core::schema::{Question, QuestionType};
+use sokuto_core::schema::{AnswerPayload, Question, QuestionType};
 
 use crate::engine::InferenceEngine;
 use crate::error::{Result, RuntimeError};
@@ -298,11 +298,13 @@ impl<'a> HierarchicalCoarseScorer for ModelDrivenCoarseScorer<'a> {
             self.engine
                 .predict_single_question(self.tokenizer, state, &question, calib)?;
 
-        answer.probabilities.ok_or_else(|| {
-            RuntimeError::InvalidQuestion(
+        match answer.payload {
+            AnswerPayload::Choice { probabilities, .. }
+            | AnswerPayload::Score { probabilities, .. } => Ok(probabilities),
+            _ => Err(RuntimeError::InvalidQuestion(
                 "大分類推論結果に確率分布が含まれていません。".to_string(),
-            )
-        })
+            )),
+        }
     }
 }
 

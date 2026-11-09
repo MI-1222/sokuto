@@ -164,11 +164,11 @@ fn test_end_to_end_question_inference_and_decision() {
     let answer =
         evaluate_question(&question, &logits, &calib_config).expect("決定数理評価に失敗しました。");
 
-    assert!(answer.choice.is_some());
-    let selected = answer.choice.as_ref().unwrap();
-    assert!(["card", "loan", "other"].contains(&selected.as_str()));
-    assert!(answer.confidence.unwrap() >= 0.0 && answer.confidence.unwrap() <= 1.0);
-    assert_eq!(answer.probabilities.as_ref().unwrap().len(), 3);
+    assert!(answer.is_choice());
+    let selected = answer.selected().unwrap();
+    assert!(["card", "loan", "other"].contains(&selected));
+    assert!(answer.confidence().unwrap() >= 0.0 && answer.confidence().unwrap() <= 1.0);
+    assert_eq!(answer.probabilities().unwrap().len(), 3);
 
     // 2. SystemOneResponse への統合
     let mut answers = IndexMap::new();
@@ -207,10 +207,10 @@ fn test_end_to_end_question_inference_and_decision() {
 
     let score_answer = evaluate_question(&score_question, &score_logits, &calib_config)
         .expect("Score 決定数理評価失敗。");
-    assert!(score_answer.score.is_some());
-    let score_val = score_answer.score.unwrap();
+    assert!(score_answer.is_score());
+    let score_val = score_answer.as_score().unwrap();
     assert!((0.0..=4.0).contains(&score_val));
-    assert!((0.0..=1.0).contains(&score_answer.confidence.unwrap()));
+    assert!((0.0..=1.0).contains(&score_answer.confidence().unwrap()));
 
     // 4. Noul 型質問のエンドツーエンド推論
     let noul_question = Question {
@@ -228,8 +228,8 @@ fn test_end_to_end_question_inference_and_decision() {
 
     let noul_answer = evaluate_question(&noul_question, &noul_logits, &calib_config)
         .expect("Noul 決定数理評価失敗。");
-    assert!(noul_answer.noul.is_some());
-    let noul_prob = noul_answer.noul.unwrap();
+    assert!(noul_answer.is_noul());
+    let noul_prob = noul_answer.as_noul().unwrap();
     assert!((0.0..=1.0).contains(&noul_prob));
     let eff_conf = noul_answer.effective_confidence().unwrap();
     assert!((0.0..=1.0).contains(&eff_conf));

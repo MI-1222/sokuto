@@ -24,32 +24,32 @@ fn test_choice_comprehensive() {
     let logits = vec![1.0, 6.0, 0.5, -2.0];
     let ans = evaluate_choice(&logits, &criteria, 1.0).unwrap();
 
-    assert_eq!(ans.choice.as_deref(), Some("billing"));
-    assert!(ans.score.is_none());
-    assert!(ans.noul.is_none());
+    assert_eq!(ans.selected(), Some("billing"));
+    assert!(ans.as_score().is_none());
+    assert!(ans.as_noul().is_none());
 
-    let probs = ans.probabilities.as_ref().unwrap();
+    let probs = ans.probabilities().unwrap();
     assert_eq!(probs.len(), 4);
     assert!(probs["billing"] > 0.90);
     assert!(probs["billing"] + probs["support"] + probs["sales"] + probs["other"] > 0.9999);
 
-    let conf = ans.confidence.unwrap();
+    let conf = ans.confidence().unwrap();
     assert!(conf > 0.70 && conf <= 1.0);
 
     // 2. 完全一様分布(全ロジット同値): 確信度は 0.0、かつタイブレークで先頭候補が選ばれる
     let uniform_logits = vec![2.0, 2.0, 2.0, 2.0];
     let ans_uniform = evaluate_choice(&uniform_logits, &criteria, 1.0).unwrap();
-    assert_eq!(ans_uniform.choice.as_deref(), Some("support"));
-    assert!(ans_uniform.confidence.unwrap() < 1e-6);
+    assert_eq!(ans_uniform.selected(), Some("support"));
+    assert!(ans_uniform.confidence().unwrap() < 1e-6);
 
     // 3. 単一候補 (K=1) のエッジケース: 確信度 1.0、確率 1.0
     let mut single_map = IndexMap::new();
     single_map.insert("only".to_string(), "唯一の選択肢".to_string());
     let criteria_single = Criteria::Map(single_map);
     let ans_single = evaluate_choice(&[5.0], &criteria_single, 1.0).unwrap();
-    assert_eq!(ans_single.choice.as_deref(), Some("only"));
-    assert_eq!(ans_single.confidence, Some(1.0));
-    assert_eq!(ans_single.probabilities.unwrap()["only"], 1.0);
+    assert_eq!(ans_single.selected(), Some("only"));
+    assert_eq!(ans_single.confidence(), Some(1.0));
+    assert_eq!(ans_single.probabilities().unwrap()["only"], 1.0);
 
     // K=1 特異点における非有限値 (NaN, Inf, -Inf) のエラー検出。
     assert!(matches!(
@@ -82,15 +82,15 @@ fn test_score_comprehensive() {
     let logits = vec![-1.0, 0.0, 2.0, 5.0, 1.0];
     let ans = evaluate_score(&logits, &criteria, 1.0).unwrap();
 
-    let score = ans.score.unwrap();
+    let score = ans.as_score().unwrap();
     // 期待値は 2.5 〜 3.5 の間に収まる
     assert!(score > 2.5 && score < 3.5);
 
-    let probs = ans.probabilities.as_ref().unwrap();
+    let probs = ans.probabilities().unwrap();
     assert_eq!(probs.len(), 5);
     assert!(probs["満足"] > 0.70);
 
-    let conf = ans.confidence.unwrap();
+    let conf = ans.confidence().unwrap();
     assert!(conf > 0.50 && conf <= 1.0);
 
     // 2. 二峰性両極端分裂 [0.5, 0.0, 0.0, 0.0, 0.5] (k=0 と k=4)
@@ -99,14 +99,14 @@ fn test_score_comprehensive() {
     // 確信度 C_var = 1.0 - 4.0 / 4.0 = 0.0
     let bimodal_logits = vec![10.0, -100.0, -100.0, -100.0, 10.0];
     let ans_bimodal = evaluate_score(&bimodal_logits, &criteria, 1.0).unwrap();
-    assert!((ans_bimodal.score.unwrap() - 2.0).abs() < 1e-3);
-    assert!(ans_bimodal.confidence.unwrap() < 1e-3);
+    assert!((ans_bimodal.as_score().unwrap() - 2.0).abs() < 1e-3);
+    assert!(ans_bimodal.confidence().unwrap() < 1e-3);
 
     // 3. 単一レベル集中 (ワンホット): 確信度 1.0
     let one_hot_logits = vec![-100.0, -100.0, 20.0, -100.0, -100.0];
     let ans_one_hot = evaluate_score(&one_hot_logits, &criteria, 1.0).unwrap();
-    assert!((ans_one_hot.score.unwrap() - 2.0).abs() < 1e-3);
-    assert!((ans_one_hot.confidence.unwrap() - 1.0).abs() < 1e-3);
+    assert!((ans_one_hot.as_score().unwrap() - 2.0).abs() < 1e-3);
+    assert!((ans_one_hot.confidence().unwrap() - 1.0).abs() < 1e-3);
 }
 
 /// Noul プリミティブの総合評価テスト。
@@ -114,23 +114,23 @@ fn test_score_comprehensive() {
 fn test_noul_comprehensive() {
     // 1. 明確に真である場合
     let ans_true = evaluate_noul(&[5.0, 0.0], 1.0).unwrap();
-    assert!(ans_true.noul.unwrap() > 0.99);
-    assert!(ans_true.choice.is_none());
-    assert!(ans_true.score.is_none());
-    assert!(ans_true.probabilities.is_none());
-    assert!(ans_true.confidence.is_none());
+    assert!(ans_true.as_noul().unwrap() > 0.99);
+    assert!(ans_true.as_choice().is_none());
+    assert!(ans_true.as_score().is_none());
+    assert!(ans_true.probabilities().is_none());
+    assert!(ans_true.confidence().is_none());
 
     // 2. 明確に偽である場合
     let ans_false = evaluate_noul(&[-2.0, 3.0], 1.0).unwrap();
-    assert!(ans_false.noul.unwrap() < 0.01);
+    assert!(ans_false.as_noul().unwrap() < 0.01);
 
     // 3. 五分五分(真偽ロジット同値)
     let ans_neutral = evaluate_noul(&[1.5, 1.5], 1.0).unwrap();
-    assert!((ans_neutral.noul.unwrap() - 0.5).abs() < 1e-6);
+    assert!((ans_neutral.as_noul().unwrap() - 0.5).abs() < 1e-6);
 
     // 4. 極端なロジット差でもオーバーフロー・アンダーフローせず動作
     let ans_extreme = evaluate_noul(&[5000.0, -5000.0], 1.0).unwrap();
-    assert!((ans_extreme.noul.unwrap() - 1.0).abs() < 1e-6);
+    assert!((ans_extreme.as_noul().unwrap() - 1.0).abs() < 1e-6);
 }
 
 /// CalibrationConfig を介した温度自動適用と複数質問の一括レスポンス生成テスト。
@@ -162,7 +162,7 @@ fn test_evaluate_question_and_systemone_response() {
     let q_choice = Question::new_choice("問い合わせを分類せよ。", category_map);
     let logits_choice = vec![3.0, 1.0, 0.0];
     let ans_choice = evaluate_question(&q_choice, &logits_choice, &config).unwrap();
-    assert_eq!(ans_choice.choice.as_deref(), Some("bug"));
+    assert_eq!(ans_choice.selected(), Some("bug"));
 
     // 質問 2: Score (3段階 -> score バケット "2-5" の温度 1.08 が適用される)
     let q_score = Question::new_score(
@@ -171,13 +171,13 @@ fn test_evaluate_question_and_systemone_response() {
     );
     let logits_score = vec![0.0, 2.0, 4.0];
     let ans_score = evaluate_question(&q_score, &logits_score, &config).unwrap();
-    assert!(ans_score.score.unwrap() > 1.5);
+    assert!(ans_score.as_score().unwrap() > 1.5);
 
     // 質問 3: Noul (温度 0.95 が適用される)
     let q_noul = Question::new_noul("有料プランのユーザーか。");
     let logits_noul = vec![2.0, 0.0];
     let ans_noul = evaluate_question(&q_noul, &logits_noul, &config).unwrap();
-    assert!(ans_noul.noul.unwrap() > 0.85);
+    assert!(ans_noul.as_noul().unwrap() > 0.85);
 
     // レスポンス全体の構築
     let mut answers = IndexMap::new();
@@ -209,14 +209,14 @@ fn test_zero_allocation_buffers() {
     let mut buf = [0.0; 2];
     let ans_choice =
         evaluate_choice_with_buf(&[2.0, 1.0], &Criteria::Map(criteria_map), 1.0, &mut buf).unwrap();
-    assert_eq!(ans_choice.choice.as_deref(), Some("a"));
+    assert_eq!(ans_choice.selected(), Some("a"));
 
     // 2. Score with buf
     let criteria_list = Criteria::List(vec!["0".to_string(), "1".to_string(), "2".to_string()]);
     let mut buf_score = [0.0; 3];
     let ans_score =
         evaluate_score_with_buf(&[0.0, 1.0, 3.0], &criteria_list, 1.0, &mut buf_score).unwrap();
-    assert!(ans_score.score.unwrap() > 1.0);
+    assert!(ans_score.as_score().unwrap() > 1.0);
 }
 
 /// ゲーティング処理に向けた effective_confidence の動作検証。
@@ -230,7 +230,7 @@ fn test_effective_confidence_for_gating() {
 
     // Noul: confidence は None だが、effective_confidence() では |2P - 1| が透過的に得られる
     let ans_noul_high = sokuto_core::Answer::noul(0.95);
-    assert!(ans_noul_high.confidence.is_none());
+    assert!(ans_noul_high.confidence().is_none());
     assert!((ans_noul_high.effective_confidence().unwrap() - 0.90).abs() < 1e-6);
 
     let ans_noul_mid = sokuto_core::Answer::noul(0.50);

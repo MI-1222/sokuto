@@ -7,6 +7,8 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use indexmap::IndexMap;
+
 use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_core::contract::model_spec::{
     ModelInputDimensions, OP_INDEX_PADDING, TENSOR_ATTENTION_MASK, TENSOR_INPUT_IDS, TENSOR_LOGITS,
@@ -14,7 +16,7 @@ use sokuto_core::contract::model_spec::{
 };
 use sokuto_core::decision::evaluate_question;
 use sokuto_core::gating::GatingConfig;
-use sokuto_core::schema::{Answer, Question, QuestionType};
+use sokuto_core::schema::{Answer, AnswerPayload, Question, QuestionType};
 
 use ort::session::Session;
 use ort::session::builder::SessionBuilder;
@@ -529,19 +531,23 @@ impl InferenceEngine {
             .map_err(RuntimeError::Core)?;
 
         // 5. 全候補空間に対する確率マップの再構成
-        let full_probabilities = sub_answer
-            .probabilities
-            .as_ref()
-            .map(|sub_probs| reconstruct_probabilities(&original_keys, sub_probs));
-
-        let mut answer = Answer {
-            choice: sub_answer.choice,
-            confidence: sub_answer.confidence,
-            probabilities: full_probabilities,
-            score: None,
-            noul: None,
-            gating: None,
+        let (selected, confidence, full_probabilities) = match sub_answer.payload {
+            AnswerPayload::Choice {
+                selected,
+                probabilities,
+                confidence,
+            } => {
+                let full = reconstruct_probabilities(&original_keys, &probabilities);
+                (selected, confidence, full)
+            }
+            _ => (
+                sub_answer.selected().unwrap_or("").to_string(),
+                sub_answer.confidence().unwrap_or(0.0),
+                IndexMap::new(),
+            ),
         };
+
+        let mut answer = Answer::choice(selected, full_probabilities, confidence);
 
         // 6. ゲーティング判定の適用 (縮小空間での確信度・正規化自由エネルギーを尊重しつつ監査メタデータを付与)
         let energy = calculate_choice_energy(&sub_question, &sub_logits, calib_config);

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use indexmap::IndexMap;
 use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_core::gating::DecisionRoute;
-use sokuto_core::schema::Answer;
+use sokuto_core::schema::{Answer, AnswerPayload};
 
 use crate::dag::interpolate::{NodeContextValue, interpolate_prompt, interpolate_question};
 use crate::dag::pool::PoolError;
@@ -338,8 +338,7 @@ impl InProcessDagExecutor {
                     {
                         use sokuto_core::gating::CandidateProbability;
                         let candidates: Vec<CandidateProbability> = ans
-                            .probabilities
-                            .as_ref()
+                            .probabilities()
                             .map(|p| {
                                 let mut list: Vec<_> = p
                                     .iter()
@@ -406,15 +405,13 @@ impl InProcessDagExecutor {
 
 /// Answer をコンテキスト値に変換する内部ヘルパー。
 fn answer_to_context_value(answer: &Answer) -> NodeContextValue {
-    let conf = answer.confidence.unwrap_or(0.0);
-    if let Some(ref c) = answer.choice {
-        NodeContextValue::new(c.clone(), conf)
-    } else if let Some(n) = answer.noul {
-        NodeContextValue::new(if n >= 0.5 { "true" } else { "false" }, conf)
-    } else if let Some(s) = answer.score {
-        NodeContextValue::new(format!("{s}"), conf)
-    } else {
-        NodeContextValue::new("null", conf)
+    let conf = answer.effective_confidence().unwrap_or(0.0);
+    match &answer.payload {
+        AnswerPayload::Choice { selected, .. } => NodeContextValue::new(selected.clone(), conf),
+        AnswerPayload::Score { value, .. } => NodeContextValue::new(format!("{value}"), conf),
+        AnswerPayload::Noul { probability } => {
+            NodeContextValue::new(if *probability >= 0.5 { "true" } else { "false" }, conf)
+        }
     }
 }
 
@@ -442,7 +439,7 @@ fn matches_condition(
 
     // 1. confidence フィールドの比較
     if field == "confidence" {
-        let conf = answer.and_then(|a| a.confidence).unwrap_or(0.0);
+        let conf = answer.and_then(|a| a.effective_confidence()).unwrap_or(0.0);
         let target_val = match &cond.value {
             Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0),
             _ => 0.0,
@@ -482,7 +479,7 @@ fn matches_condition(
         && let Some(ans) = answer
     {
         // Noul (言明真実確率値 f64: 0.0〜1.0) 型判定
-        if let Some(noul_val) = ans.noul {
+        if let Some(noul_val) = ans.as_noul() {
             // bool リテラルまたは文字列による判定 (true: >= 0.5, false: < 0.5)
             let target_bool = match &cond.value {
                 Some(serde_json::Value::Bool(b)) => Some(*b),
@@ -517,7 +514,7 @@ fn matches_condition(
         }
 
         // Choice (文字列) 型判定
-        if let Some(ref choice_val) = ans.choice {
+        if let Some(choice_val) = ans.selected() {
             match cond.op {
                 NodeConditionOp::Eq => {
                     let target_str = cond.value.as_ref().and_then(|v| v.as_str()).unwrap_or("");
@@ -539,7 +536,7 @@ fn matches_condition(
         }
 
         // Score (数値) 型判定
-        if let Some(score_val) = ans.score {
+        if let Some(score_val) = ans.as_score() {
             let target_num = cond.value.as_ref().and_then(|v| v.as_f64()).unwrap_or(0.0);
             return match cond.op {
                 NodeConditionOp::Eq => (score_val - target_num).abs() < 1e-6,
@@ -601,14 +598,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_conditions_confidence() {
-        let answer = Answer {
-            choice: Some("transfer".to_string()),
-            confidence: Some(0.62),
-            probabilities: None,
-            score: None,
-            noul: None,
-            gating: None,
-        };
+        let answer = Answer::choice("transfer", IndexMap::new(), 0.62);
         let context = IndexMap::new();
 
         let conditions = vec![
@@ -632,14 +622,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_conditions_noul() {
-        let answer = Answer {
-            choice: None,
-            confidence: Some(0.98),
-            probabilities: None,
-            score: None,
-            noul: Some(0.02),
-            gating: None,
-        };
+        let answer = Answer::noul(0.02);
         let context = IndexMap::new();
 
         let conditions = vec![

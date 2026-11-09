@@ -528,10 +528,10 @@ impl InferenceEngine {
         // スクリーニングされた質問の確率マップを全候補空間に復元し、ゲーティングを再適用
         for (q_key, original_keys) in &original_keys_map {
             if let Some(answer) = answers.get_mut(q_key)
-                && let Some(ref sub_probs) = answer.probabilities
+                && let Some(sub_probs) = answer.probabilities()
             {
                 let full_probs = reconstruct_probabilities(original_keys, sub_probs);
-                answer.probabilities = Some(full_probs);
+                answer.set_probabilities(full_probs);
                 let orig_q = questions.get(q_key);
                 let energy = answer.gating.as_ref().and_then(|g| g.energy);
                 apply_gating_to_answer_with_energy(
@@ -748,10 +748,10 @@ impl InferenceEngine {
         // 4. スクリーニングされた質問の確率マップを全候補空間に復元し、ゲーティングを適用
         for (q_key, original_keys) in &original_keys_map {
             if let Some(answer) = answers.get_mut(q_key)
-                && let Some(ref sub_probs) = answer.probabilities
+                && let Some(sub_probs) = answer.probabilities()
             {
                 let full_probs = reconstruct_probabilities(original_keys, sub_probs);
-                answer.probabilities = Some(full_probs);
+                answer.set_probabilities(full_probs);
                 let orig_q = questions.get(q_key);
                 let energy = coarse_energies.get(q_key).copied().flatten();
                 apply_gating_to_answer_with_energy(

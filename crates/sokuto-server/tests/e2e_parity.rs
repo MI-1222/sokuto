@@ -182,7 +182,7 @@ async fn test_e2e_parity_all_golden_cases() {
             // 1. Choice 型の採択キー検証
             if let Some(expected_choice) = expected_ans["choice"].as_str() {
                 assert_eq!(
-                    actual_ans.choice.as_deref(),
+                    actual_ans.selected(),
                     Some(expected_choice),
                     "ケース '{case_id}' ({q_id}): Choice 採択キーが不一致です。"
                 );
@@ -190,7 +190,7 @@ async fn test_e2e_parity_all_golden_cases() {
 
             // 2. Score 型の加重平均値検証
             if let Some(expected_score) = expected_ans["score"].as_f64() {
-                let actual_score = actual_ans.score.unwrap_or_else(|| {
+                let actual_score = actual_ans.as_score().unwrap_or_else(|| {
                     panic!("ケース '{case_id}' ({q_id}): score が None です。");
                 });
                 let diff = (actual_score - expected_score).abs();
@@ -205,7 +205,7 @@ async fn test_e2e_parity_all_golden_cases() {
             // 3. Noul 型の真実確率値検証
             if let Some(expected_noul) = expected_ans["noul"].as_f64() {
                 let actual_noul = actual_ans
-                    .noul
+                    .as_noul()
                     .unwrap_or_else(|| panic!("ケース '{case_id}' ({q_id}): noul が None です。"));
                 let diff = (actual_noul - expected_noul).abs();
                 assert!(
@@ -218,7 +218,7 @@ async fn test_e2e_parity_all_golden_cases() {
 
             // 4. 各候補の確率分布検証
             if let Some(expected_probs) = expected_ans["probabilities"].as_object() {
-                let actual_probs = actual_ans.probabilities.as_ref().unwrap_or_else(|| {
+                let actual_probs = actual_ans.probabilities().unwrap_or_else(|| {
                     panic!("ケース '{case_id}' ({q_id}): probabilities が None です。");
                 });
                 for (opt_key, expected_prob_val) in expected_probs {
@@ -238,7 +238,7 @@ async fn test_e2e_parity_all_golden_cases() {
 
             // 5. 確信度スコアの検証
             if let Some(expected_conf) = expected_ans["confidence"].as_f64() {
-                let actual_conf = actual_ans.confidence.unwrap_or_else(|| {
+                let actual_conf = actual_ans.confidence().unwrap_or_else(|| {
                     panic!("ケース '{case_id}' ({q_id}): confidence が None です。");
                 });
                 let diff = (actual_conf - expected_conf).abs();
@@ -338,18 +338,18 @@ async fn test_e2e_scenario_ec_hardware_defect_details() {
 
     // 部署判定: tech_support が採択されること
     let dept = actual.answers.get("department").unwrap();
-    assert_eq!(dept.choice.as_deref(), Some("tech_support"));
-    let dept_probs = dept.probabilities.as_ref().unwrap();
+    assert_eq!(dept.selected(), Some("tech_support"));
+    let dept_probs = dept.probabilities().unwrap();
     assert!(dept_probs["tech_support"] > 0.50);
 
     // 緊急度判定: Score が 1.0〜5.0 の範囲内であること
     let urgency = actual.answers.get("urgency_score").unwrap();
-    let score_val = urgency.score.unwrap();
+    let score_val = urgency.as_score().unwrap();
     assert!((1.0..=5.0).contains(&score_val));
 
     // ハードウェア初期不良判定: Noul 真実確率が [0.0, 1.0] に収まり、実効確信度が高水準であること
     let defect = actual.answers.get("is_hardware_defect").unwrap();
-    let p_defect = defect.noul.unwrap();
+    let p_defect = defect.as_noul().unwrap();
     assert!((0.0..=1.0).contains(&p_defect));
     let eff_conf = defect.effective_confidence().unwrap();
     assert!(eff_conf > 0.80);
@@ -398,7 +398,7 @@ async fn test_e2e_scenario_payment_incident_e403_details() {
     let actual: SystemOneResponse = serde_json::from_slice(&body_bytes).unwrap();
 
     let action = actual.answers.get("action").unwrap();
-    assert!(action.choice.is_some());
+    assert!(action.is_choice());
     assert!(action.gating.is_some());
     let gating_meta = action.gating.as_ref().unwrap();
     assert_eq!(
@@ -456,7 +456,7 @@ async fn test_e2e_scenario_fraud_detection_vip_details() {
     let actual: SystemOneResponse = serde_json::from_slice(&body_bytes).unwrap();
 
     let fraud = actual.answers.get("fraud_risk").unwrap();
-    let p_true = fraud.noul.unwrap();
+    let p_true = fraud.as_noul().unwrap();
     // VIP かつリスクスコア低のため、不正確率は低水準 (< 0.50) であること
     assert!(
         p_true < 0.50,
@@ -502,8 +502,8 @@ async fn test_e2e_large_scale_k16_reconstruction() {
     let actual: SystemOneResponse = serde_json::from_slice(&body_bytes).unwrap();
 
     let pref = actual.answers.get("prefecture").unwrap();
-    assert!(pref.choice.is_some());
-    let probs = pref.probabilities.as_ref().unwrap();
+    assert!(pref.is_choice());
+    let probs = pref.probabilities().unwrap();
     assert_eq!(probs.len(), 16, "全16候補の確率が復元されていること。");
 
     let sum_probs: f64 = probs.values().sum();

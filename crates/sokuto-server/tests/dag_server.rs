@@ -414,11 +414,8 @@ async fn test_systemone_transparent_hierarchical_routing_integration() {
         .answers
         .get("q_topic")
         .expect("回答が存在すること。");
-    assert!(answer.choice.is_some());
-    let probs = answer
-        .probabilities
-        .as_ref()
-        .expect("確率分布が存在すること。");
+    assert!(answer.is_choice());
+    let probs = answer.probabilities().expect("確率分布が存在すること。");
     assert_eq!(probs.len(), 4);
     // 確率の合計値がほぼ 1.0 であること
     let sum_prob: f64 = probs.values().sum();
@@ -493,7 +490,7 @@ async fn test_systemone_transparent_hierarchical_routing_fallback_on_unrelated_c
         .answers
         .get("q_priority")
         .expect("回答が存在すること。");
-    assert!(answer.choice.is_some());
+    assert!(answer.is_choice());
     assert_eq!(sys1_res.usage.completion_tokens, 0);
 }
 

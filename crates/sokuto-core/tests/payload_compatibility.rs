@@ -310,3 +310,133 @@ fn test_decision_request_trait_and_conversion() {
     assert_eq!(s1_req.questions.len(), 1);
     assert!(s1_req.validate().is_ok());
 }
+
+/// `Answer` 構造体の直和型 (AnswerPayload) による型安全性と相互変換の検証テスト。
+#[test]
+fn test_answer_payload_type_safety_and_roundtrip() {
+    use sokuto_core::schema::AnswerPayload;
+
+    // 1. Choice 型の生成とアクセサ
+    let mut choice_probs = IndexMap::new();
+    choice_probs.insert("opt_a".to_string(), 0.9);
+    choice_probs.insert("opt_b".to_string(), 0.1);
+    let ans_choice = Answer::choice("opt_a", choice_probs.clone(), 0.85);
+
+    assert!(ans_choice.is_choice());
+    assert!(!ans_choice.is_score());
+    assert!(!ans_choice.is_noul());
+    assert_eq!(ans_choice.selected(), Some("opt_a"));
+    assert_eq!(ans_choice.as_score(), None);
+    assert_eq!(ans_choice.as_noul(), None);
+    assert_eq!(ans_choice.confidence(), Some(0.85));
+    assert_eq!(ans_choice.effective_confidence(), Some(0.85));
+    assert_eq!(ans_choice.question_type(), QuestionType::Choice);
+
+    // シリアライズ検証: choice, probabilities, confidence のみが出力され、score, noul は出力されないこと。
+    let choice_val = serde_json::to_value(&ans_choice).unwrap();
+    assert_eq!(choice_val["choice"], "opt_a");
+    assert_eq!(choice_val["confidence"], 0.85);
+    assert!(choice_val.get("score").is_none());
+    assert!(choice_val.get("noul").is_none());
+
+    // デシリアライズ検証: ラウンドトリップで同一の AnswerPayload::Choice に復元されること。
+    let restored_choice: Answer = serde_json::from_value(choice_val).unwrap();
+    assert_eq!(restored_choice, ans_choice);
+    match &restored_choice.payload {
+        AnswerPayload::Choice {
+            selected,
+            probabilities,
+            confidence,
+        } => {
+            assert_eq!(selected, "opt_a");
+            assert_eq!(probabilities, &choice_probs);
+            assert_eq!(*confidence, 0.85);
+        }
+        _ => panic!("Choice 型に復元される必要があります。"),
+    }
+
+    // 2. Score 型の生成とアクセサ
+    let mut score_probs = IndexMap::new();
+    score_probs.insert("1".to_string(), 0.2);
+    score_probs.insert("2".to_string(), 0.8);
+    let ans_score = Answer::score(1.8, score_probs.clone(), 0.75);
+
+    assert!(ans_score.is_score());
+    assert_eq!(ans_score.as_score(), Some(1.8));
+    assert_eq!(ans_score.selected(), None);
+    assert_eq!(ans_score.as_noul(), None);
+    assert_eq!(ans_score.confidence(), Some(0.75));
+    assert_eq!(ans_score.effective_confidence(), Some(0.75));
+    assert_eq!(ans_score.question_type(), QuestionType::Score);
+
+    let score_val = serde_json::to_value(&ans_score).unwrap();
+    assert_eq!(score_val["score"], 1.8);
+    assert!(score_val.get("choice").is_none());
+    assert!(score_val.get("noul").is_none());
+
+    let restored_score: Answer = serde_json::from_value(score_val).unwrap();
+    assert_eq!(restored_score, ans_score);
+
+    // 3. Noul 型の生成とアクセサ
+    let ans_noul = Answer::noul(0.92);
+    assert!(ans_noul.is_noul());
+    assert_eq!(ans_noul.as_noul(), Some(0.92));
+    assert_eq!(ans_noul.selected(), None);
+    assert_eq!(ans_noul.as_score(), None);
+    assert_eq!(ans_noul.confidence(), None);
+    // Noul の実効確信度: |2 * 0.92 - 1.0| = 0.84
+    assert!((ans_noul.effective_confidence().unwrap() - 0.84).abs() < 1e-6);
+    assert_eq!(ans_noul.question_type(), QuestionType::Noul);
+
+    let noul_val = serde_json::to_value(&ans_noul).unwrap();
+    assert_eq!(noul_val["noul"], 0.92);
+    assert!(noul_val.get("choice").is_none());
+    assert!(noul_val.get("score").is_none());
+    assert!(noul_val.get("probabilities").is_none());
+    assert!(noul_val.get("confidence").is_none());
+
+    let restored_noul: Answer = serde_json::from_value(noul_val).unwrap();
+    assert_eq!(restored_noul, ans_noul);
+}
+
+/// Jev プロトコル上あり得ない不正な矛盾状態がデシリアライズ時に厳密に拒絶されることを検証するテスト。
+#[test]
+fn test_answer_rejects_invalid_contradictory_states() {
+    // 1. Choice なのに score が含まれている矛盾状態の拒絶
+    let conflict_choice_score = json!({
+        "choice": "opt_a",
+        "score": 2.5,
+        "probabilities": {"opt_a": 1.0},
+        "confidence": 0.95
+    });
+    let result: Result<Answer, _> = serde_json::from_value(conflict_choice_score);
+    assert!(
+        result.is_err(),
+        "choice と score の両方が含まれる矛盾 JSON は拒絶される必要があります。"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(err_msg.contains("mutually exclusive"));
+
+    // 2. Score なのに noul が含まれている矛盾状態の拒絶
+    let conflict_score_noul = json!({
+        "score": 3.0,
+        "noul": 0.8
+    });
+    let result: Result<Answer, _> = serde_json::from_value(conflict_score_noul);
+    assert!(
+        result.is_err(),
+        "score と noul の両方が含まれる矛盾 JSON は拒絶される必要があります。"
+    );
+
+    // 3. choice, score, noul のいずれも含まれていない空状態の拒絶
+    let empty_answer = json!({
+        "confidence": 0.5
+    });
+    let result: Result<Answer, _> = serde_json::from_value(empty_answer);
+    assert!(
+        result.is_err(),
+        "判定フィールドを何も持たない空の Answer は拒絶される必要があります。"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(err_msg.contains("must contain exactly one of"));
+}

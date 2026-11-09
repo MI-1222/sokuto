@@ -338,16 +338,16 @@ fn test_end_to_end_coarse_to_fine_with_onnx_model() {
         .expect("Coarse-to-Fine 推論に失敗しました。");
 
     // 検証
-    assert!(answer.choice.is_some());
-    let selected = answer.choice.as_ref().unwrap();
+    assert!(answer.is_choice());
+    let selected = answer.selected().unwrap();
     eprintln!("選択された候補: {selected}");
 
     // 確信度が 0.0〜1.0 の範囲内であること
-    let conf = answer.confidence.unwrap();
+    let conf = answer.confidence().unwrap();
     assert!((0.0..=1.0).contains(&conf));
 
     // 全 77 候補のキーが probabilities に含まれていること
-    let probs = answer.probabilities.as_ref().unwrap();
+    let probs = answer.probabilities().unwrap();
     assert_eq!(probs.len(), 77);
     assert!(probs.contains_key("other"));
     assert!(probs.contains_key(selected));
@@ -445,22 +445,22 @@ fn test_batch_coarse_to_fine_mixed_questions() {
 
     // q_large_choice: 77 候補の確率マップが復元され、候補が選ばれていること
     let ans_large = answers.get("q_large_choice").unwrap();
-    assert!(ans_large.choice.is_some());
-    assert_eq!(ans_large.probabilities.as_ref().unwrap().len(), 77);
+    assert!(ans_large.is_choice());
+    assert_eq!(ans_large.probabilities().unwrap().len(), 77);
 
     // q_small_choice: 3 候補の確率マップ、候補が選ばれていること
     let ans_small = answers.get("q_small_choice").unwrap();
-    assert!(ans_small.choice.is_some());
-    assert_eq!(ans_small.probabilities.as_ref().unwrap().len(), 3);
+    assert!(ans_small.is_choice());
+    assert_eq!(ans_small.probabilities().unwrap().len(), 3);
 
     // q_score: 期待スコアが算出されていること
     let ans_score = answers.get("q_score").unwrap();
-    assert!(ans_score.score.is_some());
+    assert!(ans_score.is_score());
 
     // q_noul: 真実確率が算出されていること
     let ans_noul = answers.get("q_noul").unwrap();
-    assert!(ans_noul.noul.is_some());
-    assert!((0.0..=1.0).contains(&ans_noul.noul.unwrap()));
+    assert!(ans_noul.is_noul());
+    assert!((0.0..=1.0).contains(&ans_noul.as_noul().unwrap()));
 }
 
 #[test]

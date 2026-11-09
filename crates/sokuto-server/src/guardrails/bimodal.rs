@@ -176,7 +176,7 @@ pub fn verify_and_adjust_bimodal(
             continue;
         }
 
-        let Some(ref probs_map) = answer.probabilities else {
+        let Some(probs_map) = answer.probabilities() else {
             continue;
         };
 
@@ -303,6 +303,6 @@ mod tests {
         assert_eq!(gating.route, DecisionRoute::ConfirmOrEscalate);
         assert_eq!(gating.confidence, 0.20);
         assert!(gating.reason.contains("[Bimodal Contradiction]"));
-        assert_eq!(adjusted.confidence, Some(0.95));
+        assert_eq!(adjusted.confidence(), Some(0.95));
     }
 }

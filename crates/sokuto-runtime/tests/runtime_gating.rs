@@ -290,7 +290,7 @@ fn test_coarse_to_fine_gating_and_reconstruction() {
     let gating = ans.gating.as_ref().unwrap();
 
     // 確率マップが全 10 候補に復元されていることを検証
-    let probs = ans.probabilities.as_ref().expect("確率マップが存在する。");
+    let probs = ans.probabilities().expect("確率マップが存在する。");
     assert_eq!(probs.len(), 10, "10 候補すべての確率が復元されている。");
 
     // ゲーティングの確信度・エントロピー・マージンが正しく計算されていることを検証

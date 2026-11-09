@@ -438,43 +438,90 @@ pub fn argmax(values: &[f64]) -> Result<usize> {
     Ok(best_index)
 }
 
-/// Score 型の確率分布から加重平均スコア実数値を算出する。
+/// 任意の確率値イテレータから加重平均スコア実数値 $\text{Score} \in [0.0, M-1.0]$ を単一パス走査で算出する。
 ///
+/// # 数理仕様
 /// 各段階レベル $k \in \{0, \dots, M-1\}$ に対して $\text{Score} = \sum k \cdot p_k$ を計算する。
-pub fn expected_score(probabilities: &[f64]) -> Result<f64> {
-    if probabilities.len() < 2 {
+///
+/// - $O(M)$ 単一パス走査により、ゼロアロケーションで計算する。
+/// - $M < 2$ の場合は段階数不足エラーとして `CoreError::MathError` を返却する。
+/// - 非有限値(NaNまたは無限大)や負の確率値が含まれる場合は `CoreError::MathError` を返却する。
+///
+/// # 引数
+/// - `iter`: 各段階レベルの確率値(`f64` または `&f64`)を提供するイテレータ。
+///
+/// # 戻り値
+/// - 成功時は加重平均スコア実数値、不正時は `CoreError::MathError`。
+pub fn expected_score_iter<I>(iter: I) -> Result<f64>
+where
+    I: IntoIterator,
+    I::Item: Borrow<f64>,
+{
+    let mut count: usize = 0;
+    let mut score = 0.0;
+
+    for (k, item) in iter.into_iter().enumerate() {
+        let p = *item.borrow();
+        if !p.is_finite() {
+            return Err(CoreError::MathError {
+                message: "確率値に非有限値(NaNまたは無限大)が含まれています。".to_string(),
+            });
+        }
+        if p < 0.0 {
+            return Err(CoreError::MathError {
+                message: format!("負の確率値が含まれています: {p}。"),
+            });
+        }
+        count += 1;
+        score += (k as f64) * p;
+    }
+
+    if count < 2 {
         return Err(CoreError::MathError {
             message: "Score の確率分布は 2 段階以上必要です。".to_string(),
         });
     }
 
-    let mut score = 0.0;
-    for (k, &p) in probabilities.iter().enumerate() {
-        if !p.is_finite() {
-            return Err(CoreError::MathError {
-                message: "確率値に非有限値(NaNまたは無限大)が含まれています。".to_string(),
-            });
-        }
-        if p < 0.0 {
-            return Err(CoreError::MathError {
-                message: format!("負の確率値が含まれています: {p}。"),
-            });
-        }
-        score += (k as f64) * p;
-    }
-
     Ok(score)
 }
 
-/// Score 型の確率分布からスコアの事後分散 $\text{Var}\[S\]$ を算出する。
+/// Score 型の確率分布から加重平均スコア実数値を算出する。
 ///
-/// 段階レベル $k \in \{0, \dots, M-1\}$ に対し、加重平均期待値 $\hat{s} = E\[S\]$ を用いて
-/// $\text{Var}\[S\] = \sum_{k=0}^{M-1} (k - \hat{s})^2 p_k$ を計算する。
-pub fn score_variance(probabilities: &[f64]) -> Result<f64> {
-    let mean = expected_score(probabilities)?;
+/// 各段階レベル $k \in \{0, \dots, M-1\}$ に対して $\text{Score} = \sum k \cdot p_k$ を計算する。
+///
+/// # 備考
+/// - [`expected_score_iter`] を呼び出すゼロコストラッパーとして動作する。
+#[inline]
+pub fn expected_score(probabilities: &[f64]) -> Result<f64> {
+    expected_score_iter(probabilities)
+}
 
-    let mut variance = 0.0;
-    for (k, &p) in probabilities.iter().enumerate() {
+/// 任意の確率値イテレータから、段階数 $M$、加重平均期待値 $E[S]$、事後分散 $\text{Var}[S]$ を単一パス走査で算出する。
+///
+/// # 数理仕様
+/// Welford の重み付きオンラインアルゴリズムに基づき、単一パス走査で桁落ちなく正確に集計する。
+///
+/// - $O(M)$ 単一パス走査により、二重走査や中間 `Vec` 確保(ヒープアロケーション)を完全に排除する。
+/// - $M < 2$ の場合は段階数不足エラーとして `CoreError::MathError` を返却する。
+/// - 非有限値(NaNまたは無限大)や負の確率値が含まれる場合は `CoreError::MathError` を返却する。
+///
+/// # 引数
+/// - `iter`: 各段階レベルの確率値(`f64` または `&f64`)を提供するイテレータ。
+///
+/// # 戻り値
+/// - 成功時は `(count, expected_score, variance)` のタプル、不正時は `CoreError::MathError`。
+pub fn score_moments_iter<I>(iter: I) -> Result<(usize, f64, f64)>
+where
+    I: IntoIterator,
+    I::Item: Borrow<f64>,
+{
+    let mut count: usize = 0;
+    let mut weight_sum = 0.0;
+    let mut mean = 0.0;
+    let mut m2 = 0.0;
+
+    for (k, item) in iter.into_iter().enumerate() {
+        let p = *item.borrow();
         if !p.is_finite() {
             return Err(CoreError::MathError {
                 message: "確率値に非有限値(NaNまたは無限大)が含まれています。".to_string(),
@@ -485,12 +532,69 @@ pub fn score_variance(probabilities: &[f64]) -> Result<f64> {
                 message: format!("負の確率値が含まれています: {p}。"),
             });
         }
-        let diff = (k as f64) - mean;
-        variance += diff * diff * p;
+
+        count += 1;
+        let x = k as f64;
+        let temp = weight_sum + p;
+        let delta = x - mean;
+        let r = if temp > 0.0 { delta * p / temp } else { 0.0 };
+        mean += r;
+        m2 += weight_sum * delta * r;
+        weight_sum = temp;
     }
 
-    // 浮動小数点誤差による負数の発生を防止する。
-    Ok(variance.max(0.0))
+    if count < 2 {
+        return Err(CoreError::MathError {
+            message: "Score の確率分布は 2 段階以上必要です。".to_string(),
+        });
+    }
+
+    Ok((count, mean, m2.max(0.0)))
+}
+
+/// 任意の確率値イテレータからスコアの事後分散 $\text{Var}[S]$ を単一パス走査で算出する。
+///
+/// # 備考
+/// - [`score_moments_iter`] を呼び出し、単一パス走査で事後分散を取得する。
+pub fn score_variance_iter<I>(iter: I) -> Result<f64>
+where
+    I: IntoIterator,
+    I::Item: Borrow<f64>,
+{
+    let (_, _, var) = score_moments_iter(iter)?;
+    Ok(var)
+}
+
+/// Score 型の確率分布からスコアの事後分散 $\text{Var}[S]$ を算出する。
+///
+/// 段階レベル $k \in \{0, \dots, M-1\}$ に対し、加重平均期待値 $\hat{s} = E[S]$ を用いて
+/// $\text{Var}[S] = \sum_{k=0}^{M-1} (k - \hat{s})^2 p_k$ を計算する。
+///
+/// # 備考
+/// - [`score_variance_iter`] を呼び出すゼロコストラッパーとして動作する。
+#[inline]
+pub fn score_variance(probabilities: &[f64]) -> Result<f64> {
+    score_variance_iter(probabilities)
+}
+
+/// 任意の確率値イテレータから、最大可能分散で正規化した確信度 $C_{\text{var}} \in [0.0, 1.0]$ を単一パス走査で算出する。
+///
+/// # 備考
+/// - [`score_moments_iter`] を呼び出し、単一パス走査で段階数と事後分散を取得して正規化確信度を計算する。
+pub fn normalized_variance_confidence_iter<I>(iter: I) -> Result<f64>
+where
+    I: IntoIterator,
+    I::Item: Borrow<f64>,
+{
+    let (m, _, var) = score_moments_iter(iter)?;
+    let max_var = ((m - 1) as f64).powi(2) / 4.0;
+
+    if max_var <= 0.0 {
+        return Ok(1.0);
+    }
+
+    let confidence = 1.0 - (var / max_var);
+    Ok(confidence.clamp(0.0, 1.0))
 }
 
 /// Score 型の確率分布から、最大可能分散で正規化した確信度 $C_{\text{var}} \in [0.0, 1.0]$ を算出する。
@@ -509,23 +613,29 @@ pub fn score_variance(probabilities: &[f64]) -> Result<f64> {
 ///
 /// # 戻り値
 /// - 成功時は `[0.0, 1.0]` の閉区間にクランプされた正規化確信度、不正時は `CoreError::MathError`。
+#[inline]
 pub fn normalized_variance_confidence(probabilities: &[f64]) -> Result<f64> {
-    let m = probabilities.len();
-    if m < 2 {
-        return Err(CoreError::MathError {
-            message: "Score の確信度計算には 2 段階以上の確率分布が必要です。".to_string(),
-        });
-    }
+    normalized_variance_confidence_iter(probabilities)
+}
 
-    let var = score_variance(probabilities)?;
+/// 任意の確率値イテレータから、理論最大分散に対する事後分散の比率 $\text{VarRatio} \in [0.0, 1.0]$ を単一パス走査で算出する。
+///
+/// # 備考
+/// - [`score_moments_iter`] を呼び出し、単一パス走査で段階数と事後分散を取得して分散比率を計算する。
+pub fn score_variance_ratio_iter<I>(iter: I) -> Result<f64>
+where
+    I: IntoIterator,
+    I::Item: Borrow<f64>,
+{
+    let (m, _, var) = score_moments_iter(iter)?;
     let max_var = ((m - 1) as f64).powi(2) / 4.0;
 
     if max_var <= 0.0 {
-        return Ok(1.0);
+        return Ok(0.0);
     }
 
-    let confidence = 1.0 - (var / max_var);
-    Ok(confidence.clamp(0.0, 1.0))
+    let ratio = var / max_var;
+    Ok(ratio.clamp(0.0, 1.0))
 }
 
 /// Score 型の確率分布から、理論最大分散に対する事後分散の比率 $\text{VarRatio} \in [0.0, 1.0]$ を算出する。
@@ -539,23 +649,9 @@ pub fn normalized_variance_confidence(probabilities: &[f64]) -> Result<f64> {
 ///
 /// # 戻り値
 /// - 成功時は `[0.0, 1.0]` にクランプされた分散比率、不正時は `CoreError::MathError`。
+#[inline]
 pub fn score_variance_ratio(probabilities: &[f64]) -> Result<f64> {
-    let m = probabilities.len();
-    if m < 2 {
-        return Err(CoreError::MathError {
-            message: "Score の分散比率計算には 2 段階以上の確率分布が必要です。".to_string(),
-        });
-    }
-
-    let var = score_variance(probabilities)?;
-    let max_var = ((m - 1) as f64).powi(2) / 4.0;
-
-    if max_var <= 0.0 {
-        return Ok(0.0);
-    }
-
-    let ratio = var / max_var;
-    Ok(ratio.clamp(0.0, 1.0))
+    score_variance_ratio_iter(probabilities)
 }
 
 /// Score 型の確率分布から双峰性係数 (Bimodality Coefficient: $BC$) を算出する。
@@ -932,6 +1028,27 @@ mod tests {
     }
 
     #[test]
+    fn test_expected_score_iter() {
+        let probs = vec![0.1, 0.2, 0.7];
+        let expected = 0.0 * 0.1 + 1.0 * 0.2 + 2.0 * 0.7;
+
+        // イテレータ (参照、クローン、所有権) での一致検証
+        assert!((expected_score_iter(probs.iter()).unwrap() - expected).abs() < 1e-12);
+        assert!((expected_score_iter(probs.clone()).unwrap() - expected).abs() < 1e-12);
+        assert!((expected_score_iter(probs.into_iter()).unwrap() - expected).abs() < 1e-12);
+
+        // 異常系: 段階数不足
+        let empty: [f64; 0] = [];
+        assert!(expected_score_iter(empty).is_err());
+        assert!(expected_score_iter([1.0]).is_err());
+
+        // 異常系: 非有限値・負値
+        assert!(expected_score_iter([0.5, f64::NAN]).is_err());
+        assert!(expected_score_iter([f64::INFINITY, 0.5]).is_err());
+        assert!(expected_score_iter([-0.1, 1.1]).is_err());
+    }
+
+    #[test]
     fn test_score_non_finite_inputs() {
         // 先頭、中間、末尾に非有限値(NaN, +Inf, -Inf)が含まれる場合の捕捉を検証する。
         let test_cases = vec![
@@ -1055,6 +1172,56 @@ mod tests {
         let single_level = vec![1.0];
         assert!(score_variance(&single_level).is_err());
         assert!(normalized_variance_confidence(&single_level).is_err());
+    }
+
+    #[test]
+    fn test_score_moments_and_iter_parity() {
+        let test_distributions = vec![
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.5, 0.0, 0.0, 0.5],
+            vec![0.0, 0.5, 0.5, 0.0],
+            vec![0.1, 0.2, 0.3, 0.4],
+            vec![0.25, 0.25, 0.25, 0.25],
+            vec![0.7, 0.2, 0.1],
+        ];
+
+        for dist in test_distributions {
+            // スライス版
+            let slice_mean = expected_score(&dist).unwrap();
+            let slice_var = score_variance(&dist).unwrap();
+            let slice_conf = normalized_variance_confidence(&dist).unwrap();
+            let slice_ratio = score_variance_ratio(&dist).unwrap();
+
+            // moments 単一パス集計版
+            let (m, moments_mean, moments_var) = score_moments_iter(dist.iter()).unwrap();
+            assert_eq!(m, dist.len());
+            assert!((moments_mean - slice_mean).abs() < 1e-12);
+            assert!((moments_var - slice_var).abs() < 1e-12);
+
+            // 各種 iter 版の一致検証
+            let iter_mean = expected_score_iter(dist.iter()).unwrap();
+            let iter_var = score_variance_iter(dist.iter()).unwrap();
+            let iter_conf = normalized_variance_confidence_iter(dist.iter()).unwrap();
+            let iter_ratio = score_variance_ratio_iter(dist.iter()).unwrap();
+
+            assert!((iter_mean - slice_mean).abs() < 1e-12);
+            assert!((iter_var - slice_var).abs() < 1e-12);
+            assert!((iter_conf - slice_conf).abs() < 1e-12);
+            assert!((iter_ratio - slice_ratio).abs() < 1e-12);
+        }
+
+        // 異常系: 段階数不足
+        let empty: [f64; 0] = [];
+        assert!(score_moments_iter(empty).is_err());
+        assert!(score_variance_iter([1.0]).is_err());
+        assert!(normalized_variance_confidence_iter([1.0]).is_err());
+        assert!(score_variance_ratio_iter([1.0]).is_err());
+
+        // 異常系: 非有限値・負値
+        assert!(score_moments_iter([0.5, f64::NAN]).is_err());
+        assert!(score_variance_iter([f64::INFINITY, 0.5]).is_err());
+        assert!(normalized_variance_confidence_iter([-0.1, 1.1]).is_err());
+        assert!(score_variance_ratio_iter([0.5, -0.5]).is_err());
     }
 
     #[test]

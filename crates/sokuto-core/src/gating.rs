@@ -9,7 +9,6 @@
 //! - **`Fallback` ($< 0.50$)**: 安全弁フォールバック(情報不足・一様迷い時のデフォルト動作・棄却)。
 
 use std::fmt::{self, Write};
-use std::ops::{Deref, DerefMut};
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -267,20 +266,6 @@ impl Default for GatingConfig {
     }
 }
 
-impl Deref for GatingConfig {
-    type Target = GatingThresholds;
-
-    fn deref(&self) -> &Self::Target {
-        &self.thresholds
-    }
-}
-
-impl DerefMut for GatingConfig {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.thresholds
-    }
-}
-
 impl GatingConfig {
     /// 有効フラグと閾値設定から新規 `GatingConfig` を生成する。
     pub fn new(enabled: bool, thresholds: GatingThresholds) -> Self {
@@ -288,6 +273,18 @@ impl GatingConfig {
             enabled,
             thresholds,
         }
+    }
+
+    /// 閾値設定への参照を取得する。
+    #[inline]
+    pub fn thresholds(&self) -> &GatingThresholds {
+        &self.thresholds
+    }
+
+    /// 閾値設定への可変参照を取得する。
+    #[inline]
+    pub fn thresholds_mut(&mut self) -> &mut GatingThresholds {
+        &mut self.thresholds
     }
 
     /// 閾値設定値の数学的妥当性を検証する。
@@ -508,13 +505,15 @@ pub fn evaluate_answer_gating_opts(
         }
     };
 
-    let (is_ood, ood_reason) = if config.ood_enabled && is_choice {
+    let thresholds = &config.thresholds;
+
+    let (is_ood, ood_reason) = if thresholds.ood_enabled && is_choice {
         if let Some(e) = energy {
-            let is_hard_energy_ood = e > config.energy_threshold;
+            let is_hard_energy_ood = e > thresholds.energy_threshold;
             let is_hybrid_ood = if let (Some(loose_th), Some(min_conf), Some(min_margin)) = (
-                config.loose_energy_threshold,
-                config.ood_min_confidence,
-                config.ood_min_margin,
+                thresholds.loose_energy_threshold,
+                thresholds.ood_min_confidence,
+                thresholds.ood_min_margin,
             ) {
                 let m = margin.unwrap_or(0.0);
                 e > loose_th && (conf < min_conf || m < min_margin)
@@ -527,7 +526,7 @@ pub fn evaluate_answer_gating_opts(
                     true,
                     Some(format!(
                         "正規化自由エネルギー({:.3} > {:.3})が閾値を超過したため、未定義カテゴリまたは該当なし(OOD)として安全弁フォールバックを適用しました。",
-                        e, config.energy_threshold
+                        e, thresholds.energy_threshold
                     )),
                 )
             } else if is_hybrid_ood {
@@ -537,11 +536,11 @@ pub fn evaluate_answer_gating_opts(
                     Some(format!(
                         "正規化自由エネルギー({:.3} > {:.3})かつ不確実性(確信度={:.3} < {:.3} または マージン={:.3} < {:.3})の複合条件を満たしたため、該当なし(OOD)として安全弁フォールバックを適用しました。",
                         e,
-                        config.loose_energy_threshold.unwrap(),
+                        thresholds.loose_energy_threshold.unwrap(),
                         conf,
-                        config.ood_min_confidence.unwrap(),
+                        thresholds.ood_min_confidence.unwrap(),
                         m,
-                        config.ood_min_margin.unwrap()
+                        thresholds.ood_min_margin.unwrap()
                     )),
                 )
             } else {
@@ -562,15 +561,15 @@ pub fn evaluate_answer_gating_opts(
                 "OOD 安全弁回路が作動したため安全弁フォールバックを適用しました。".to_string()
             }),
         )
-    } else if conf >= config.high_threshold - EPSILON {
+    } else if conf >= thresholds.high_threshold - EPSILON {
         if is_choice {
             if let Some(m) = margin {
-                if m < config.top_margin_threshold - EPSILON {
+                if m < thresholds.top_margin_threshold - EPSILON {
                     (
                         DecisionRoute::ConfirmOrEscalate,
                         format!(
                             "実効確信度({:.3} >= {:.3})は高水準ですが、上位2候補の確率差({:.3} < {:.3})が僅差のため確認要求に降格しました。",
-                            conf, config.high_threshold, m, config.top_margin_threshold
+                            conf, thresholds.high_threshold, m, thresholds.top_margin_threshold
                         ),
                     )
                 } else {
@@ -578,7 +577,7 @@ pub fn evaluate_answer_gating_opts(
                         DecisionRoute::AutoExecute,
                         format!(
                             "実効確信度({:.3} >= {:.3})および上位候補マージン({:.3} >= {:.3})を満たすため自動実行が承認されました。",
-                            conf, config.high_threshold, m, config.top_margin_threshold
+                            conf, thresholds.high_threshold, m, thresholds.top_margin_threshold
                         ),
                     )
                 }
@@ -587,7 +586,7 @@ pub fn evaluate_answer_gating_opts(
                     DecisionRoute::AutoExecute,
                     format!(
                         "実効確信度({:.3} >= {:.3})が高水準であるため自動実行が承認されました。",
-                        conf, config.high_threshold
+                        conf, thresholds.high_threshold
                     ),
                 )
             }
@@ -596,16 +595,16 @@ pub fn evaluate_answer_gating_opts(
                 DecisionRoute::AutoExecute,
                 format!(
                     "実効確信度({:.3} >= {:.3})が高水準であるため自動実行が承認されました。",
-                    conf, config.high_threshold
+                    conf, thresholds.high_threshold
                 ),
             )
         }
-    } else if conf >= config.low_threshold - EPSILON {
+    } else if conf >= thresholds.low_threshold - EPSILON {
         (
             DecisionRoute::ConfirmOrEscalate,
             format!(
                 "実効確信度({:.3})が確認要求境界 [{:.3}, {:.3}) 内のため二次検証が必要です。",
-                conf, config.low_threshold, config.high_threshold
+                conf, thresholds.low_threshold, thresholds.high_threshold
             ),
         )
     } else {
@@ -613,7 +612,7 @@ pub fn evaluate_answer_gating_opts(
             DecisionRoute::Fallback,
             format!(
                 "実効確信度({:.3} < {:.3})が低水準のため安全弁フォールバックを適用しました。",
-                conf, config.low_threshold
+                conf, thresholds.low_threshold
             ),
         )
     };
@@ -789,9 +788,9 @@ mod tests {
     fn test_gating_config_default_and_validation() {
         let config = GatingConfig::default();
         assert!(config.enabled);
-        assert!((config.high_threshold - 0.70).abs() < EPSILON);
-        assert!((config.low_threshold - 0.35).abs() < EPSILON);
-        assert!((config.top_margin_threshold - 0.15).abs() < EPSILON);
+        assert!((config.thresholds.high_threshold - 0.70).abs() < EPSILON);
+        assert!((config.thresholds.low_threshold - 0.35).abs() < EPSILON);
+        assert!((config.thresholds.top_margin_threshold - 0.15).abs() < EPSILON);
         assert!(config.validate().is_ok());
 
         let invalid_config = GatingConfig {

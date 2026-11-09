@@ -280,8 +280,8 @@ fn test_validation_gating_config_valid() {
     assert!(request.validate().is_ok());
     let gating = request.gating.unwrap();
     assert!(gating.enabled);
-    assert_eq!(gating.high_threshold, 0.85);
-    assert_eq!(gating.low_threshold, 0.45);
+    assert_eq!(gating.thresholds.high_threshold, 0.85);
+    assert_eq!(gating.thresholds.low_threshold, 0.45);
 }
 
 /// StateBatchRequest と SystemOneRequest の共通 DecisionRequest トレイトおよび型エイリアス互換性テスト。

@@ -84,7 +84,7 @@ pub fn calculate_choice_energy_with_config(
     }
     let k = logits.len();
     let temp = gating_config
-        .and_then(|cfg| cfg.energy_temperature)
+        .and_then(|cfg| cfg.thresholds.energy_temperature)
         .or(calib_config.gating_thresholds.energy_temperature)
         .unwrap_or_else(|| calib_config.get_temperature(QuestionType::Choice, k));
     normalized_free_energy(logits, temp).ok()
@@ -302,7 +302,7 @@ mod tests {
         // 1. 指定なしの場合は calib_config から導出
         let resolved_default = resolve_gating_config(None, &calib);
         assert!(resolved_default.enabled);
-        assert!((resolved_default.high_threshold - 0.72).abs() < 1e-9);
+        assert!((resolved_default.thresholds.high_threshold - 0.72).abs() < 1e-9);
 
         // 2. 明示指定された場合はそれを優先
         let explicit = GatingConfig {
@@ -318,7 +318,7 @@ mod tests {
         };
         let resolved_explicit = resolve_gating_config(Some(&explicit), &calib);
         assert!(!resolved_explicit.enabled);
-        assert!((resolved_explicit.high_threshold - 0.90).abs() < 1e-9);
+        assert!((resolved_explicit.thresholds.high_threshold - 0.90).abs() < 1e-9);
     }
 
     #[test]

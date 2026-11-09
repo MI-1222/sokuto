@@ -242,8 +242,15 @@ mod tests {
         // ゲーティング設定変換のテスト
         let gating_cfg = loaded.gating_config();
         assert!(gating_cfg.enabled);
-        assert!((gating_cfg.high_threshold - DEFAULT_HIGH_CONFIDENCE_THRESHOLD).abs() < 1e-9);
-        assert!((gating_cfg.low_threshold - DEFAULT_LOW_CONFIDENCE_THRESHOLD).abs() < 1e-9);
-        assert!((gating_cfg.top_margin_threshold - DEFAULT_TOP_MARGIN_THRESHOLD).abs() < 1e-9);
+        assert!(
+            (gating_cfg.thresholds.high_threshold - DEFAULT_HIGH_CONFIDENCE_THRESHOLD).abs() < 1e-9
+        );
+        assert!(
+            (gating_cfg.thresholds.low_threshold - DEFAULT_LOW_CONFIDENCE_THRESHOLD).abs() < 1e-9
+        );
+        assert!(
+            (gating_cfg.thresholds.top_margin_threshold - DEFAULT_TOP_MARGIN_THRESHOLD).abs()
+                < 1e-9
+        );
     }
 }

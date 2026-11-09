@@ -587,14 +587,15 @@ impl<'a> CoarseToFineRouter<'a> {
         // Gating 判定
         let default_gating_config = GatingConfig::default();
         let gc = gating_config.unwrap_or(&default_gating_config);
-        let final_route =
-            if final_confidence >= gc.high_threshold && final_margin >= gc.top_margin_threshold {
-                DecisionRoute::AutoExecute
-            } else if final_confidence < gc.low_threshold {
-                DecisionRoute::Fallback
-            } else {
-                DecisionRoute::ConfirmOrEscalate
-            };
+        let final_route = if final_confidence >= gc.thresholds.high_threshold
+            && final_margin >= gc.thresholds.top_margin_threshold
+        {
+            DecisionRoute::AutoExecute
+        } else if final_confidence < gc.thresholds.low_threshold {
+            DecisionRoute::Fallback
+        } else {
+            DecisionRoute::ConfirmOrEscalate
+        };
 
         let gating = GatingMetadata {
             route: final_route,

@@ -619,50 +619,43 @@ pub fn evaluate_answer_gating_opts(
 
     // エスカレーションコンテキストの遅延生成 (ConfirmOrEscalate または Fallback 時のみアロケーションを実行)。
     let escalation = if route != DecisionRoute::AutoExecute {
-        let mut candidates: Vec<CandidateProbability> = Vec::new();
-        match &answer.payload {
+        let top_candidates = match &answer.payload {
             AnswerPayload::Choice { probabilities, .. }
-            | AnswerPayload::Score { probabilities, .. } => {
-                candidates = probabilities
-                    .iter()
-                    .map(|(k, &p)| CandidateProbability {
-                        candidate: k.clone(),
-                        probability: p,
-                    })
-                    .collect();
-                candidates.sort_by(|a, b| b.probability.total_cmp(&a.probability));
-            }
+            | AnswerPayload::Score { probabilities, .. } => extract_top3_candidates(probabilities),
             AnswerPayload::Noul { probability } => {
                 let p_true = *probability;
                 let p_false = (1.0 - p_true).clamp(0.0, 1.0);
                 if p_true >= p_false {
-                    candidates.push(CandidateProbability {
-                        candidate: "true".to_string(),
-                        probability: p_true,
-                    });
-                    candidates.push(CandidateProbability {
-                        candidate: "false".to_string(),
-                        probability: p_false,
-                    });
+                    vec![
+                        CandidateProbability {
+                            candidate: "true".to_string(),
+                            probability: p_true,
+                        },
+                        CandidateProbability {
+                            candidate: "false".to_string(),
+                            probability: p_false,
+                        },
+                    ]
                 } else {
-                    candidates.push(CandidateProbability {
-                        candidate: "false".to_string(),
-                        probability: p_false,
-                    });
-                    candidates.push(CandidateProbability {
-                        candidate: "true".to_string(),
-                        probability: p_true,
-                    });
+                    vec![
+                        CandidateProbability {
+                            candidate: "false".to_string(),
+                            probability: p_false,
+                        },
+                        CandidateProbability {
+                            candidate: "true".to_string(),
+                            probability: p_true,
+                        },
+                    ]
                 }
             }
-        }
+        };
 
-        let top_candidates = candidates.iter().take(3).cloned().collect();
         let prompt_template = if generate_prompt {
             Some(build_escalation_prompt(
                 question_id,
                 question,
-                &candidates,
+                &top_candidates,
                 margin,
             ))
         } else {
@@ -689,6 +682,52 @@ pub fn evaluate_answer_gating_opts(
         reason,
         escalation,
     }
+}
+
+/// 確率マップから確率降順で上位 3 件の候補を抽出する。
+///
+/// 全件の文字列クローンやヒープ確保・全ソートを行わず、
+/// 要素数 3 の固定長スタック配列と `std::mem::swap` を用いて単一パスで上位候補を収集する。
+///
+/// # 引数
+/// - `probabilities`: 候補ラベルと較正済み確率値の対応マップ。
+///
+/// # 戻り値
+/// 確率降順の上位候補一覧 (最大 3 件)。
+fn extract_top3_candidates(probabilities: &IndexMap<String, f64>) -> Vec<CandidateProbability> {
+    let mut top: [Option<(&str, f64)>; 3] = [None, None, None];
+
+    for (k, &p) in probabilities {
+        // 3 枠が埋まっており、かつ第 3 位の確率以下の場合は走査を短絡スキップする。
+        if let Some((_, p_min)) = top[2]
+            && p.total_cmp(&p_min) != std::cmp::Ordering::Greater
+        {
+            continue;
+        }
+
+        let mut item = Some((k.as_str(), p));
+        for slot in top.iter_mut() {
+            match slot {
+                Some((_, slot_p)) => {
+                    if p.total_cmp(slot_p) == std::cmp::Ordering::Greater {
+                        std::mem::swap(slot, &mut item);
+                    }
+                }
+                None => {
+                    *slot = item;
+                    break;
+                }
+            }
+        }
+    }
+
+    top.into_iter()
+        .flatten()
+        .map(|(k, p)| CandidateProbability {
+            candidate: k.to_string(),
+            probability: p,
+        })
+        .collect()
 }
 
 /// System 2 (大型自己回帰LLM) に向けた委託用プロンプト案を生成する。
@@ -1107,5 +1146,56 @@ mod tests {
         assert_eq!(meta_generated.route, DecisionRoute::ConfirmOrEscalate);
         let esc_generated = meta_generated.escalation.as_ref().unwrap();
         assert!(esc_generated.prompt_template.is_some());
+    }
+
+    #[test]
+    fn test_extract_top3_candidates_comprehensive() {
+        // 1. 空マップの場合
+        let empty_probs = IndexMap::new();
+        assert!(extract_top3_candidates(&empty_probs).is_empty());
+
+        // 2. 1 件のみの場合
+        let mut single_prob = IndexMap::new();
+        single_prob.insert("single".to_string(), 0.95);
+        let res_single = extract_top3_candidates(&single_prob);
+        assert_eq!(res_single.len(), 1);
+        assert_eq!(res_single[0].candidate, "single");
+        assert!((res_single[0].probability - 0.95).abs() < EPSILON);
+
+        // 3. 2 件の場合
+        let mut two_probs = IndexMap::new();
+        two_probs.insert("low".to_string(), 0.20);
+        two_probs.insert("high".to_string(), 0.80);
+        let res_two = extract_top3_candidates(&two_probs);
+        assert_eq!(res_two.len(), 2);
+        assert_eq!(res_two[0].candidate, "high");
+        assert_eq!(res_two[1].candidate, "low");
+
+        // 4. 4 件以上 (多数候補) の場合
+        let mut multi_probs = IndexMap::new();
+        multi_probs.insert("c1".to_string(), 0.10);
+        multi_probs.insert("c2".to_string(), 0.40);
+        multi_probs.insert("c3".to_string(), 0.05);
+        multi_probs.insert("c4".to_string(), 0.25);
+        multi_probs.insert("c5".to_string(), 0.20);
+        let res_multi = extract_top3_candidates(&multi_probs);
+        assert_eq!(res_multi.len(), 3);
+        assert_eq!(res_multi[0].candidate, "c2");
+        assert!((res_multi[0].probability - 0.40).abs() < EPSILON);
+        assert_eq!(res_multi[1].candidate, "c4");
+        assert!((res_multi[1].probability - 0.25).abs() < EPSILON);
+        assert_eq!(res_multi[2].candidate, "c5");
+        assert!((res_multi[2].probability - 0.20).abs() < EPSILON);
+
+        // 5. 多数候補 (255 候補スケール) でトップ 3 が確実に抽出される検証
+        let mut large_probs = IndexMap::new();
+        for i in 0..255 {
+            large_probs.insert(format!("opt_{i}"), (i as f64) / 1000.0);
+        }
+        let res_large = extract_top3_candidates(&large_probs);
+        assert_eq!(res_large.len(), 3);
+        assert_eq!(res_large[0].candidate, "opt_254");
+        assert_eq!(res_large[1].candidate, "opt_253");
+        assert_eq!(res_large[2].candidate, "opt_252");
     }
 }

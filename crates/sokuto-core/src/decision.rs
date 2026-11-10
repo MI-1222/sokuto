@@ -38,7 +38,7 @@ pub fn evaluate_choice_with_buf(
     temperature: f64,
     probs_buf: &mut [f64],
 ) -> Result<Answer> {
-    let map = criteria.as_map_or_err("choice", None)?;
+    let map = criteria.as_map_or_err(QuestionType::Choice, None)?;
 
     let k = map.len();
     if k == 0 || k > 255 {
@@ -151,7 +151,7 @@ pub fn evaluate_score_with_buf(
     temperature: f64,
     probs_buf: &mut [f64],
 ) -> Result<Answer> {
-    let list = criteria.as_list_or_err("score", None)?;
+    let list = criteria.as_list_or_err(QuestionType::Score, None)?;
 
     let m = list.len();
     if !(2..=10).contains(&m) {
@@ -261,7 +261,7 @@ pub fn evaluate_question_with_buf(
                     .as_ref()
                     .ok_or_else(|| CoreError::MissingCriteria {
                         question_id: question_id.map(|s| s.to_string()),
-                        question_type: "choice".to_string(),
+                        question_type: QuestionType::Choice,
                     })?;
             let k = criteria.len();
             let temperature = config.get_temperature(QuestionType::Choice, k);
@@ -274,7 +274,7 @@ pub fn evaluate_question_with_buf(
                     .as_ref()
                     .ok_or_else(|| CoreError::MissingCriteria {
                         question_id: question_id.map(|s| s.to_string()),
-                        question_type: "score".to_string(),
+                        question_type: QuestionType::Score,
                     })?;
             let m = criteria.len();
             let temperature = config.get_temperature(QuestionType::Score, m);

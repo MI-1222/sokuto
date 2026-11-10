@@ -152,7 +152,7 @@ fn test_validation_choice_missing_criteria() {
         request.validate().unwrap_err(),
         CoreError::MissingCriteria {
             question_id: Some("category".to_string()),
-            question_type: "choice".to_string(),
+            question_type: QuestionType::Choice,
         }
     );
 }
@@ -176,7 +176,7 @@ fn test_validation_choice_invalid_criteria_type() {
         request.validate().unwrap_err(),
         CoreError::InvalidCriteriaType {
             question_id: Some("category".to_string()),
-            question_type: "choice".to_string(),
+            question_type: QuestionType::Choice,
             expected: "Map (オブジェクト)",
             actual: "List (配列)",
         }

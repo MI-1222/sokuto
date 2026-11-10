@@ -4,6 +4,8 @@
 
 use thiserror::Error;
 
+use crate::schema::QuestionType;
+
 /// 質問識別子(任意)に基づき、エラーメッセージ用のプレフィックス文字列を生成する。
 fn question_prefix(id: &Option<String>) -> String {
     match id {
@@ -50,8 +52,8 @@ pub enum CoreError {
     InvalidCriteriaType {
         /// 対象の質問識別子(任意)。
         question_id: Option<String>,
-        /// 対象の質問タイプ名。
-        question_type: String,
+        /// 対象の質問タイプ。
+        question_type: QuestionType,
         /// 期待される形式名。
         expected: &'static str,
         /// 実際に指定された形式名。
@@ -66,8 +68,8 @@ pub enum CoreError {
     MissingCriteria {
         /// 対象の質問識別子(任意)。
         question_id: Option<String>,
-        /// 対象の質問タイプ名。
-        question_type: String,
+        /// 対象の質問タイプ。
+        question_type: QuestionType,
     },
 
     /// 質問リストが空である場合のエラー。

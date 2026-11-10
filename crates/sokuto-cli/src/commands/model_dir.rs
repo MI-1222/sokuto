@@ -114,6 +114,7 @@ pub fn load_calibration_config(model_dir: &Path) -> Result<CalibrationConfig, Cl
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sokuto_core::contract::calibration::BucketSpec;
     use std::fs;
 
     #[test]
@@ -217,7 +218,10 @@ mod tests {
 
         let config = load_calibration_config(&temp_dir).expect("較正設定ロードに成功。");
         assert_eq!(config.version, "1.0");
-        assert_eq!(config.temperature_map.choice.get("3"), Some(&1.25));
+        assert_eq!(
+            config.temperature_map.choice.get(&BucketSpec::Exact(3)),
+            Some(&1.25)
+        );
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

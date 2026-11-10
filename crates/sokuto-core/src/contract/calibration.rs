@@ -170,18 +170,25 @@ struct RawCalibrationConfig {
     gating_thresholds: GatingThresholds,
 }
 
+/// バケット定義マップからバケット仕様と温度のペア一覧を事前パースする。
+fn parse_bucket_map(map: &IndexMap<String, f64>) -> Vec<(BucketSpec, f64)> {
+    map.iter()
+        .filter_map(|(k, &v)| BucketSpec::parse(k).map(|spec| (spec, v)))
+        .collect()
+}
+
 impl From<RawCalibrationConfig> for CalibrationConfig {
     fn from(raw: RawCalibrationConfig) -> Self {
-        let mut config = Self {
+        let parsed_choice = parse_bucket_map(&raw.temperature_map.choice);
+        let parsed_score = parse_bucket_map(&raw.temperature_map.score);
+        Self {
             version: raw.version,
             default_temperature: raw.default_temperature,
+            parsed_choice,
+            parsed_score,
             temperature_map: raw.temperature_map,
             gating_thresholds: raw.gating_thresholds,
-            parsed_choice: Vec::new(),
-            parsed_score: Vec::new(),
-        };
-        config.init_parsed_buckets();
-        config
+        }
     }
 }
 
@@ -200,49 +207,55 @@ fn default_temperature() -> f64 {
 
 impl Default for CalibrationConfig {
     fn default() -> Self {
-        let mut config = Self {
+        let temperature_map = TemperatureMap::default();
+        let parsed_choice = parse_bucket_map(&temperature_map.choice);
+        let parsed_score = parse_bucket_map(&temperature_map.score);
+        Self {
             version: "1.0".to_string(),
             default_temperature: 1.0,
-            temperature_map: TemperatureMap::default(),
+            parsed_choice,
+            parsed_score,
+            temperature_map,
             gating_thresholds: GatingThresholds::default(),
-            parsed_choice: Vec::new(),
-            parsed_score: Vec::new(),
-        };
-        config.init_parsed_buckets();
-        config
+        }
     }
 }
 
 impl CalibrationConfig {
     /// 新規キャリブレーション設定を生成する。
+    ///
+    /// 引数として渡された `temperature_map` から Choice / Score バケット仕様を即座に事前パースし、
+    /// パース済みキャッシュを確定させた状態でインスタンスを構築する。
     pub fn new(version: impl Into<String>, temperature_map: TemperatureMap) -> Self {
-        let mut config = Self {
+        let parsed_choice = parse_bucket_map(&temperature_map.choice);
+        let parsed_score = parse_bucket_map(&temperature_map.score);
+        Self {
             version: version.into(),
             default_temperature: 1.0,
+            parsed_choice,
+            parsed_score,
             temperature_map,
             gating_thresholds: GatingThresholds::default(),
-            parsed_choice: Vec::new(),
-            parsed_score: Vec::new(),
-        };
-        config.init_parsed_buckets();
-        config
+        }
     }
 
     /// バケット定義文字列を事前パースして内部キャッシュに格納する。
     pub fn init_parsed_buckets(&mut self) {
-        self.parsed_choice = self
-            .temperature_map
-            .choice
-            .iter()
-            .filter_map(|(k, &v)| BucketSpec::parse(k).map(|spec| (spec, v)))
-            .collect();
+        self.parsed_choice = parse_bucket_map(&self.temperature_map.choice);
+        self.parsed_score = parse_bucket_map(&self.temperature_map.score);
+    }
 
-        self.parsed_score = self
-            .temperature_map
-            .score
-            .iter()
-            .filter_map(|(k, &v)| BucketSpec::parse(k).map(|spec| (spec, v)))
-            .collect();
+    /// デフォルト温度係数を設定して自身を返却する。
+    pub fn with_default_temperature(mut self, default_temperature: f64) -> Self {
+        self.default_temperature = default_temperature;
+        self
+    }
+
+    /// 温度テーブルマップを設定し、バケット定義を再パースして自身を返却する。
+    pub fn with_temperature_map(mut self, temperature_map: TemperatureMap) -> Self {
+        self.temperature_map = temperature_map;
+        self.init_parsed_buckets();
+        self
     }
 
     /// ゲーティング閾値を設定して自身を返却する。
@@ -257,13 +270,13 @@ impl CalibrationConfig {
     }
 
     /// JSON 文字列からデシリアライズする。
+    ///
+    /// デシリアライズ処理(`#[serde(from = "RawCalibrationConfig")]`)により、
+    /// 構築時に必ず `BucketSpec` の事前パースが完了する不変条件が保証される。
     pub fn from_json_str(json_str: &str) -> Result<Self> {
-        let mut config: Self =
-            serde_json::from_str(json_str).map_err(|e| CoreError::SerializationError {
-                message: format!("calibration.json の解析に失敗しました: {e}。"),
-            })?;
-        config.init_parsed_buckets();
-        Ok(config)
+        serde_json::from_str(json_str).map_err(|e| CoreError::SerializationError {
+            message: format!("calibration.json の解析に失敗しました: {e}。"),
+        })
     }
 
     /// JSON 文字列へシリアライズする。
@@ -280,25 +293,16 @@ impl CalibrationConfig {
     /// - `"3-5"`: 候補数が 3 以上 5 以下の場合に一致。
     /// - `"11+"`: 候補数が 11 以上の場合に一致。
     ///
-    /// 事前パース済みの `BucketSpec` を走査し、整数の範囲比較のみで決定する。
+    /// 構築時に確定した事前パース済みの `BucketSpec` を走査し、整数の範囲比較のみで決定する。
+    /// 動的文字列パースによるフォールバック処理は行わない。
     /// マッチする定義が存在しない場合は、`default_temperature` を返却する。
     #[inline]
     pub fn get_temperature(&self, question_type: QuestionType, candidate_count: usize) -> f64 {
         match question_type {
             QuestionType::Choice => {
-                if !self.parsed_choice.is_empty() {
-                    self.resolve_parsed_bucket(&self.parsed_choice, candidate_count)
-                } else {
-                    self.resolve_bucket(&self.temperature_map.choice, candidate_count)
-                }
+                self.resolve_parsed_bucket(&self.parsed_choice, candidate_count)
             }
-            QuestionType::Score => {
-                if !self.parsed_score.is_empty() {
-                    self.resolve_parsed_bucket(&self.parsed_score, candidate_count)
-                } else {
-                    self.resolve_bucket(&self.temperature_map.score, candidate_count)
-                }
-            }
+            QuestionType::Score => self.resolve_parsed_bucket(&self.parsed_score, candidate_count),
             QuestionType::Noul => self.temperature_map.noul,
         }
     }
@@ -313,21 +317,6 @@ impl CalibrationConfig {
         }
         self.default_temperature
     }
-
-    /// バケットマップを走査し、候補数に一致する温度を探索する (フォールバック用)。
-    fn resolve_bucket(&self, table: &IndexMap<String, f64>, count: usize) -> f64 {
-        for (bucket_expr, &temperature) in table {
-            if matches_bucket(bucket_expr, count) {
-                return temperature;
-            }
-        }
-        self.default_temperature
-    }
-}
-
-/// バケット定義文字列(例: "2", "3-5", "11+")と候補数のマッチ判定を行う。
-pub fn matches_bucket(expr: &str, count: usize) -> bool {
-    BucketSpec::parse(expr).is_some_and(|spec| spec.matches(count))
 }
 
 #[cfg(test)]
@@ -337,22 +326,6 @@ mod tests {
         DEFAULT_HIGH_CONFIDENCE_THRESHOLD, DEFAULT_LOW_CONFIDENCE_THRESHOLD,
         DEFAULT_TOP_MARGIN_THRESHOLD,
     };
-
-    #[test]
-    fn test_bucket_matching() {
-        assert!(matches_bucket("2", 2));
-        assert!(!matches_bucket("2", 3));
-
-        assert!(matches_bucket("3-5", 3));
-        assert!(matches_bucket("3-5", 4));
-        assert!(matches_bucket("3-5", 5));
-        assert!(!matches_bucket("3-5", 2));
-        assert!(!matches_bucket("3-5", 6));
-
-        assert!(matches_bucket("11+", 11));
-        assert!(matches_bucket("11+", 50));
-        assert!(!matches_bucket("11+", 10));
-    }
 
     #[test]
     fn test_calibration_round_trip() {
@@ -366,18 +339,14 @@ mod tests {
         score.insert("2-5".to_string(), 1.02);
         score.insert("6-10".to_string(), 1.10);
 
-        let config = CalibrationConfig {
-            version: "1.0".to_string(),
-            default_temperature: 1.0,
-            temperature_map: TemperatureMap {
+        let config = CalibrationConfig::new(
+            "1.0",
+            TemperatureMap {
                 choice,
                 score,
                 noul: 0.95,
             },
-            gating_thresholds: GatingThresholds::default(),
-            parsed_choice: Vec::new(),
-            parsed_score: Vec::new(),
-        };
+        );
 
         let json = config.to_json_string().unwrap();
         let loaded = CalibrationConfig::from_json_str(&json).unwrap();
@@ -418,6 +387,29 @@ mod tests {
             (gating_cfg.thresholds.top_margin_threshold - DEFAULT_TOP_MARGIN_THRESHOLD).abs()
                 < 1e-9
         );
+    }
+
+    #[test]
+    fn test_parsed_buckets_resolution() {
+        let mut choice = IndexMap::new();
+        choice.insert("2".to_string(), 1.05);
+        choice.insert("3-5".to_string(), 1.15);
+
+        // new 呼び出し時点で事前パースが完了している
+        let config = CalibrationConfig::new(
+            "1.0",
+            TemperatureMap {
+                choice,
+                score: IndexMap::new(),
+                noul: 1.0,
+            },
+        );
+
+        // 事前パース結果に基づいて即座に温度解決される
+        assert_eq!(config.get_temperature(QuestionType::Choice, 2), 1.05);
+        assert_eq!(config.get_temperature(QuestionType::Choice, 4), 1.15);
+        // マッチしない候補数は default_temperature が返却される
+        assert_eq!(config.get_temperature(QuestionType::Choice, 99), 1.0);
     }
 
     #[test]
@@ -471,31 +463,5 @@ mod tests {
 
         assert!(BucketSpec::from_str("invalid").is_err());
         assert!(BucketSpec::from_str("5-3").is_err());
-    }
-
-    #[test]
-    fn test_uninitialized_fallback() {
-        // 手動構築で parsed_choice が空のインスタンスでもフォールバックで正常に温度解決できることを検証
-        let mut choice = IndexMap::new();
-        choice.insert("2".to_string(), 1.05);
-        choice.insert("3-5".to_string(), 1.15);
-
-        let config = CalibrationConfig {
-            version: "1.0".to_string(),
-            default_temperature: 1.0,
-            temperature_map: TemperatureMap {
-                choice,
-                score: IndexMap::new(),
-                noul: 1.0,
-            },
-            gating_thresholds: GatingThresholds::default(),
-            parsed_choice: Vec::new(),
-            parsed_score: Vec::new(),
-        };
-
-        // parsed_choice が空でも動的マッチで解決される
-        assert_eq!(config.get_temperature(QuestionType::Choice, 2), 1.05);
-        assert_eq!(config.get_temperature(QuestionType::Choice, 4), 1.15);
-        assert_eq!(config.get_temperature(QuestionType::Choice, 99), 1.0);
     }
 }

@@ -370,7 +370,7 @@ mod tests {
         let logits = vec![1.0, 5.0, 2.0];
         let answer = evaluate_choice(&logits, &criteria, 1.0).unwrap();
 
-        assert_eq!(answer.selected(), Some("dog"));
+        assert_eq!(answer.as_choice(), Some("dog"));
         assert!(answer.as_score().is_none());
         assert!(answer.as_noul().is_none());
         assert!(answer.is_choice());
@@ -393,7 +393,7 @@ mod tests {
         let logits = vec![std::f64::consts::PI];
         let answer = evaluate_choice(&logits, &criteria, 1.0).unwrap();
 
-        assert_eq!(answer.selected(), Some("only_one"));
+        assert_eq!(answer.as_choice(), Some("only_one"));
         assert_eq!(answer.confidence(), Some(1.0));
         let probs = answer.probabilities().unwrap();
         assert_eq!(probs["only_one"], 1.0);
@@ -401,7 +401,7 @@ mod tests {
         // K=1 特異点において作業バッファ probs_buf が 1.0 に更新されることを検証する。
         let mut probs_buf = vec![0.0];
         let answer_buf = evaluate_choice_with_buf(&logits, &criteria, 1.0, &mut probs_buf).unwrap();
-        assert_eq!(answer_buf.selected(), Some("only_one"));
+        assert_eq!(answer_buf.as_choice(), Some("only_one"));
         assert_eq!(probs_buf[0], 1.0);
 
         // バッファ長不一致の検証。
@@ -429,7 +429,7 @@ mod tests {
         let logits = vec![4.0, 4.0, 1.0];
         let answer = evaluate_choice(&logits, &criteria, 1.0).unwrap();
 
-        assert_eq!(answer.selected(), Some("opt_a"));
+        assert_eq!(answer.as_choice(), Some("opt_a"));
     }
 
     #[test]
@@ -547,7 +547,7 @@ mod tests {
         c_map.insert("no".to_string(), "いいえ".to_string());
         let q_choice = Question::new_choice("選択肢を選べ。", c_map);
         let ans_choice = evaluate_question(&q_choice, &[2.0, 0.5], &config).unwrap();
-        assert_eq!(ans_choice.selected(), Some("yes"));
+        assert_eq!(ans_choice.as_choice(), Some("yes"));
 
         // 2. Score のディスパッチ検証
         let q_score = Question::new_score(

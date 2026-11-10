@@ -514,7 +514,7 @@ fn matches_condition(
         }
 
         // Choice (文字列) 型判定
-        if let Some(choice_val) = ans.selected() {
+        if let Some(choice_val) = ans.as_choice() {
             match cond.op {
                 NodeConditionOp::Eq => {
                     let target_str = cond.value.as_ref().and_then(|v| v.as_str()).unwrap_or("");

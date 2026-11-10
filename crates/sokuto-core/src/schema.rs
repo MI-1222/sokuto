@@ -387,27 +387,78 @@ impl AnswerPayload {
     }
 
     /// Choice の採択候補ラベルを取得する。
-    pub fn choice(&self) -> Option<&str> {
+    pub fn as_choice(&self) -> Option<&str> {
         match self {
             Self::Choice { selected, .. } => Some(selected.as_str()),
             _ => None,
         }
     }
 
+    /// Choice の採択候補ラベルを取得する (`as_choice` の別名・非推奨)。
+    #[deprecated(since = "0.4.0", note = "代わりに `as_choice` を使用してください。")]
+    pub fn choice(&self) -> Option<&str> {
+        self.as_choice()
+    }
+
+    /// Choice の採択候補ラベルを取得する (`as_choice` の別名・非推奨)。
+    #[deprecated(since = "0.4.0", note = "代わりに `as_choice` を使用してください。")]
+    pub fn selected(&self) -> Option<&str> {
+        self.as_choice()
+    }
+
     /// Score の加重平均値を取得する。
-    pub fn score(&self) -> Option<f64> {
+    pub fn as_score(&self) -> Option<f64> {
         match self {
             Self::Score { value, .. } => Some(*value),
             _ => None,
         }
     }
 
+    /// Score の加重平均値を取得する (`as_score` の別名・非推奨)。
+    #[deprecated(since = "0.4.0", note = "代わりに `as_score` を使用してください。")]
+    pub fn score(&self) -> Option<f64> {
+        self.as_score()
+    }
+
+    /// Score の加重平均スコア値を取得する (`as_score` の別名・非推奨)。
+    #[deprecated(since = "0.4.0", note = "代わりに `as_score` を使用してください。")]
+    pub fn score_value(&self) -> Option<f64> {
+        self.as_score()
+    }
+
     /// Noul の真実確率値を取得する。
-    pub fn noul(&self) -> Option<f64> {
+    pub fn as_noul(&self) -> Option<f64> {
         match self {
             Self::Noul { probability } => Some(*probability),
             _ => None,
         }
+    }
+
+    /// Noul の真実確率値を取得する (`as_noul` の別名・非推奨)。
+    #[deprecated(since = "0.4.0", note = "代わりに `as_noul` を使用してください。")]
+    pub fn noul(&self) -> Option<f64> {
+        self.as_noul()
+    }
+
+    /// Noul の真実確率値を取得する (`as_noul` の別名・非推奨)。
+    #[deprecated(since = "0.4.0", note = "代わりに `as_noul` を使用してください。")]
+    pub fn noul_probability(&self) -> Option<f64> {
+        self.as_noul()
+    }
+
+    /// Choice 判定であるかどうか。
+    pub fn is_choice(&self) -> bool {
+        matches!(self, Self::Choice { .. })
+    }
+
+    /// Score 判定であるかどうか。
+    pub fn is_score(&self) -> bool {
+        matches!(self, Self::Score { .. })
+    }
+
+    /// Noul 判定であるかどうか。
+    pub fn is_noul(&self) -> bool {
+        matches!(self, Self::Noul { .. })
     }
 
     /// 確率分布マップの参照を取得する。
@@ -666,11 +717,6 @@ impl Answer {
         self.gating.as_ref().map(|g| g.route)
     }
 
-    /// 対応する質問種別 (`QuestionType`) を取得する。
-    pub fn question_type(&self) -> QuestionType {
-        self.payload.question_type()
-    }
-
     /// ゲーティング処理等に向けた実効確信度(Effective Confidence)を取得する。
     ///
     /// # 概要
@@ -682,70 +728,19 @@ impl Answer {
     pub fn effective_confidence(&self) -> Option<f64> {
         Some(self.payload.effective_confidence())
     }
+}
 
-    /// Choice の採択候補ラベルを取得する。
-    pub fn selected(&self) -> Option<&str> {
-        self.payload.choice()
+impl std::ops::Deref for Answer {
+    type Target = AnswerPayload;
+
+    fn deref(&self) -> &Self::Target {
+        &self.payload
     }
+}
 
-    /// Choice の採択候補ラベルを取得する (`selected` の別名)。
-    pub fn as_choice(&self) -> Option<&str> {
-        self.payload.choice()
-    }
-
-    /// Score の加重平均スコア値を取得する。
-    pub fn score_value(&self) -> Option<f64> {
-        self.payload.score()
-    }
-
-    /// Score の加重平均スコア値を取得する (`score_value` の別名)。
-    pub fn as_score(&self) -> Option<f64> {
-        self.payload.score()
-    }
-
-    /// Noul の真実確率値を取得する。
-    pub fn noul_probability(&self) -> Option<f64> {
-        self.payload.noul()
-    }
-
-    /// Noul の真実確率値を取得する (`noul_probability` の別名)。
-    pub fn as_noul(&self) -> Option<f64> {
-        self.payload.noul()
-    }
-
-    /// 確率分布マップの参照を取得する。
-    pub fn probabilities(&self) -> Option<&IndexMap<String, f64>> {
-        self.payload.probabilities()
-    }
-
-    /// 確率分布マップの可変参照を取得する。
-    pub fn probabilities_mut(&mut self) -> Option<&mut IndexMap<String, f64>> {
-        self.payload.probabilities_mut()
-    }
-
-    /// 正規化確信度を取得する。
-    pub fn confidence(&self) -> Option<f64> {
-        self.payload.confidence()
-    }
-
-    /// 確率分布マップを更新する。Choice / Score 型の場合に適用される。
-    pub fn set_probabilities(&mut self, probabilities: IndexMap<String, f64>) {
-        self.payload.set_probabilities(probabilities);
-    }
-
-    /// Choice 判定であるかどうか。
-    pub fn is_choice(&self) -> bool {
-        matches!(self.payload, AnswerPayload::Choice { .. })
-    }
-
-    /// Score 判定であるかどうか。
-    pub fn is_score(&self) -> bool {
-        matches!(self.payload, AnswerPayload::Score { .. })
-    }
-
-    /// Noul 判定であるかどうか。
-    pub fn is_noul(&self) -> bool {
-        matches!(self.payload, AnswerPayload::Noul { .. })
+impl std::ops::DerefMut for Answer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.payload
     }
 }
 

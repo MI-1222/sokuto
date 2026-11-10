@@ -541,7 +541,7 @@ impl InferenceEngine {
                 (selected, confidence, full)
             }
             _ => (
-                sub_answer.selected().unwrap_or("").to_string(),
+                sub_answer.as_choice().unwrap_or("").to_string(),
                 sub_answer.confidence().unwrap_or(0.0),
                 IndexMap::new(),
             ),

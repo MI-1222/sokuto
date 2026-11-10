@@ -428,7 +428,7 @@ fn analyze_model_energy_distribution(
             .as_ref()
             .expect("gating メタデータが存在する。");
         let energy = gating.energy.expect("energy 値が存在する。");
-        let _choice = answer.selected().unwrap_or_default();
+        let _choice = answer.as_choice().unwrap_or_default();
         id_energies.push(energy);
         println!(
             "  ID  | E = {:>7.3} | Conf = {:.3} | Logits = {:<25?} | {}",
@@ -476,7 +476,7 @@ fn analyze_model_energy_distribution(
             .as_ref()
             .expect("gating メタデータが存在する。");
         let energy = gating.energy.expect("energy 値が存在する。");
-        let _choice = answer.selected().unwrap_or_default();
+        let _choice = answer.as_choice().unwrap_or_default();
         ood_energies.push(energy);
         println!(
             "  OOD | E = {:>7.3} | Conf = {:.3} | Logits = {:<25?} | {}",

@@ -30,7 +30,7 @@ mod distribution_extremes {
         let logits = vec![100.0, -100.0, -100.0];
         let answer = evaluate_choice(&logits, &criteria, 1.0).unwrap();
 
-        assert_eq!(answer.selected(), Some("A"));
+        assert_eq!(answer.as_choice(), Some("A"));
         let probs = answer.probabilities().unwrap();
         assert!((probs.get("A").copied().unwrap() - 1.0).abs() < 1e-6);
         assert!(probs.get("B").copied().unwrap() < 1e-6);
@@ -65,7 +65,7 @@ mod distribution_extremes {
         let answer = evaluate_choice(&logits, &criteria, 1.0).unwrap();
 
         // 決定論的タイブレークにより先頭候補が採択される。
-        assert_eq!(answer.selected(), Some("opt1"));
+        assert_eq!(answer.as_choice(), Some("opt1"));
 
         let probs = answer.probabilities().unwrap();
         for val in probs.values() {
@@ -148,7 +148,7 @@ mod structural_bounds {
         let logits = vec![42.0];
         let answer = evaluate_choice(&logits, &criteria, 1.0).unwrap();
 
-        assert_eq!(answer.selected(), Some("only"));
+        assert_eq!(answer.as_choice(), Some("only"));
         assert_eq!(answer.confidence(), Some(1.0));
         let probs = answer.probabilities().unwrap();
         assert_eq!(probs.len(), 1);
@@ -186,7 +186,7 @@ mod structural_bounds {
             logits255.push(i as f64 * 0.01);
         }
         let ans255 = evaluate_choice(&logits255, &Criteria::Map(map255), 1.0).unwrap();
-        assert_eq!(ans255.selected(), Some("opt_254"));
+        assert_eq!(ans255.as_choice(), Some("opt_254"));
         let sum: f64 = ans255.probabilities().unwrap().values().sum();
         assert!((sum - 1.0).abs() < 1e-5);
 
@@ -359,7 +359,7 @@ mod non_finite_and_extreme_guards {
 
         // 極小温度: 1e-4 および 1e-9 (有効下限クランプによりオーバーフローせず最大値 One-hot 化する)。
         let ans_micro = evaluate_choice(&logits, &criteria, 1e-9).unwrap();
-        assert_eq!(ans_micro.selected(), Some("a"));
+        assert_eq!(ans_micro.as_choice(), Some("a"));
         assert!((ans_micro.confidence().unwrap() - 1.0).abs() < 1e-6);
 
         // 高温極限: 1000.0 (一様分布へ平滑化され確信度が極小化する)。
@@ -385,7 +385,7 @@ mod deterministic_and_contract {
         for _ in 0..10 {
             let ans = evaluate_choice(&tied_logits, &criteria, 1.0).unwrap();
             assert_eq!(
-                ans.selected(),
+                ans.as_choice(),
                 Some("first"),
                 "同率タイブレークで先頭候補が採択されませんでした。"
             );
@@ -394,7 +394,7 @@ mod deterministic_and_contract {
         // 全候補が同率の場合でも先頭が確定的に採択される。
         let all_tied = vec![3.0, 3.0, 3.0];
         let ans_all = evaluate_choice(&all_tied, &criteria, 1.0).unwrap();
-        assert_eq!(ans_all.selected(), Some("first"));
+        assert_eq!(ans_all.as_choice(), Some("first"));
     }
 
     #[test]
@@ -465,7 +465,7 @@ mod deterministic_and_contract {
             ]),
         );
         let ans_choice = evaluate_question(&q_choice, &[10.0, 0.0], &config).unwrap();
-        assert_eq!(ans_choice.selected(), Some("red"));
+        assert_eq!(ans_choice.as_choice(), Some("red"));
         assert!(ans_choice.effective_confidence().unwrap() > 0.99);
 
         // 2. Score

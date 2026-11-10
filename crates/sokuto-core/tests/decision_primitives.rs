@@ -24,7 +24,7 @@ fn test_choice_comprehensive() {
     let logits = vec![1.0, 6.0, 0.5, -2.0];
     let ans = evaluate_choice(&logits, &criteria, 1.0).unwrap();
 
-    assert_eq!(ans.selected(), Some("billing"));
+    assert_eq!(ans.as_choice(), Some("billing"));
     assert!(ans.as_score().is_none());
     assert!(ans.as_noul().is_none());
 
@@ -39,7 +39,7 @@ fn test_choice_comprehensive() {
     // 2. 完全一様分布(全ロジット同値): 確信度は 0.0、かつタイブレークで先頭候補が選ばれる
     let uniform_logits = vec![2.0, 2.0, 2.0, 2.0];
     let ans_uniform = evaluate_choice(&uniform_logits, &criteria, 1.0).unwrap();
-    assert_eq!(ans_uniform.selected(), Some("support"));
+    assert_eq!(ans_uniform.as_choice(), Some("support"));
     assert!(ans_uniform.confidence().unwrap() < 1e-6);
 
     // 3. 単一候補 (K=1) のエッジケース: 確信度 1.0、確率 1.0
@@ -47,7 +47,7 @@ fn test_choice_comprehensive() {
     single_map.insert("only".to_string(), "唯一の選択肢".to_string());
     let criteria_single = Criteria::Map(single_map);
     let ans_single = evaluate_choice(&[5.0], &criteria_single, 1.0).unwrap();
-    assert_eq!(ans_single.selected(), Some("only"));
+    assert_eq!(ans_single.as_choice(), Some("only"));
     assert_eq!(ans_single.confidence(), Some(1.0));
     assert_eq!(ans_single.probabilities().unwrap()["only"], 1.0);
 
@@ -162,7 +162,7 @@ fn test_evaluate_question_and_systemone_response() {
     let q_choice = Question::new_choice("問い合わせを分類せよ。", category_map);
     let logits_choice = vec![3.0, 1.0, 0.0];
     let ans_choice = evaluate_question(&q_choice, &logits_choice, &config).unwrap();
-    assert_eq!(ans_choice.selected(), Some("bug"));
+    assert_eq!(ans_choice.as_choice(), Some("bug"));
 
     // 質問 2: Score (3段階 -> score バケット "2-5" の温度 1.08 が適用される)
     let q_score = Question::new_score(
@@ -209,7 +209,7 @@ fn test_zero_allocation_buffers() {
     let mut buf = [0.0; 2];
     let ans_choice =
         evaluate_choice_with_buf(&[2.0, 1.0], &Criteria::Map(criteria_map), 1.0, &mut buf).unwrap();
-    assert_eq!(ans_choice.selected(), Some("a"));
+    assert_eq!(ans_choice.as_choice(), Some("a"));
 
     // 2. Score with buf
     let criteria_list = Criteria::List(vec!["0".to_string(), "1".to_string(), "2".to_string()]);

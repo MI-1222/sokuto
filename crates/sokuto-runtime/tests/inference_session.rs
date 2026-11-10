@@ -165,7 +165,7 @@ fn test_end_to_end_question_inference_and_decision() {
         evaluate_question(&question, &logits, &calib_config).expect("決定数理評価に失敗しました。");
 
     assert!(answer.is_choice());
-    let selected = answer.selected().unwrap();
+    let selected = answer.as_choice().unwrap();
     assert!(["card", "loan", "other"].contains(&selected));
     assert!(answer.confidence().unwrap() >= 0.0 && answer.confidence().unwrap() <= 1.0);
     assert_eq!(answer.probabilities().unwrap().len(), 3);

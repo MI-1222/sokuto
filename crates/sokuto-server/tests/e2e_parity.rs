@@ -182,7 +182,7 @@ async fn test_e2e_parity_all_golden_cases() {
             // 1. Choice 型の採択キー検証
             if let Some(expected_choice) = expected_ans["choice"].as_str() {
                 assert_eq!(
-                    actual_ans.selected(),
+                    actual_ans.as_choice(),
                     Some(expected_choice),
                     "ケース '{case_id}' ({q_id}): Choice 採択キーが不一致です。"
                 );
@@ -338,7 +338,7 @@ async fn test_e2e_scenario_ec_hardware_defect_details() {
 
     // 部署判定: tech_support が採択されること
     let dept = actual.answers.get("department").unwrap();
-    assert_eq!(dept.selected(), Some("tech_support"));
+    assert_eq!(dept.as_choice(), Some("tech_support"));
     let dept_probs = dept.probabilities().unwrap();
     assert!(dept_probs["tech_support"] > 0.50);
 

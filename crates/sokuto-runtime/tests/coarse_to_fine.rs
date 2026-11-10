@@ -339,7 +339,7 @@ fn test_end_to_end_coarse_to_fine_with_onnx_model() {
 
     // 検証
     assert!(answer.is_choice());
-    let selected = answer.selected().unwrap();
+    let selected = answer.as_choice().unwrap();
     eprintln!("選択された候補: {selected}");
 
     // 確信度が 0.0〜1.0 の範囲内であること

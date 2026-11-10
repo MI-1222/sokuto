@@ -656,11 +656,13 @@ pub fn score_variance_ratio(probabilities: &[f64]) -> Result<f64> {
     score_variance_ratio_iter(probabilities)
 }
 
-/// Score 型の確率分布から双峰性係数 (Bimodality Coefficient: $BC$) を算出する。
+/// 任意の確率値イテレータから双峰性係数 (Bimodality Coefficient: $BC$) を算出する。
 ///
 /// # 概要
 /// - 離散確率分布における母集団中心モーメント(2次、3次、4次)を直接算出し、
 ///   標本補正項による $M \le 3$ でのゼロ除算クラッシュを完全に排除した閉じた数理計算を行う。
+/// - スタックバッファ(最大32要素)を活用することで、Score 型の通常スコープ($M \le 10$)において
+///   ヒープアロケーションを一切発生させずに計算を完結する。
 /// - 単峰性分布では $BC < 0.555$ となり、完全一様分布では $BC \approx 0.555$、
 ///   両端対立(二極化)分布では $BC \to 1.0$ へ漸近する。
 /// - 極小分散 ($\sigma^2 < 10^{-6}$) の場合は、完全単峰・高確信度と判定してゼロ除算を回避し、
@@ -672,28 +674,24 @@ pub fn score_variance_ratio(probabilities: &[f64]) -> Result<f64> {
 /// $\mu_r = \sum_{k=0}^{M-1} (k - \mu)^r p_k$ である。
 ///
 /// # 引数
-/// - `probabilities`: 各段階レベルの確率分布スライス ($M \ge 2$)。
+/// - `iter`: 各段階レベルの確率値(`f64` または `&f64`)を提供するイテレータ ($M \ge 2$)。
 ///
 /// # 戻り値
 /// - 成功時は `[0.0, 1.0]` の閉区間にクランプされた双峰性係数、不正時は `CoreError::MathError`。
-pub fn bimodality_coefficient(probabilities: &[f64]) -> Result<f64> {
-    let m = probabilities.len();
-    if m < 2 {
-        return Err(CoreError::MathError {
-            message: "双峰性係数の計算には 2 段階以上の確率分布が必要です。".to_string(),
-        });
-    }
+pub fn bimodality_coefficient_iter<I>(iter: I) -> Result<f64>
+where
+    I: IntoIterator,
+    I::Item: Borrow<f64>,
+{
+    const STACK_CAPACITY: usize = 32;
+    let mut stack_buf = [0.0; STACK_CAPACITY];
+    let mut heap_buf: Option<Vec<f64>> = None;
+    let mut count = 0;
+    let mut sum_prob = 0.0;
+    let mut weighted_sum = 0.0;
 
-    let mean = expected_score(probabilities)?;
-
-    // 2次中心モーメント (分散 sigma^2)
-    let mut variance = 0.0;
-    // 3次中心モーメント mu_3
-    let mut mu3 = 0.0;
-    // 4次中心モーメント mu_4
-    let mut mu4 = 0.0;
-
-    for (k, &p) in probabilities.iter().enumerate() {
+    for (k, item) in iter.into_iter().enumerate() {
+        let p = *item.borrow();
         if !p.is_finite() {
             return Err(CoreError::MathError {
                 message: "確率値に非有限値(NaNまたは無限大)が含まれています。".to_string(),
@@ -704,6 +702,49 @@ pub fn bimodality_coefficient(probabilities: &[f64]) -> Result<f64> {
                 message: format!("負の確率値が含まれています: {p}。"),
             });
         }
+
+        if count < STACK_CAPACITY {
+            stack_buf[count] = p;
+        } else {
+            let vec = heap_buf.get_or_insert_with(|| {
+                let mut v = Vec::with_capacity(64);
+                v.extend_from_slice(&stack_buf);
+                v
+            });
+            vec.push(p);
+        }
+
+        count += 1;
+        sum_prob += p;
+        weighted_sum += (k as f64) * p;
+    }
+
+    if count < 2 {
+        return Err(CoreError::MathError {
+            message: "双峰性係数の計算には 2 段階以上の確率分布が必要です。".to_string(),
+        });
+    }
+
+    let mean = if sum_prob > 0.0 {
+        weighted_sum / sum_prob
+    } else {
+        weighted_sum
+    };
+
+    let slice: &[f64] = if let Some(ref v) = heap_buf {
+        v.as_slice()
+    } else {
+        &stack_buf[..count]
+    };
+
+    // 2次中心モーメント (分散 sigma^2)
+    let mut variance = 0.0;
+    // 3次中心モーメント mu_3
+    let mut mu3 = 0.0;
+    // 4次中心モーメント mu_4
+    let mut mu4 = 0.0;
+
+    for (k, &p) in slice.iter().enumerate() {
         let diff = (k as f64) - mean;
         let diff2 = diff * diff;
         variance += diff2 * p;
@@ -733,6 +774,34 @@ pub fn bimodality_coefficient(probabilities: &[f64]) -> Result<f64> {
 
     let bc = (gamma * gamma + 1.0) / kurtosis;
     Ok(bc.clamp(0.0, 1.0))
+}
+
+/// Score 型の確率分布から双峰性係数 (Bimodality Coefficient: $BC$) を算出する。
+///
+/// # 概要
+/// - 離散確率分布における母集団中心モーメント(2次、3次、4次)を直接算出し、
+///   標本補正項による $M \le 3$ でのゼロ除算クラッシュを完全に排除した閉じた数理計算を行う。
+/// - 単峰性分布では $BC < 0.555$ となり、完全一様分布では $BC \approx 0.555$、
+///   両端対立(二極化)分布では $BC \to 1.0$ へ漸近する。
+/// - 極小分散 ($\sigma^2 < 10^{-6}$) の場合は、完全単峰・高確信度と判定してゼロ除算を回避し、
+///   即座に $0.0$ を返却する。
+///
+/// # 数理仕様
+/// $$BC = \frac{\gamma^2 + 1}{\kappa}$$
+/// ここで、歪度 $\gamma = \frac{\mu_3}{\sigma^3}$、尖度 $\kappa = \frac{\mu_4}{\sigma^4}$、
+/// $\mu_r = \sum_{k=0}^{M-1} (k - \mu)^r p_k$ である。
+///
+/// # 引数
+/// - `probabilities`: 各段階レベルの確率分布スライス ($M \ge 2$)。
+///
+/// # 戻り値
+/// - 成功時は `[0.0, 1.0]` の閉区間にクランプされた双峰性係数、不正時は `CoreError::MathError`。
+///
+/// # 備考
+/// - [`bimodality_coefficient_iter`] を呼び出すゼロコストラッパーとして動作する。
+#[inline]
+pub fn bimodality_coefficient(probabilities: &[f64]) -> Result<f64> {
+    bimodality_coefficient_iter(probabilities)
 }
 
 /// Noul 型の言明真実確率値 $P(\text{true}) \in [0.0, 1.0]$ を算出する。
@@ -792,6 +861,84 @@ pub fn noul_confidence(probability: f64) -> Result<f64> {
     Ok(conf.clamp(0.0, 1.0))
 }
 
+/// 任意のロジット値イテレータから自由エネルギー値および要素数を単一パス走査で算出する内部ヘルパー。
+fn free_energy_with_count_iter<I>(iter: I, temperature: f64) -> Result<(f64, usize)>
+where
+    I: IntoIterator,
+    I::Item: Borrow<f64>,
+{
+    if !temperature.is_finite() || temperature <= 0.0 {
+        return Err(CoreError::MathError {
+            message: format!("温度パラメータは正の有限実数である必要があります: {temperature}。"),
+        });
+    }
+
+    let effective_tau = temperature.max(1e-4);
+    let mut count = 0;
+    let mut max_logit = f64::NEG_INFINITY;
+    let mut sum_exp = 0.0;
+
+    for item in iter {
+        let z = *item.borrow();
+        if !z.is_finite() {
+            return Err(CoreError::MathError {
+                message: "ロジットに非有限値(NaNまたは無限大)が含まれています。".to_string(),
+            });
+        }
+
+        count += 1;
+        if count == 1 {
+            max_logit = z;
+            sum_exp = 1.0;
+        } else if z > max_logit {
+            let scale = ((max_logit - z) / effective_tau).exp();
+            sum_exp = sum_exp * scale + 1.0;
+            max_logit = z;
+        } else {
+            let scaled = ((z - max_logit) / effective_tau).exp();
+            sum_exp += scaled;
+        }
+    }
+
+    if count == 0 {
+        return Err(CoreError::MathError {
+            message: "ロジット配列が空です。".to_string(),
+        });
+    }
+
+    if count == 1 {
+        return Ok((-max_logit, 1));
+    }
+
+    let energy = -max_logit - effective_tau * sum_exp.ln();
+    Ok((energy, count))
+}
+
+/// 任意の未正規化生ロジットのイテレータからヘルムホルツ自由エネルギー (Free Energy) を単一パス走査で算出する。
+///
+/// # 概要
+/// - オンライン LogSumExp アルゴリズムにより、単一パス走査かつゼロアロケーションで計算する。
+/// - 指数オーバーフローを防ぐため、オンライン最大値追跡によるスケーリングを適用する。
+///
+/// # 数理仕様
+/// $$E(x; C) = -T \cdot \ln \sum_{i=1}^K \exp\left( \frac{z_i}{T} \right)$$
+/// 有効温度 $T_{\text{eff}} = \max(T, 10^{-4})$ を適用する。
+///
+/// # 引数
+/// - `iter`: 未正規化の生ロジット(`f64` または `&f64`)を提供するイテレータ。
+/// - `temperature`: 較正温度パラメータ $T$。正の有限実数。
+///
+/// # 戻り値
+/// - 成功時は自由エネルギー値 $E(x; C)$、入力不正時は `CoreError::MathError`。
+pub fn free_energy_iter<I>(iter: I, temperature: f64) -> Result<f64>
+where
+    I: IntoIterator,
+    I::Item: Borrow<f64>,
+{
+    let (energy, _) = free_energy_with_count_iter(iter, temperature)?;
+    Ok(energy)
+}
+
 /// ロジット列からヘルムホルツ自由エネルギー (Free Energy) を算出する。
 ///
 /// # 概要
@@ -809,55 +956,41 @@ pub fn noul_confidence(probability: f64) -> Result<f64> {
 ///
 /// # 戻り値
 /// - 成功時は自由エネルギー値 $E(x; C)$、入力不正時は `CoreError::MathError` を返却する。
+///
+/// # 備考
+/// - [`free_energy_iter`] を呼び出すゼロコストラッパーとして動作する。
+#[inline]
 pub fn free_energy(logits: &[f64], temperature: f64) -> Result<f64> {
-    if logits.is_empty() {
-        return Err(CoreError::MathError {
-            message: "ロジット配列が空です。".to_string(),
-        });
-    }
+    free_energy_iter(logits, temperature)
+}
 
-    if !temperature.is_finite() || temperature <= 0.0 {
-        return Err(CoreError::MathError {
-            message: format!("温度パラメータは正の有限実数である必要があります: {temperature}。"),
-        });
-    }
-
-    // 単一候補 (K=1) の場合は、-z_0 を直接返却する。
-    if logits.len() == 1 {
-        if !logits[0].is_finite() {
-            return Err(CoreError::MathError {
-                message: "ロジットに非有限値(NaNまたは無限大)が含まれています。".to_string(),
-            });
-        }
-        return Ok(-logits[0]);
+/// 任意の未正規化生ロジットのイテレータから、候補数 $K$ に対する基底エネルギー偏向を補正した正規化自由エネルギーを単一パス走査で算出する。
+///
+/// # 概要
+/// - 単一パス走査で自由エネルギーと候補数 $K$ を同時に集計し、ゼロアロケーションで補正エネルギーを算出する。
+///
+/// # 数理仕様
+/// $$E_{\text{norm}}(x; C) = E(x; C) + T \ln K = -T \cdot \ln\left( \frac{1}{K} \sum_{i=1}^K \exp\left(\frac{z_i}{T}\right) \right)$$
+///
+/// # 引数
+/// - `iter`: 未正規化の生ロジット(`f64` または `&f64`)を提供するイテレータ。
+/// - `temperature`: 較正温度パラメータ $T$。正の有限実数。
+///
+/// # 戻り値
+/// - 成功時は正規化自由エネルギー値 $E_{\text{norm}}(x; C)$、入力不正時は `CoreError::MathError`。
+pub fn normalized_free_energy_iter<I>(iter: I, temperature: f64) -> Result<f64>
+where
+    I: IntoIterator,
+    I::Item: Borrow<f64>,
+{
+    let (raw_energy, k) = free_energy_with_count_iter(iter, temperature)?;
+    if k <= 1 {
+        return Ok(raw_energy);
     }
 
     let effective_tau = temperature.max(1e-4);
-
-    // Pass 1: 最大値探索および非有限値の検出。
-    let mut max_logit = f64::NEG_INFINITY;
-    for &logit in logits {
-        if !logit.is_finite() {
-            return Err(CoreError::MathError {
-                message: "ロジットに非有限値(NaNまたは無限大)が含まれています。".to_string(),
-            });
-        }
-        if logit > max_logit {
-            max_logit = logit;
-        }
-    }
-
-    // Pass 2: 最大値減算後の指数和累積 (Max-trick)。
-    // (logit - max_logit) <= 0.0 であるためオーバーフローしない。
-    // かつ最大要素は exp(0.0) = 1.0 であるため、sum_exp >= 1.0 が保証され ln(sum_exp) >= 0.0 となる。
-    let mut sum_exp = 0.0;
-    for &logit in logits {
-        let scaled = (logit - max_logit) / effective_tau;
-        sum_exp += scaled.exp();
-    }
-
-    let energy = -max_logit - effective_tau * sum_exp.ln();
-    Ok(energy)
+    let shift = effective_tau * (k as f64).ln();
+    Ok(raw_energy + shift)
 }
 
 /// 候補数 $K$ に対する基底エネルギー偏向を補正した、正規化ヘルムホルツ自由エネルギー (Normalized Free Energy) を算出する。
@@ -869,7 +1002,7 @@ pub fn free_energy(logits: &[f64], temperature: f64) -> Result<f64> {
 /// - すべてのロジットが同一の定数 $c$ (完全な一様分布) であるとき、本関数の出力は厳密に $-c$ (ロジットが0のときは0.0) となる。
 ///
 /// # 数理仕様
-/// $$E_{\text{norm}}(x; C) = E(x; C) + T \ln K = -T \cdot \ln\left( \frac{1}{K} \sum_{i=1}^K \exp\left(\frac{z_i}{T}\right) \right) = -z_{\max} - T_{\text{eff}} \cdot \ln\left( \frac{1}{K} \sum_{i=1}^K \exp\left(\frac{z_i - z_{\max}}{T_{\text{eff}}}\right) \right)$$
+/// $$E_{\text{norm}}(x; C) = E(x; C) + T \ln K = -T \cdot \ln\left( \frac{1}{K} \sum_{i=1}^K \exp\left(\frac{z_i}{T}\right) \right) = -z_{\max} - T_{\text{eff}} \cdot \ln\left( \frac{1}{K} \sum_{i=1}^K \exp\left(\frac{z_i - z_{\max}}{T_{\text{eff}}} \right) \right)$$
 ///
 /// # 引数
 /// - `logits`: 未正規化の生ロジットスライス (`f64`)。
@@ -877,16 +1010,12 @@ pub fn free_energy(logits: &[f64], temperature: f64) -> Result<f64> {
 ///
 /// # 戻り値
 /// - 成功時は正規化自由エネルギー値 $E_{\text{norm}}(x; C)$、入力不正時は `CoreError::MathError` を返却する。
+///
+/// # 備考
+/// - [`normalized_free_energy_iter`] を呼び出すゼロコストラッパーとして動作する。
+#[inline]
 pub fn normalized_free_energy(logits: &[f64], temperature: f64) -> Result<f64> {
-    let k = logits.len();
-    let raw_energy = free_energy(logits, temperature)?;
-    if k <= 1 {
-        return Ok(raw_energy);
-    }
-
-    let effective_tau = temperature.max(1e-4);
-    let shift = effective_tau * (k as f64).ln();
-    Ok(raw_energy + shift)
+    normalized_free_energy_iter(logits, temperature)
 }
 
 #[cfg(test)]
@@ -1682,5 +1811,49 @@ mod tests {
         // ロジットに非有限値
         assert!(free_energy(&[1.0, f64::NAN], 1.0).is_err());
         assert!(free_energy(&[1.0, f64::INFINITY], 1.0).is_err());
+    }
+
+    #[test]
+    fn test_bimodality_coefficient_iter_parity() {
+        use indexmap::IndexMap;
+
+        // 1. IndexMap からのゼロアロケーション走査
+        let mut map = IndexMap::new();
+        map.insert("cat_0".to_string(), 0.5);
+        map.insert("cat_1".to_string(), 0.0);
+        map.insert("cat_2".to_string(), 0.0);
+        map.insert("cat_3".to_string(), 0.5);
+
+        let slice = [0.5, 0.0, 0.0, 0.5];
+        let bc_slice = bimodality_coefficient(&slice).unwrap();
+        let bc_iter = bimodality_coefficient_iter(map.values()).unwrap();
+        assert_eq!(bc_slice, bc_iter);
+
+        // 2. スタックバッファ上限 (32要素) を超えるケースでのヒープフォールバック検証
+        let large_p: Vec<f64> = (0..50).map(|_| 1.0 / 50.0).collect();
+        let bc_large_slice = bimodality_coefficient(&large_p).unwrap();
+        let bc_large_iter = bimodality_coefficient_iter(large_p.iter()).unwrap();
+        assert!((bc_large_slice - bc_large_iter).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_free_energy_iter_parity() {
+        use indexmap::IndexMap;
+
+        let mut map = IndexMap::new();
+        map.insert("k0".to_string(), 2.0);
+        map.insert("k1".to_string(), 1.0);
+        map.insert("k2".to_string(), 0.0);
+
+        let slice = [2.0, 1.0, 0.0];
+        let t = 1.0;
+
+        let fe_slice = free_energy(&slice, t).unwrap();
+        let fe_iter = free_energy_iter(map.values(), t).unwrap();
+        assert!((fe_slice - fe_iter).abs() < 1e-9);
+
+        let nfe_slice = normalized_free_energy(&slice, t).unwrap();
+        let nfe_iter = normalized_free_energy_iter(map.values(), t).unwrap();
+        assert!((nfe_slice - nfe_iter).abs() < 1e-9);
     }
 }

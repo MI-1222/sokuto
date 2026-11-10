@@ -5,6 +5,8 @@
 //! 検知時は Gating 安全弁を作動させ、誤った自動実行 (AutoExecute) を防止して
 //! `ConfirmOrEscalate` へ強制降格する。
 
+use std::borrow::Borrow;
+
 use indexmap::IndexMap;
 use sokuto_core::error::Result;
 use sokuto_core::gating::DecisionRoute;
@@ -142,6 +144,45 @@ impl BimodalDetector {
             expected_score: mean,
         })
     }
+
+    /// 任意の確率値イテレータを検査し、二峰性レポートを生成する。
+    ///
+    /// # 備考
+    /// - スタックバッファを活用し、Score 型の通常スコープ ($M \le 10$) において
+    ///   ヒープアロケーションなしで二峰性を検査する。
+    pub fn detect_iter<I>(&self, iter: I) -> Result<BimodalReport>
+    where
+        I: IntoIterator,
+        I::Item: Borrow<f64>,
+    {
+        const STACK_CAPACITY: usize = 16;
+        let mut stack_buf = [0.0; STACK_CAPACITY];
+        let mut heap_buf: Option<Vec<f64>> = None;
+        let mut m = 0;
+
+        for item in iter {
+            let p = *item.borrow();
+            if m < STACK_CAPACITY {
+                stack_buf[m] = p;
+            } else {
+                let vec = heap_buf.get_or_insert_with(|| {
+                    let mut v = Vec::with_capacity(32);
+                    v.extend_from_slice(&stack_buf);
+                    v
+                });
+                vec.push(p);
+            }
+            m += 1;
+        }
+
+        let slice = if let Some(ref v) = heap_buf {
+            v.as_slice()
+        } else {
+            &stack_buf[..m]
+        };
+
+        self.detect(slice)
+    }
 }
 
 impl Default for BimodalDetector {
@@ -180,8 +221,7 @@ pub fn verify_and_adjust_bimodal(
             continue;
         };
 
-        let probs_vec: Vec<f64> = probs_map.values().copied().collect();
-        let Ok(report) = detector.detect(&probs_vec) else {
+        let Ok(report) = detector.detect_iter(probs_map.values()) else {
             continue;
         };
 

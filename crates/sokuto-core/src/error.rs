@@ -154,3 +154,20 @@ pub enum CoreError {
         actual: usize,
     },
 }
+
+impl CoreError {
+    /// エラーに質問識別子 (question_id) のコンテキストを付与または上書きする。
+    pub fn with_question_id(mut self, qid: impl Into<String>) -> Self {
+        let qid_str = Some(qid.into());
+        match &mut self {
+            Self::InvalidChoiceCount { question_id, .. }
+            | Self::InvalidScoreLevelCount { question_id, .. }
+            | Self::InvalidCriteriaType { question_id, .. }
+            | Self::MissingCriteria { question_id, .. } => {
+                *question_id = qid_str;
+            }
+            _ => {}
+        }
+        self
+    }
+}

@@ -135,8 +135,11 @@ impl Question {
     }
 
     /// 質問スキーマの整合性を検証する。
-    pub fn validate(&self, question_id: &str) -> Result<()> {
-        let qid = Some(question_id.to_string());
+    ///
+    /// # 引数
+    /// - `question_id`: 質問識別子 (任意)。エラー発生時に診断メッセージへ付与される。
+    pub fn validate(&self, question_id: Option<&str>) -> Result<()> {
+        let qid = question_id.map(|s| s.to_string());
         match self.question_type {
             QuestionType::Choice => {
                 let criteria =
@@ -235,7 +238,7 @@ pub fn validate_request_payload(
         return Err(CoreError::EmptyQuestions);
     }
     for (question_id, question) in questions {
-        question.validate(question_id)?;
+        question.validate(Some(question_id))?;
     }
     if let Some(gating) = gating {
         gating.validate()?;

@@ -1305,6 +1305,7 @@ impl DualSessionEngine {
                     sample_logits,
                     calib_config,
                     &mut scratch_probs[..k_i],
+                    Some(qid.as_str()),
                 )?;
 
                 let energy = calculate_choice_energy(q, sample_logits, calib_config);

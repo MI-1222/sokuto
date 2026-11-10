@@ -267,14 +267,22 @@ pub fn evaluate_noul(logits: &[f64], temperature: f64) -> Result<Answer> {
 }
 
 /// 作業用バッファを活用し、質問定義、生ロジット、および較正設定から型安全に判定結果 (`Answer`) を導出する。
+///
+/// # 引数
+/// - `question`: 評価対象の質問定義。
+/// - `logits`: 推論エンジンから出力された生ロジットスライス。
+/// - `config`: 最適温度マップを保持するキャリブレーション設定。
+/// - `probs_buf`: 確率値書き込み用の作業バッファスライス (`logits` と同長が必要)。
+/// - `question_id`: 質問識別子 (任意)。エラー発生時に診断メッセージへ反映される。
 pub fn evaluate_question_with_buf(
     question: &Question,
     logits: &[f64],
     config: &CalibrationConfig,
     probs_buf: &mut [f64],
+    question_id: Option<&str>,
 ) -> Result<Answer> {
     // 質問定義のスキーマ検証を実施する。
-    question.validate("evaluate_question")?;
+    question.validate(question_id)?;
 
     match question.question_type {
         QuestionType::Choice => {
@@ -283,7 +291,7 @@ pub fn evaluate_question_with_buf(
                     .criteria
                     .as_ref()
                     .ok_or_else(|| CoreError::MissingCriteria {
-                        question_id: Some("evaluate_question".to_string()),
+                        question_id: question_id.map(|s| s.to_string()),
                         question_type: "choice".to_string(),
                     })?;
             let k = criteria.len();
@@ -296,7 +304,7 @@ pub fn evaluate_question_with_buf(
                     .criteria
                     .as_ref()
                     .ok_or_else(|| CoreError::MissingCriteria {
-                        question_id: Some("evaluate_question".to_string()),
+                        question_id: question_id.map(|s| s.to_string()),
                         question_type: "score".to_string(),
                     })?;
             let m = criteria.len();
@@ -316,6 +324,7 @@ pub fn evaluate_question_with_buf(
 /// - 質問タイプ (`QuestionType`) および候補数・段階数に基づいて `CalibrationConfig` から
 ///   最適な較正温度 $\tau^*$ を自動解決する。
 /// - 質問プリミティブに応じた評価関数へディスパッチする。
+/// - エラー診断時に質問識別子を付与したい場合は [`evaluate_question_with_id`] を使用する。
 ///
 /// # 引数
 /// - `question`: 評価対象の質問定義。
@@ -329,8 +338,20 @@ pub fn evaluate_question(
     logits: &[f64],
     config: &CalibrationConfig,
 ) -> Result<Answer> {
+    evaluate_question_with_id(None, question, logits, config)
+}
+
+/// 質問識別子を指定し、質問定義、生ロジット、および較正設定から型安全に判定結果 (`Answer`) を導出する。
+///
+/// エラー発生時に指定された `question_id` がエラーコンテキストへ反映される。
+pub fn evaluate_question_with_id(
+    question_id: Option<&str>,
+    question: &Question,
+    logits: &[f64],
+    config: &CalibrationConfig,
+) -> Result<Answer> {
     let mut probs_buf = vec![0.0; logits.len()];
-    evaluate_question_with_buf(question, logits, config, &mut probs_buf)
+    evaluate_question_with_buf(question, logits, config, &mut probs_buf, question_id)
 }
 
 #[cfg(test)]
@@ -539,5 +560,63 @@ mod tests {
         let q_noul = Question::new_noul("真偽を判定せよ。");
         let ans_noul = evaluate_question(&q_noul, &[2.5, 0.0], &config).unwrap();
         assert!(ans_noul.as_noul().unwrap() > 0.85);
+    }
+
+    #[test]
+    fn test_evaluate_question_error_preserves_question_id() {
+        let config = CalibrationConfig::default();
+
+        // 候補数 0 の不正な Choice 質問定義を作成
+        let invalid_q = Question {
+            question_type: QuestionType::Choice,
+            instructions: "無効な指示".to_string(),
+            criteria: Some(Criteria::Map(IndexMap::new())),
+        };
+
+        // 1. question_id を指定した場合: エラーに指定した question_id が保持されること
+        let err_with_id =
+            evaluate_question_with_id(Some("intent"), &invalid_q, &[1.0], &config).unwrap_err();
+        match &err_with_id {
+            CoreError::InvalidChoiceCount { question_id, count } => {
+                assert_eq!(question_id.as_deref(), Some("intent"));
+                assert_eq!(*count, 0);
+            }
+            other => panic!("予期しないエラー型です: {other:?}"),
+        }
+        let err_msg = err_with_id.to_string();
+        assert!(
+            err_msg.contains("質問 'intent': "),
+            "エラーメッセージに質問識別子が含まれていること: {err_msg}"
+        );
+        assert!(
+            !err_msg.contains("evaluate_question"),
+            "旧ダミープレフィックスが含まれていないこと: {err_msg}"
+        );
+
+        // 2. question_id が None の場合: question_id は None となり余分なプレフィックスが付与されないこと
+        let err_no_id = evaluate_question(&invalid_q, &[1.0], &config).unwrap_err();
+        match &err_no_id {
+            CoreError::InvalidChoiceCount { question_id, count } => {
+                assert_eq!(question_id, &None);
+                assert_eq!(*count, 0);
+            }
+            other => panic!("予期しないエラー型です: {other:?}"),
+        }
+        let err_no_id_msg = err_no_id.to_string();
+        assert!(
+            !err_no_id_msg.contains("evaluate_question"),
+            "旧ダミープレフィックスが含まれていないこと: {err_no_id_msg}"
+        );
+        assert!(
+            !err_no_id_msg.starts_with("質問 '"),
+            "識別子なしの場合は質問プレフィックスが付与されないこと: {err_no_id_msg}"
+        );
+
+        // 3. evaluate_question_with_buf でも question_id が正しく伝搬すること
+        let mut buf = [0.0; 2];
+        let err_buf =
+            evaluate_question_with_buf(&invalid_q, &[1.0], &config, &mut buf, Some("urgency"))
+                .unwrap_err();
+        assert!(err_buf.to_string().contains("質問 'urgency': "));
     }
 }

@@ -202,6 +202,7 @@ impl InferenceEngine {
                 valid_logits,
                 calib_config,
                 &mut probs_buf[..k_i],
+                Some(q_key.as_str()),
             )?;
             let energy = calculate_choice_energy(question, valid_logits, calib_config);
             apply_gating_to_answer_with_energy(
@@ -286,6 +287,7 @@ impl InferenceEngine {
                 valid_logits,
                 calib_config,
                 &mut scratchpad.probs_buf[..k_i],
+                Some(q_key.as_str()),
             )?;
             let energy = calculate_choice_energy(question, valid_logits, calib_config);
             apply_gating_to_answer_with_energy(
@@ -439,6 +441,7 @@ impl InferenceEngine {
                     valid_logits,
                     calib_config,
                     &mut probs_buf[..k_i],
+                    Some(q_key.as_str()),
                 )?;
                 let energy = calculate_choice_energy(question, valid_logits, calib_config);
                 apply_gating_to_answer_with_energy(
@@ -722,6 +725,7 @@ impl InferenceEngine {
                     valid_logits,
                     calib_config,
                     &mut probs_buf[..k_i],
+                    Some(q_key.as_str()),
                 )?;
 
                 let energy = calculate_choice_energy(question, valid_logits, calib_config);

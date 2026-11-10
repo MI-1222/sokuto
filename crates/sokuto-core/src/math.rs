@@ -668,8 +668,9 @@ pub fn score_variance_ratio(probabilities: &[f64]) -> Result<f64> {
 /// # 概要
 /// - 離散確率分布における母集団中心モーメント(2次、3次、4次)を直接算出し、
 ///   標本補正項による $M \le 3$ でのゼロ除算クラッシュを完全に排除した閉じた数理計算を行う。
-/// - スタックバッファ(最大32要素)を活用することで、Score 型の通常スコープ($M \le 10$)において
-///   ヒープアロケーションを一切発生させずに計算を完結する。
+/// - Welford / Terriberry の加重オンライン高次モーメント更新式を採用し、平均、分散 ($M_2$)、
+///   3次中心モーメント ($M_3$)、4次中心モーメント ($M_4$) を完全単一パス・ゼロアロケーションでストリーミング算出する。
+/// - 中間バッファを一切必要としないため、メモリ計算量は $O(1)$ であり、要素数に関わらずヒープ割り当ては完全ゼロとなる。
 /// - 単峰性分布では $BC < 0.555$ となり、完全一様分布では $BC \approx 0.555$、
 ///   両端対立(二極化)分布では $BC \to 1.0$ へ漸近する。
 /// - 極小分散 ($\sigma^2 < 10^{-6}$) の場合は、完全単峰・高確信度と判定してゼロ除算を回避し、
@@ -691,12 +692,12 @@ where
     I: IntoIterator,
     I::Item: Borrow<f64>,
 {
-    const STACK_CAPACITY: usize = 32;
-    let mut stack_buf = [0.0; STACK_CAPACITY];
-    let mut heap_buf: Option<Vec<f64>> = None;
-    let mut count = 0;
-    let mut sum_prob = 0.0;
-    let mut weighted_sum = 0.0;
+    let mut count: usize = 0;
+    let mut weight_sum = 0.0;
+    let mut mean = 0.0;
+    let mut m2 = 0.0;
+    let mut m3 = 0.0;
+    let mut m4 = 0.0;
 
     for (k, item) in iter.into_iter().enumerate() {
         let p = *item.borrow();
@@ -711,20 +712,27 @@ where
             });
         }
 
-        if count < STACK_CAPACITY {
-            stack_buf[count] = p;
-        } else {
-            let vec = heap_buf.get_or_insert_with(|| {
-                let mut v = Vec::with_capacity(64);
-                v.extend_from_slice(&stack_buf);
-                v
-            });
-            vec.push(p);
-        }
-
         count += 1;
-        sum_prob += p;
-        weighted_sum += (k as f64) * p;
+        let x = k as f64;
+        let temp_weight = weight_sum + p;
+        let delta = x - mean;
+        let r = if temp_weight > 0.0 {
+            delta * p / temp_weight
+        } else {
+            0.0
+        };
+        let delta2 = delta - r;
+
+        let delta_m2 = weight_sum * delta * r;
+        let r2 = r * r;
+        let term_m4 = weight_sum * (r2 * r2) + p * (delta2 * delta2 * delta2 * delta2);
+
+        // 高次モーメントの更新 (M4 -> M3 -> M2 -> mean の順序で依存関係を解決)
+        m4 += -4.0 * r * m3 + 6.0 * r2 * m2 + term_m4;
+        m3 += -3.0 * r * m2 + delta_m2 * (delta - 2.0 * r);
+        m2 += delta_m2;
+        mean += r;
+        weight_sum = temp_weight;
     }
 
     if count < 2 {
@@ -733,38 +741,11 @@ where
         });
     }
 
-    let mean = if sum_prob > 0.0 {
-        weighted_sum / sum_prob
+    let (variance, mu3, mu4) = if weight_sum > 0.0 {
+        (m2 / weight_sum, m3 / weight_sum, m4 / weight_sum)
     } else {
-        weighted_sum
+        (0.0, 0.0, 0.0)
     };
-
-    let slice: &[f64] = if let Some(ref v) = heap_buf {
-        v.as_slice()
-    } else {
-        &stack_buf[..count]
-    };
-
-    // 2次中心モーメント (分散 sigma^2)
-    let mut variance = 0.0;
-    // 3次中心モーメント mu_3
-    let mut mu3 = 0.0;
-    // 4次中心モーメント mu_4
-    let mut mu4 = 0.0;
-
-    for (k, &p) in slice.iter().enumerate() {
-        let diff = (k as f64) - mean;
-        let diff2 = diff * diff;
-        variance += diff2 * p;
-        mu3 += diff2 * diff * p;
-        mu4 += diff2 * diff2 * p;
-    }
-
-    if sum_prob > 0.0 {
-        variance /= sum_prob;
-        mu3 /= sum_prob;
-        mu4 /= sum_prob;
-    }
 
     // 極小分散 (ワンホット等) のショートサーキット判定
     if variance < 1e-6 {
@@ -1870,7 +1851,7 @@ mod tests {
         let bc_iter = bimodality_coefficient_iter(map.values()).unwrap();
         assert_eq!(bc_slice, bc_iter);
 
-        // 2. スタックバッファ上限 (32要素) を超えるケースでのヒープフォールバック検証
+        // 2. 大規模要素数 (50要素) における単一パス計算とスライス計算の一致検証
         let large_p: Vec<f64> = (0..50).map(|_| 1.0 / 50.0).collect();
         let bc_large_slice = bimodality_coefficient(&large_p).unwrap();
         let bc_large_iter = bimodality_coefficient_iter(large_p.iter()).unwrap();

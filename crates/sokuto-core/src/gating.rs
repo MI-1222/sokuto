@@ -4,9 +4,9 @@
 //! 決定論的に 3 系統のアクションへ分岐する安全制御ロジックを提供する。
 //!
 //! ## 3系統ルーティングの判定基準
-//! - **`AutoExecute` ($\ge 0.85$ & Margin $\ge 0.15$)**: 自動実行(高信頼・人手や大型LLMの介在なし)。
-//! - **`ConfirmOrEscalate` ($0.50 \dots 0.85$ または Margin $< 0.15$)**: 確認/二次検証要求(System 2 LLMへの委託または人手確認)。
-//! - **`Fallback` ($< 0.50$)**: 安全弁フォールバック(情報不足・一様迷い時のデフォルト動作・棄却)。
+//! - **`AutoExecute` ($\ge 0.70$ & Margin $\ge 0.15$)**: 自動実行(高信頼・人手や大型LLMの介在なし)。
+//! - **`ConfirmOrEscalate` ($0.35 \dots 0.70$ または Margin $< 0.15$)**: 確認/二次検証要求(System 2 LLMへの委託または人手確認)。
+//! - **`Fallback` ($< 0.35$)**: 安全弁フォールバック(情報不足・一様迷い時のデフォルト動作・棄却)。
 
 use std::fmt::{self, Write};
 
@@ -549,12 +549,33 @@ pub fn evaluate_answer_gating_opts(
     };
 
     // 閾値判定とマージンガード (OOD 検知時は最優先で Fallback へ短絡降格)。
+    // Choice 型の場合、純粋な分布平坦度指標であるエントロピー確信度 (1.0 - H_norm) を算出し、
+    // 複合確信度 (S_conf <= Margin) によるデッドコード化を回避してマージンガードを判定する。
+    let entropy_confidence = if is_choice {
+        entropy.map(|h| (1.0 - h).clamp(0.0, 1.0))
+    } else {
+        None
+    };
+
     let (route, reason) = if is_ood {
         (
             DecisionRoute::Fallback,
             ood_reason.unwrap_or_else(|| {
                 "OOD 安全弁回路が作動したため安全弁フォールバックを適用しました。".to_string()
             }),
+        )
+    } else if is_choice
+        && entropy_confidence.unwrap_or(0.0) >= thresholds.high_threshold - EPSILON
+        && margin.unwrap_or(1.0) < thresholds.top_margin_threshold - EPSILON
+    {
+        let ent_conf = entropy_confidence.unwrap_or(0.0);
+        let m = margin.unwrap_or(0.0);
+        (
+            DecisionRoute::ConfirmOrEscalate,
+            format!(
+                "エントロピー確信度({:.3} >= {:.3})は高水準ですが、上位2候補の確率差({:.3} < {:.3})が僅差のため確認要求に降格しました。",
+                ent_conf, thresholds.high_threshold, m, thresholds.top_margin_threshold
+            ),
         )
     } else if conf >= thresholds.high_threshold - EPSILON {
         if is_choice {
@@ -886,6 +907,41 @@ mod tests {
         assert_eq!(esc.top_candidates.len(), 3);
         assert_eq!(esc.top_candidates[0].candidate, "opt_a");
         assert_eq!(esc.top_candidates[1].candidate, "opt_b");
+    }
+
+    #[test]
+    fn test_evaluate_answer_gating_margin_guard_with_derived_composite_confidence() {
+        // 高基数 (K=80) において、分布は上位に集中 (エントロピー確信度 1 - H_norm >= 0.70) しているが、
+        // Top-1 と Top-2 が僅差 (0.48 vs 0.44 -> margin 0.04 < 0.15) のリアルなケース。
+        // 本番パイプラインでは複合確信度 S_conf = (1 - H_norm) * 0.04 ≈ 0.028 となり、
+        // 旧仕様では low_threshold (0.35) 未満により Fallback へ誤判定されていた。
+        let mut probs = IndexMap::new();
+        probs.insert("opt_00".to_string(), 0.48);
+        probs.insert("opt_01".to_string(), 0.44);
+        let rem_prob = 0.08 / 78.0;
+        for i in 2..80 {
+            probs.insert(format!("opt_{:02}", i), rem_prob);
+        }
+
+        // 複合確信度 S_conf の算出
+        let s_conf = crate::math::composite_confidence_iter(probs.values()).unwrap();
+        assert!(
+            s_conf < 0.05,
+            "複合確信度はマージン 0.04 に制約されて 0.05 未満となる。"
+        );
+
+        let answer = Answer::choice("opt_00", probs, s_conf);
+        let config = GatingConfig::default();
+        let meta = evaluate_answer_gating(&answer, Some("q_high_k"), None, &config);
+
+        // マージンガードが先行発動し、Fallback ではなく ConfirmOrEscalate へ正しく降格・ルーティングされること
+        assert_eq!(meta.route, DecisionRoute::ConfirmOrEscalate);
+        assert!(meta.reason.contains("エントロピー確信度"));
+        assert!(meta.reason.contains("上位2候補の確率差"));
+        assert!(meta.escalation.is_some());
+        let esc = meta.escalation.unwrap();
+        assert_eq!(esc.top_candidates[0].candidate, "opt_00");
+        assert_eq!(esc.top_candidates[1].candidate, "opt_01");
     }
 
     #[test]

@@ -6,5 +6,5 @@
 pub mod calibration;
 pub mod model_spec;
 
-pub use calibration::{CalibrationConfig, TemperatureMap};
+pub use calibration::{BucketSpec, CalibrationConfig, TemperatureMap};
 pub use model_spec::*;

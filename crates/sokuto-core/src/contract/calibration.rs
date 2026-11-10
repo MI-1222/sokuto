@@ -31,6 +31,8 @@ pub enum BucketSpec {
 
 impl BucketSpec {
     /// 文字列スライスからバケット仕様をパースする。
+    ///
+    /// 範囲指定(`Range(start, end)`)の場合は `start <= end` であることを検証し、範囲逆転している場合は `None` を返却する。
     pub fn parse(expr: &str) -> Option<Self> {
         let trimmed = expr.trim();
         if trimmed.is_empty() || trimmed.starts_with('+') {
@@ -52,6 +54,7 @@ impl BucketSpec {
                 start_str.trim().parse::<usize>(),
                 end_str.trim().parse::<usize>(),
             )
+            && start <= end
         {
             return Some(Self::Range(start, end));
         }
@@ -447,6 +450,7 @@ mod tests {
         assert!(BucketSpec::parse("3-").is_none());
         assert!(BucketSpec::parse("+5").is_none());
         assert!(BucketSpec::parse("").is_none());
+        assert!(BucketSpec::parse("5-3").is_none());
     }
 
     #[test]
@@ -466,6 +470,7 @@ mod tests {
         assert_eq!(format!("{at_least}"), "10+");
 
         assert!(BucketSpec::from_str("invalid").is_err());
+        assert!(BucketSpec::from_str("5-3").is_err());
     }
 
     #[test]

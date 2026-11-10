@@ -14,7 +14,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
-use crate::math::{normalized_entropy_iter, top_margin_iter};
+use crate::math::{normalized_entropy, normalized_entropy_iter, top_margin_iter};
 use crate::schema::{Answer, AnswerPayload, Question, QuestionType};
 
 /// デフォルトの高確信度閾値 (自動実行境界)。
@@ -493,15 +493,10 @@ pub fn evaluate_answer_gating_opts(
             Some((1.0 - confidence).clamp(0.0, 1.0))
         }
         AnswerPayload::Noul { probability } => {
-            // Noul 型の場合、二値エントロピー指標 (底 2 のシャノンエントロピー) を記録する。
-            let p_true = *probability;
-            let p_false = (1.0 - p_true).clamp(0.0, 1.0);
-            if p_true > 0.0 && p_false > 0.0 {
-                let h = -(p_true * p_true.ln() + p_false * p_false.ln()) / std::f64::consts::LN_2;
-                Some(h.clamp(0.0, 1.0))
-            } else {
-                Some(0.0)
-            }
+            // Noul 型の場合、二値確率分布 [p, 1 - p] に対する正規化シャノンエントロピー指標を記録する。
+            let p_true = probability.clamp(0.0, 1.0);
+            let p_false = 1.0 - p_true;
+            normalized_entropy(&[p_true, p_false]).ok()
         }
     };
 
@@ -930,12 +925,27 @@ mod tests {
         let ans_high = Answer::noul(0.96);
         let meta_high = evaluate_answer_gating(&ans_high, Some("noul_q"), None, &config);
         assert_eq!(meta_high.route, DecisionRoute::AutoExecute);
+        assert!(meta_high.entropy.is_some());
+        let ent_high = meta_high.entropy.unwrap();
+        assert!(ent_high > 0.20 && ent_high < 0.30);
 
         // Low: P=0.52 -> C=|2*0.52 - 1| = 0.04 < 0.35
         let ans_low = Answer::noul(0.52);
         let meta_low = evaluate_answer_gating(&ans_low, Some("noul_q"), None, &config);
         assert_eq!(meta_low.route, DecisionRoute::Fallback);
         assert!(meta_low.escalation.is_some());
+        assert!(meta_low.entropy.is_some());
+        let ent_low = meta_low.entropy.unwrap();
+        assert!(ent_low > 0.99 && ent_low <= 1.0);
+
+        // Extreme: P=1.0 -> H=0.0, P=0.5 -> H=1.0
+        let ans_one = Answer::noul(1.0);
+        let meta_one = evaluate_answer_gating(&ans_one, Some("noul_q"), None, &config);
+        assert_eq!(meta_one.entropy, Some(0.0));
+
+        let ans_half = Answer::noul(0.5);
+        let meta_half = evaluate_answer_gating(&ans_half, Some("noul_q"), None, &config);
+        assert!((meta_half.entropy.unwrap() - 1.0).abs() < 1e-12);
     }
 
     #[test]

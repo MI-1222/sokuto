@@ -552,6 +552,15 @@ where
     Ok((count, mean, m2.max(0.0)))
 }
 
+/// Score 型の確率分布から、段階数 $M$、加重平均期待値 $E[S]$、事後分散 $\text{Var}[S]$ を単一パス走査で算出する。
+///
+/// # 備考
+/// - [`score_moments_iter`] を呼び出すゼロコストラッパーとして動作する。
+#[inline]
+pub fn score_moments(probabilities: &[f64]) -> Result<(usize, f64, f64)> {
+    score_moments_iter(probabilities)
+}
+
 /// 任意の確率値イテレータからスコアの事後分散 $\text{Var}[S]$ を単一パス走査で算出する。
 ///
 /// # 備考
@@ -577,6 +586,34 @@ pub fn score_variance(probabilities: &[f64]) -> Result<f64> {
     score_variance_iter(probabilities)
 }
 
+/// 段階数 $M$ と事後分散 $\text{Var}[S]$ から、最大可能分散で正規化した確信度 $C_{\text{var}} \in [0.0, 1.0]$ を算出する。
+///
+/// # 概要
+/// - $M$ 段階評価における理論上の最大分散 $V_{\max} = \frac{(M-1)^2}{4}$ (両極端に 0.5 ずつ配分された二峰性分布)を用いて事後分散を正規化する。
+/// - $M < 2$ の場合は分散による不確実性を定義できないため、確信度 1.0 を返却する。
+///
+/// # 数理仕様
+/// $$C_{\text{var}} = 1.0 - \frac{\text{Var}[S]}{V_{\max}} = 1.0 - \frac{4 \cdot \text{Var}[S]}{(M-1)^2}$$
+///
+/// # 引数
+/// - `m`: 評価段階数 $M$。
+/// - `var`: 算出済みの事後分散 $\text{Var}[S]$。
+///
+/// # 戻り値
+/// - `[0.0, 1.0]` の閉区間にクランプされた正規化分散確信度。
+#[inline]
+pub fn normalized_variance_confidence_from_variance(m: usize, var: f64) -> f64 {
+    if m < 2 {
+        return 1.0;
+    }
+    let max_var = ((m - 1) as f64).powi(2) / 4.0;
+    if max_var <= 0.0 {
+        return 1.0;
+    }
+    let confidence = 1.0 - (var / max_var);
+    confidence.clamp(0.0, 1.0)
+}
+
 /// 任意の確率値イテレータから、最大可能分散で正規化した確信度 $C_{\text{var}} \in [0.0, 1.0]$ を単一パス走査で算出する。
 ///
 /// # 備考
@@ -587,14 +624,7 @@ where
     I::Item: Borrow<f64>,
 {
     let (m, _, var) = score_moments_iter(iter)?;
-    let max_var = ((m - 1) as f64).powi(2) / 4.0;
-
-    if max_var <= 0.0 {
-        return Ok(1.0);
-    }
-
-    let confidence = 1.0 - (var / max_var);
-    Ok(confidence.clamp(0.0, 1.0))
+    Ok(normalized_variance_confidence_from_variance(m, var))
 }
 
 /// Score 型の確率分布から、最大可能分散で正規化した確信度 $C_{\text{var}} \in [0.0, 1.0]$ を算出する。
@@ -1194,9 +1224,16 @@ mod tests {
 
             // moments 単一パス集計版
             let (m, moments_mean, moments_var) = score_moments_iter(dist.iter()).unwrap();
+            let (m_slice, s_mean, s_var) = score_moments(&dist).unwrap();
             assert_eq!(m, dist.len());
+            assert_eq!(m_slice, m);
             assert!((moments_mean - slice_mean).abs() < 1e-12);
             assert!((moments_var - slice_var).abs() < 1e-12);
+            assert!((s_mean - slice_mean).abs() < 1e-12);
+            assert!((s_var - slice_var).abs() < 1e-12);
+
+            let conf_from_var = normalized_variance_confidence_from_variance(m, moments_var);
+            assert!((conf_from_var - slice_conf).abs() < 1e-12);
 
             // 各種 iter 版の一致検証
             let iter_mean = expected_score_iter(dist.iter()).unwrap();

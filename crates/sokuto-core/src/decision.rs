@@ -8,8 +8,8 @@ use indexmap::IndexMap;
 use crate::contract::CalibrationConfig;
 use crate::error::{CoreError, Result};
 use crate::math::{
-    argmax, composite_confidence, expected_score, normalized_variance_confidence, noul_probability,
-    softmax_into,
+    argmax, composite_confidence, normalized_variance_confidence_from_variance, noul_probability,
+    score_moments_iter, softmax_into,
 };
 use crate::schema::{Answer, Criteria, Question, QuestionType};
 
@@ -151,6 +151,7 @@ pub fn evaluate_choice(logits: &[f64], criteria: &Criteria, temperature: f64) ->
 /// - 確率マップのキーには、評価段階ラベルに重複がない場合はそのラベル名を用い、
 ///   重複または空文字が存在する場合はインデックス文字列 (`"0"`, `"1"`, ...) を用いる。
 ///   $M \le 10$ であるため、重複検査はヒープ確保を行わずにスタック上の二重走査で実施する。
+/// - 同一確率バッファに対する加重平均期待値と事後分散の算出は [`score_moments_iter`] による単一パス走査に集約し、二重走査を排除する。
 ///
 /// # 引数
 /// - `logits`: 未正規化の生ロジットスライス(`f64`)。
@@ -204,11 +205,11 @@ pub fn evaluate_score_with_buf(
     // ゼロアロケーション版ソフトマックス確率分布の算出。
     softmax_into(logits, probs_buf, temperature)?;
 
-    // 加重平均連続値スコアの算出。
-    let score_val = expected_score(probs_buf)?;
+    // 単一パス走査による加重平均期待値(スコア)および事後分散の算出。
+    let (m_observed, score_val, var) = score_moments_iter(probs_buf.iter())?;
 
     // 順序尺度分散確信度の算出。
-    let confidence = normalized_variance_confidence(probs_buf)?;
+    let confidence = normalized_variance_confidence_from_variance(m_observed, var);
 
     // 確率マップキーの一意性判定(M <= 10 のため HashSet を使わず二重走査でアロケーションゼロ判定)。
     let is_unique_and_non_empty = list

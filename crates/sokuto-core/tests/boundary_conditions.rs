@@ -274,21 +274,21 @@ mod structural_bounds {
         let mut long_buf = vec![0.0; 3];
 
         assert!(matches!(
-            evaluate_choice_with_buf(&logits, &criteria_choice, 1.0, &mut short_buf),
+            evaluate_choice_with_buf(&logits, &criteria_choice, 1.0, &mut short_buf, None),
             Err(CoreError::MathError { .. })
         ));
         assert!(matches!(
-            evaluate_choice_with_buf(&logits, &criteria_choice, 1.0, &mut long_buf),
+            evaluate_choice_with_buf(&logits, &criteria_choice, 1.0, &mut long_buf, None),
             Err(CoreError::MathError { .. })
         ));
 
         let criteria_score = Criteria::List(vec!["A".to_string(), "B".to_string()]);
         assert!(matches!(
-            evaluate_score_with_buf(&logits, &criteria_score, 1.0, &mut short_buf),
+            evaluate_score_with_buf(&logits, &criteria_score, 1.0, &mut short_buf, None),
             Err(CoreError::MathError { .. })
         ));
         assert!(matches!(
-            evaluate_score_with_buf(&logits, &criteria_score, 1.0, &mut long_buf),
+            evaluate_score_with_buf(&logits, &criteria_score, 1.0, &mut long_buf, None),
             Err(CoreError::MathError { .. })
         ));
     }

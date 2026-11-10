@@ -168,6 +168,13 @@ impl CoreError {
             | Self::MissingCriteria { question_id, .. } => {
                 *question_id = qid_str;
             }
+            Self::MathError { message } => {
+                let id = qid_str.as_ref().unwrap();
+                let prefix = format!("質問 '{id}': ");
+                if !message.starts_with(&prefix) {
+                    *message = format!("{prefix}{message}");
+                }
+            }
             _ => {}
         }
         self

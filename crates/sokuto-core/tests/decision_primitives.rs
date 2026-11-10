@@ -207,15 +207,22 @@ fn test_zero_allocation_buffers() {
     criteria_map.insert("a".to_string(), "A".to_string());
     criteria_map.insert("b".to_string(), "B".to_string());
     let mut buf = [0.0; 2];
-    let ans_choice =
-        evaluate_choice_with_buf(&[2.0, 1.0], &Criteria::Map(criteria_map), 1.0, &mut buf).unwrap();
+    let ans_choice = evaluate_choice_with_buf(
+        &[2.0, 1.0],
+        &Criteria::Map(criteria_map),
+        1.0,
+        &mut buf,
+        None,
+    )
+    .unwrap();
     assert_eq!(ans_choice.as_choice(), Some("a"));
 
     // 2. Score with buf
     let criteria_list = Criteria::List(vec!["0".to_string(), "1".to_string(), "2".to_string()]);
     let mut buf_score = [0.0; 3];
     let ans_score =
-        evaluate_score_with_buf(&[0.0, 1.0, 3.0], &criteria_list, 1.0, &mut buf_score).unwrap();
+        evaluate_score_with_buf(&[0.0, 1.0, 3.0], &criteria_list, 1.0, &mut buf_score, None)
+            .unwrap();
     assert!(ans_score.as_score().unwrap() > 1.0);
 }
 

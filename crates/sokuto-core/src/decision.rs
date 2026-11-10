@@ -29,6 +29,7 @@ use crate::schema::{Answer, Criteria, Question, QuestionType};
 /// - `criteria`: 候補識別子と説明文のマップを保持する評価基準。
 /// - `temperature`: 適用する較正温度パラメータ $\tau$。
 /// - `probs_buf`: 確率分布書き込み用の作業バッファスライス(`logits` と同長が必要)。
+/// - `question_id`: 質問識別子 (任意)。エラー発生時に診断メッセージへ反映される。
 ///
 /// # 戻り値
 /// - 成功時は Choice 判定が格納された `Answer`、入力不正時は `CoreError`。
@@ -37,30 +38,37 @@ pub fn evaluate_choice_with_buf(
     criteria: &Criteria,
     temperature: f64,
     probs_buf: &mut [f64],
+    question_id: Option<&str>,
 ) -> Result<Answer> {
-    let map = criteria.as_map_or_err(QuestionType::Choice, None)?;
+    let map = criteria.as_map_or_err(QuestionType::Choice, question_id)?;
 
     let k = map.len();
     if k == 0 || k > 255 {
         return Err(CoreError::InvalidChoiceCount {
-            question_id: None,
+            question_id: question_id.map(str::to_string),
             count: k,
         });
     }
 
     if logits.len() != k {
+        let prefix = question_id
+            .map(|qid| format!("質問 '{qid}': "))
+            .unwrap_or_default();
         return Err(CoreError::MathError {
             message: format!(
-                "ロジットの要素数({logits_len})が候補数({k})と一致しません。",
+                "{prefix}ロジットの要素数({logits_len})が候補数({k})と一致しません。",
                 logits_len = logits.len()
             ),
         });
     }
 
     if probs_buf.len() != logits.len() {
+        let prefix = question_id
+            .map(|qid| format!("質問 '{qid}': "))
+            .unwrap_or_default();
         return Err(CoreError::MathError {
             message: format!(
-                "出力バッファ長({out_len})がロジット長({logits_len})と一致しません。",
+                "{prefix}出力バッファ長({out_len})がロジット長({logits_len})と一致しません。",
                 out_len = probs_buf.len(),
                 logits_len = logits.len()
             ),
@@ -121,7 +129,7 @@ pub fn evaluate_choice_with_buf(
 /// - 内部で必要なバッファを確保した上で [`evaluate_choice_with_buf`] を呼び出す。
 pub fn evaluate_choice(logits: &[f64], criteria: &Criteria, temperature: f64) -> Result<Answer> {
     let mut probs_buf = vec![0.0; logits.len()];
-    evaluate_choice_with_buf(logits, criteria, temperature, &mut probs_buf)
+    evaluate_choice_with_buf(logits, criteria, temperature, &mut probs_buf, None)
 }
 
 /// 作業用バッファを活用し、Score プリミティブの生ロジットから加重平均スコア実数値、確率分布、および分散確信度を算出する。
@@ -142,6 +150,7 @@ pub fn evaluate_choice(logits: &[f64], criteria: &Criteria, temperature: f64) ->
 /// - `criteria`: 順序付けられた評価段階基準の配列。
 /// - `temperature`: 適用する較正温度パラメータ $\tau$。
 /// - `probs_buf`: 確率分布書き込み用の作業バッファスライス(`logits` と同長が必要)。
+/// - `question_id`: 質問識別子 (任意)。エラー発生時に診断メッセージへ反映される。
 ///
 /// # 戻り値
 /// - 成功時は Score 判定が格納された `Answer`、入力不正時は `CoreError`。
@@ -150,21 +159,38 @@ pub fn evaluate_score_with_buf(
     criteria: &Criteria,
     temperature: f64,
     probs_buf: &mut [f64],
+    question_id: Option<&str>,
 ) -> Result<Answer> {
-    let list = criteria.as_list_or_err(QuestionType::Score, None)?;
+    let list = criteria.as_list_or_err(QuestionType::Score, question_id)?;
 
     let m = list.len();
     if !(2..=10).contains(&m) {
         return Err(CoreError::InvalidScoreLevelCount {
-            question_id: None,
+            question_id: question_id.map(str::to_string),
             count: m,
         });
     }
 
     if logits.len() != m {
+        let prefix = question_id
+            .map(|qid| format!("質問 '{qid}': "))
+            .unwrap_or_default();
         return Err(CoreError::MathError {
             message: format!(
-                "ロジットの要素数({logits_len})が段階数({m})と一致しません。",
+                "{prefix}ロジットの要素数({logits_len})が段階数({m})と一致しません。",
+                logits_len = logits.len()
+            ),
+        });
+    }
+
+    if probs_buf.len() != logits.len() {
+        let prefix = question_id
+            .map(|qid| format!("質問 '{qid}': "))
+            .unwrap_or_default();
+        return Err(CoreError::MathError {
+            message: format!(
+                "{prefix}出力バッファ長({out_len})がロジット長({logits_len})と一致しません。",
+                out_len = probs_buf.len(),
                 logits_len = logits.len()
             ),
         });
@@ -204,7 +230,7 @@ pub fn evaluate_score_with_buf(
 /// - 内部で必要なバッファを確保した上で [`evaluate_score_with_buf`] を呼び出す。
 pub fn evaluate_score(logits: &[f64], criteria: &Criteria, temperature: f64) -> Result<Answer> {
     let mut probs_buf = vec![0.0; logits.len()];
-    evaluate_score_with_buf(logits, criteria, temperature, &mut probs_buf)
+    evaluate_score_with_buf(logits, criteria, temperature, &mut probs_buf, None)
 }
 
 /// Noul プリミティブの生ロジットから真偽確率判定結果を算出する。
@@ -253,7 +279,7 @@ pub fn evaluate_question_with_buf(
     // 質問定義のスキーマ検証を実施する。
     question.validate(question_id)?;
 
-    match question.question_type {
+    let res = match question.question_type {
         QuestionType::Choice => {
             let criteria =
                 question
@@ -265,7 +291,7 @@ pub fn evaluate_question_with_buf(
                     })?;
             let k = criteria.len();
             let temperature = config.get_temperature(QuestionType::Choice, k);
-            evaluate_choice_with_buf(logits, criteria, temperature, probs_buf)
+            evaluate_choice_with_buf(logits, criteria, temperature, probs_buf, question_id)
         }
         QuestionType::Score => {
             let criteria =
@@ -278,13 +304,21 @@ pub fn evaluate_question_with_buf(
                     })?;
             let m = criteria.len();
             let temperature = config.get_temperature(QuestionType::Score, m);
-            evaluate_score_with_buf(logits, criteria, temperature, probs_buf)
+            evaluate_score_with_buf(logits, criteria, temperature, probs_buf, question_id)
         }
         QuestionType::Noul => {
             let temperature = config.get_temperature(QuestionType::Noul, 2);
             evaluate_noul(logits, temperature)
         }
-    }
+    };
+
+    res.map_err(|err| {
+        if let Some(qid) = question_id {
+            err.with_question_id(qid)
+        } else {
+            err
+        }
+    })
 }
 
 /// 単一の質問定義、生ロジット、および較正設定から型安全に判定結果 (`Answer`) を導出する。
@@ -368,21 +402,22 @@ mod tests {
 
         // K=1 特異点において作業バッファ probs_buf が 1.0 に更新されることを検証する。
         let mut probs_buf = vec![0.0];
-        let answer_buf = evaluate_choice_with_buf(&logits, &criteria, 1.0, &mut probs_buf).unwrap();
+        let answer_buf =
+            evaluate_choice_with_buf(&logits, &criteria, 1.0, &mut probs_buf, None).unwrap();
         assert_eq!(answer_buf.as_choice(), Some("only_one"));
         assert_eq!(probs_buf[0], 1.0);
 
         // バッファ長不一致の検証。
         let mut empty_buf = vec![];
-        assert!(evaluate_choice_with_buf(&logits, &criteria, 1.0, &mut empty_buf).is_err());
+        assert!(evaluate_choice_with_buf(&logits, &criteria, 1.0, &mut empty_buf, None).is_err());
         let mut long_buf = vec![0.0, 0.0];
-        assert!(evaluate_choice_with_buf(&logits, &criteria, 1.0, &mut long_buf).is_err());
+        assert!(evaluate_choice_with_buf(&logits, &criteria, 1.0, &mut long_buf, None).is_err());
 
         // 温度異常の検証。
         let mut buf = vec![0.0];
-        assert!(evaluate_choice_with_buf(&logits, &criteria, 0.0, &mut buf).is_err());
-        assert!(evaluate_choice_with_buf(&logits, &criteria, -1.0, &mut buf).is_err());
-        assert!(evaluate_choice_with_buf(&logits, &criteria, f64::NAN, &mut buf).is_err());
+        assert!(evaluate_choice_with_buf(&logits, &criteria, 0.0, &mut buf, None).is_err());
+        assert!(evaluate_choice_with_buf(&logits, &criteria, -1.0, &mut buf, None).is_err());
+        assert!(evaluate_choice_with_buf(&logits, &criteria, f64::NAN, &mut buf, None).is_err());
     }
 
     #[test]
@@ -587,5 +622,47 @@ mod tests {
             evaluate_question_with_buf(&invalid_q, &[1.0], &config, &mut buf, Some("urgency"))
                 .unwrap_err();
         assert!(err_buf.to_string().contains("質問 'urgency': "));
+
+        // 4. ロジット数不一致時の MathError にも question_id が伝播すること
+        let mut valid_c_map = IndexMap::new();
+        valid_c_map.insert("a".to_string(), "A".to_string());
+        valid_c_map.insert("b".to_string(), "B".to_string());
+        let valid_q = Question::new_choice("選択せよ。", valid_c_map);
+        let mut mismatch_buf = [0.0; 3];
+        let err_logits_mismatch = evaluate_question_with_buf(
+            &valid_q,
+            &[1.0, 2.0, 3.0],
+            &config,
+            &mut mismatch_buf,
+            Some("category"),
+        )
+        .unwrap_err();
+        assert!(
+            err_logits_mismatch
+                .to_string()
+                .contains("質問 'category': ")
+        );
+        assert!(
+            err_logits_mismatch
+                .to_string()
+                .contains("ロジットの要素数(3)が候補数(2)と一致しません")
+        );
+
+        // 5. Score 型の段階数不一致時にも question_id が伝播すること
+        let invalid_score_q = Question::new_score("評価せよ。", vec!["単一".to_string()]);
+        let mut score_buf = [0.0; 1];
+        let err_score = evaluate_question_with_buf(
+            &invalid_score_q,
+            &[1.0],
+            &config,
+            &mut score_buf,
+            Some("rating"),
+        )
+        .unwrap_err();
+        assert!(err_score.to_string().contains("質問 'rating': "));
+        assert!(matches!(
+            err_score,
+            CoreError::InvalidScoreLevelCount { .. }
+        ));
     }
 }

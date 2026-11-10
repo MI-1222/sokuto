@@ -347,7 +347,6 @@ impl DecisionRequest for SystemOneRequest {
 /// Jev の3大プリミティブ(Choice / Score / Noul)に対応する排他的な直和型である。
 /// 不正な状態(排他フィールドの競合や必須データの欠落)を型レベルで排除する。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum AnswerPayload {
     /// Choice 型: 採択候補ラベル、確率分布マップ、および正規化確信度。
     Choice {
@@ -462,13 +461,69 @@ impl AnswerPayload {
 /// Jev 公式互換のフラット JSON 表現(`choice`, `score`, `noul`, `probabilities`, `confidence`, `gating`)と
 /// 型安全な直和型表現(`AnswerPayload`)を透過的に相互変換する。
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Answer {
     /// 判定ペイロード(Choice / Score / Noul の直和型)。
     pub payload: AnswerPayload,
 
     /// 確信度ゲーティングによるルーティングおよび監査メタデータ(任意)。
     pub gating: Option<GatingMetadata>,
+}
+
+/// OpenAPI 仕様書向け `Answer` フラットスキーマ定義ヘルパー。
+///
+/// Jev 公式互換のフラット JSON レスポンス表現(`choice`, `score`, `noul`, `probabilities`, `confidence`, `gating`)を
+/// OpenAPI ドキュメントへ正確に反映するための内部スキーマ構造体である。
+#[cfg(feature = "openapi")]
+#[derive(utoipa::ToSchema)]
+#[schema(as = Answer)]
+#[allow(dead_code)]
+struct AnswerFlatSchema {
+    /// Choice 型: 採択候補ラベル。
+    #[schema(example = "candidate_a")]
+    choice: Option<String>,
+
+    /// Score 型: 加重平均スコア値。
+    #[schema(example = 4.2)]
+    score: Option<f64>,
+
+    /// Noul 型: 言明真実確率値(0.0 <= P <= 1.0)。
+    #[schema(example = 0.95)]
+    noul: Option<f64>,
+
+    /// Choice / Score 型: 候補または各評価段階の確率分布マップ。
+    probabilities: Option<IndexMap<String, f64>>,
+
+    /// Choice / Score 型: 分布の尖り度に基づく正規化確信度(0.0 <= C <= 1.0)。
+    #[schema(example = 0.88)]
+    confidence: Option<f64>,
+
+    /// 確信度ゲーティングによるルーティングおよび監査メタデータ(任意)。
+    gating: Option<GatingMetadata>,
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::__dev::ComposeSchema for Answer {
+    fn compose(
+        generics: Vec<utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>>,
+    ) -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        AnswerFlatSchema::compose(generics)
+    }
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::ToSchema for Answer {
+    fn name() -> std::borrow::Cow<'static, str> {
+        AnswerFlatSchema::name()
+    }
+
+    fn schemas(
+        schemas: &mut Vec<(
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+        )>,
+    ) {
+        AnswerFlatSchema::schemas(schemas);
+    }
 }
 
 impl Serialize for Answer {

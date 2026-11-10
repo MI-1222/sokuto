@@ -204,6 +204,75 @@ fn test_systemone_response_schema_parity() {
 }
 
 #[test]
+fn test_answer_flat_schema_parity() {
+    let spec = generate_openapi_spec();
+    let spec_json = serde_json::to_value(&spec).expect("JSON シリアライズに成功すること。");
+
+    let schemas = &spec_json["components"]["schemas"];
+    let answer_schema = &schemas["Answer"];
+    assert!(
+        answer_schema.is_object(),
+        "Answer スキーマがオブジェクト定義として存在すること。"
+    );
+
+    let properties = &answer_schema["properties"];
+
+    // 内部直和型フィールド payload が露出していないことの検証
+    assert!(
+        properties.get("payload").is_none(),
+        "Answer スキーマに内部フィールド 'payload' が露出してはいけません。"
+    );
+    assert!(
+        !schemas.as_object().unwrap().contains_key("AnswerPayload"),
+        "内部実装 enum 'AnswerPayload' は OpenAPI コンポーネントに露出してはいけません。"
+    );
+
+    // フラット化された公開フィールド群の存在検証
+    let expected_fields = [
+        "choice",
+        "score",
+        "noul",
+        "probabilities",
+        "confidence",
+        "gating",
+    ];
+    for field in expected_fields {
+        assert!(
+            properties.get(field).is_some(),
+            "Answer スキーマにフラットフィールド '{field}' が定義されていること。"
+        );
+    }
+
+    // 実際のシリアライズ結果との整合性検証 (Choice, Score, Noul)
+    let choice_ans = Answer::choice("cand_1", IndexMap::new(), 0.9);
+    let choice_val = serde_json::to_value(&choice_ans).unwrap();
+    for key in choice_val.as_object().unwrap().keys() {
+        assert!(
+            properties.get(key).is_some(),
+            "Choice JSON のキー '{key}' が OpenAPI スキーマプロパティに含まれていること。"
+        );
+    }
+
+    let score_ans = Answer::score(3.5, IndexMap::new(), 0.85);
+    let score_val = serde_json::to_value(&score_ans).unwrap();
+    for key in score_val.as_object().unwrap().keys() {
+        assert!(
+            properties.get(key).is_some(),
+            "Score JSON のキー '{key}' が OpenAPI スキーマプロパティに含まれていること。"
+        );
+    }
+
+    let noul_ans = Answer::noul(0.75);
+    let noul_val = serde_json::to_value(&noul_ans).unwrap();
+    for key in noul_val.as_object().unwrap().keys() {
+        assert!(
+            properties.get(key).is_some(),
+            "Noul JSON のキー '{key}' が OpenAPI スキーマプロパティに含まれていること。"
+        );
+    }
+}
+
+#[test]
 fn test_criteria_untagged_schema_compatibility() {
     let spec = generate_openapi_spec();
     let spec_json = serde_json::to_value(&spec).expect("JSON シリアライズに成功すること。");

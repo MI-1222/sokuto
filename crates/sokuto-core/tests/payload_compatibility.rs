@@ -332,13 +332,6 @@ fn test_answer_payload_type_safety_and_roundtrip() {
     assert_eq!(ans_choice.effective_confidence(), Some(0.85));
     assert_eq!(ans_choice.question_type(), QuestionType::Choice);
 
-    // 非推奨アクセサの動作検証
-    #[allow(deprecated)]
-    {
-        assert_eq!(ans_choice.payload.selected(), Some("opt_a"));
-        assert_eq!(ans_choice.payload.choice(), Some("opt_a"));
-    }
-
     // シリアライズ検証: choice, probabilities, confidence のみが出力され、score, noul は出力されないこと。
     let choice_val = serde_json::to_value(&ans_choice).unwrap();
     assert_eq!(choice_val["choice"], "opt_a");
@@ -376,14 +369,6 @@ fn test_answer_payload_type_safety_and_roundtrip() {
     assert_eq!(ans_score.effective_confidence(), Some(0.75));
     assert_eq!(ans_score.question_type(), QuestionType::Score);
 
-    // 非推奨アクセサの動作検証
-    #[allow(deprecated)]
-    {
-        assert_eq!(ans_score.payload.score(), Some(1.8));
-        assert_eq!(ans_score.payload.score_value(), Some(1.8));
-        assert_eq!(ans_score.payload.selected(), None);
-    }
-
     let score_val = serde_json::to_value(&ans_score).unwrap();
     assert_eq!(score_val["score"], 1.8);
     assert!(score_val.get("choice").is_none());
@@ -400,13 +385,6 @@ fn test_answer_payload_type_safety_and_roundtrip() {
     assert_eq!(ans_noul.as_score(), None);
     assert_eq!(ans_noul.confidence(), None);
 
-    // 非推奨アクセサの動作検証
-    #[allow(deprecated)]
-    {
-        assert_eq!(ans_noul.payload.noul(), Some(0.92));
-        assert_eq!(ans_noul.payload.noul_probability(), Some(0.92));
-        assert_eq!(ans_noul.payload.selected(), None);
-    }
     // Noul の実効確信度: |2 * 0.92 - 1.0| = 0.84
     assert!((ans_noul.effective_confidence().unwrap() - 0.84).abs() < 1e-6);
     assert_eq!(ans_noul.question_type(), QuestionType::Noul);

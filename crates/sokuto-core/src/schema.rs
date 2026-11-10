@@ -418,18 +418,6 @@ impl AnswerPayload {
         }
     }
 
-    /// Choice の採択候補ラベルを取得する (`as_choice` の別名・非推奨)。
-    #[deprecated(since = "0.4.0", note = "代わりに `as_choice` を使用してください。")]
-    pub fn choice(&self) -> Option<&str> {
-        self.as_choice()
-    }
-
-    /// Choice の採択候補ラベルを取得する (`as_choice` の別名・非推奨)。
-    #[deprecated(since = "0.4.0", note = "代わりに `as_choice` を使用してください。")]
-    pub fn selected(&self) -> Option<&str> {
-        self.as_choice()
-    }
-
     /// Score の加重平均値を取得する。
     pub fn as_score(&self) -> Option<f64> {
         match self {
@@ -438,36 +426,12 @@ impl AnswerPayload {
         }
     }
 
-    /// Score の加重平均値を取得する (`as_score` の別名・非推奨)。
-    #[deprecated(since = "0.4.0", note = "代わりに `as_score` を使用してください。")]
-    pub fn score(&self) -> Option<f64> {
-        self.as_score()
-    }
-
-    /// Score の加重平均スコア値を取得する (`as_score` の別名・非推奨)。
-    #[deprecated(since = "0.4.0", note = "代わりに `as_score` を使用してください。")]
-    pub fn score_value(&self) -> Option<f64> {
-        self.as_score()
-    }
-
     /// Noul の真実確率値を取得する。
     pub fn as_noul(&self) -> Option<f64> {
         match self {
             Self::Noul { probability } => Some(*probability),
             _ => None,
         }
-    }
-
-    /// Noul の真実確率値を取得する (`as_noul` の別名・非推奨)。
-    #[deprecated(since = "0.4.0", note = "代わりに `as_noul` を使用してください。")]
-    pub fn noul(&self) -> Option<f64> {
-        self.as_noul()
-    }
-
-    /// Noul の真実確率値を取得する (`as_noul` の別名・非推奨)。
-    #[deprecated(since = "0.4.0", note = "代わりに `as_noul` を使用してください。")]
-    pub fn noul_probability(&self) -> Option<f64> {
-        self.as_noul()
     }
 
     /// Choice 判定であるかどうか。

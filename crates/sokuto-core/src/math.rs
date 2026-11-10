@@ -476,6 +476,7 @@ pub fn expected_score(probabilities: &[f64]) -> Result<f64> {
 /// - $O(M)$ 単一パス走査により、二重走査や中間 `Vec` 確保(ヒープアロケーション)を完全に排除する。
 /// - $M < 2$ の場合は段階数不足エラーとして `CoreError::MathError` を返却する。
 /// - 非有限値(NaNまたは無限大)や負の確率値が含まれる場合は `CoreError::MathError` を返却する。
+/// - 確率総和の丸め誤差や非正規化重みに対応するため、加重二乗和 $M_2$ を重みの総和で正規化して加重分散を算出する。
 ///
 /// # 引数
 /// - `iter`: 各段階レベルの確率値(`f64` または `&f64`)を提供するイテレータ。
@@ -521,7 +522,13 @@ where
         });
     }
 
-    Ok((count, mean, m2.max(0.0)))
+    let var = if weight_sum > 0.0 {
+        (m2 / weight_sum).max(0.0)
+    } else {
+        0.0
+    };
+
+    Ok((count, mean, var))
 }
 
 /// Score 型の確率分布から、段階数 $M$、加重平均期待値 $E[S]$、事後分散 $\text{Var}[S]$ を単一パス走査で算出する。
@@ -1347,6 +1354,21 @@ mod tests {
             assert!((iter_conf - slice_conf).abs() < 1e-12);
             assert!((iter_ratio - slice_ratio).abs() < 1e-12);
         }
+
+        // 非正規化重み配列に対する加重分散の正規化検証
+        // 重みの総和が 1.0 でない場合でも、分散が真の加重分散として正規化されることを検証する。
+        let unnormalized_scaled_2x = vec![1.0, 0.0, 0.0, 1.0]; // 総和 2.0 (両端 0 と 3 に均等配分)
+        let unnormalized_scaled_half = vec![0.25, 0.0, 0.0, 0.25]; // 総和 0.5 (両端 0 と 3 に均等配分)
+        let normalized = vec![0.5, 0.0, 0.0, 0.5]; // 総和 1.0
+        let (_, mean_norm, var_norm) = score_moments_iter(&normalized).unwrap();
+        let (_, mean_2x, var_2x) = score_moments_iter(&unnormalized_scaled_2x).unwrap();
+        let (_, mean_half, var_half) = score_moments_iter(&unnormalized_scaled_half).unwrap();
+
+        assert!((mean_2x - mean_norm).abs() < 1e-12);
+        assert!((mean_half - mean_norm).abs() < 1e-12);
+        assert!((var_2x - var_norm).abs() < 1e-12);
+        assert!((var_half - var_norm).abs() < 1e-12);
+        assert!((var_norm - 2.25).abs() < 1e-12);
 
         // 異常系: 段階数不足
         let empty: [f64; 0] = [];

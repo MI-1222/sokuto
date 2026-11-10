@@ -678,7 +678,8 @@ pub fn score_variance_ratio(probabilities: &[f64]) -> Result<f64> {
 /// # 数理仕様
 /// $$BC = \frac{\gamma^2 + 1}{\kappa}$$
 /// ここで、歪度 $\gamma = \frac{\mu_3}{\sigma^3}$、尖度 $\kappa = \frac{\mu_4}{\sigma^4}$、
-/// $\mu_r = \sum_{k=0}^{M-1} (k - \mu)^r p_k$ である。
+/// $\mu_r = \frac{1}{W} \sum_{k=0}^{M-1} (k - \mu)^r p_k$ ($W = \sum p_k$) である。
+/// 確率総和の丸め誤差や非正規化重みに対応するため、各中心モーメントを $W$ で正規化して歪度・尖度を算出する。
 ///
 /// # 引数
 /// - `iter`: 各段階レベルの確率値(`f64` または `&f64`)を提供するイテレータ ($M \ge 2$)。
@@ -759,6 +760,12 @@ where
         mu4 += diff2 * diff2 * p;
     }
 
+    if sum_prob > 0.0 {
+        variance /= sum_prob;
+        mu3 /= sum_prob;
+        mu4 /= sum_prob;
+    }
+
     // 極小分散 (ワンホット等) のショートサーキット判定
     if variance < 1e-6 {
         return Ok(0.0);
@@ -796,7 +803,8 @@ where
 /// # 数理仕様
 /// $$BC = \frac{\gamma^2 + 1}{\kappa}$$
 /// ここで、歪度 $\gamma = \frac{\mu_3}{\sigma^3}$、尖度 $\kappa = \frac{\mu_4}{\sigma^4}$、
-/// $\mu_r = \sum_{k=0}^{M-1} (k - \mu)^r p_k$ である。
+/// $\mu_r = \frac{1}{W} \sum_{k=0}^{M-1} (k - \mu)^r p_k$ ($W = \sum p_k$) である。
+/// 確率総和の丸め誤差や非正規化重みに対応するため、各中心モーメントを $W$ で正規化して歪度・尖度を算出する。
 ///
 /// # 引数
 /// - `probabilities`: 各段階レベルの確率分布スライス ($M \ge 2$)。
@@ -1729,7 +1737,18 @@ mod tests {
         let var_ratio = score_variance_ratio(&p_adjacent).unwrap();
         assert!(var_ratio < 0.20);
 
-        // 7. 異常系
+        // 7. 非正規化重み配列に対する双峰性係数のスケール不変性検証
+        // 確率の総和が 1.0 でない場合でも、高次中心モーメントの正規化により BC が厳密に一致することを検証する。
+        let p_asymmetric = vec![0.1, 0.2, 0.4, 0.3];
+        let p_scaled_2x = vec![0.2, 0.4, 0.8, 0.6];
+        let p_scaled_half = vec![0.05, 0.1, 0.2, 0.15];
+        let bc_norm = bimodality_coefficient(&p_asymmetric).unwrap();
+        let bc_2x = bimodality_coefficient(&p_scaled_2x).unwrap();
+        let bc_half = bimodality_coefficient(&p_scaled_half).unwrap();
+        assert!((bc_2x - bc_norm).abs() < 1e-12);
+        assert!((bc_half - bc_norm).abs() < 1e-12);
+
+        // 8. 異常系
         assert!(bimodality_coefficient(&[]).is_err());
         assert!(bimodality_coefficient(&[1.0]).is_err());
         assert!(bimodality_coefficient(&[-0.1, 1.1]).is_err());

@@ -687,7 +687,7 @@ pub fn evaluate_answer_gating_opts(
 /// 確率マップから確率降順で上位 3 件の候補を抽出する。
 ///
 /// 全件の文字列クローンやヒープ確保・全ソートを行わず、
-/// 要素数 3 の固定長スタック配列と `std::mem::swap` を用いて単一パスで上位候補を収集する。
+/// 要素数 3 の固定長スタック配列とインサーションシフトを用いて単一パスで上位候補を収集する。
 ///
 /// # 引数
 /// - `probabilities`: 候補ラベルと較正済み確率値の対応マップ。
@@ -705,18 +705,18 @@ fn extract_top3_candidates(probabilities: &IndexMap<String, f64>) -> Vec<Candida
             continue;
         }
 
-        let mut item = Some((k.as_str(), p));
-        for slot in top.iter_mut() {
-            match slot {
-                Some((_, slot_p)) => {
-                    if p.total_cmp(slot_p) == std::cmp::Ordering::Greater {
-                        std::mem::swap(slot, &mut item);
-                    }
+        // 挿入位置を特定し、後続スロットを右シフトして格納する。
+        for i in 0..3 {
+            let should_insert = match top[i] {
+                Some((_, slot_p)) => p.total_cmp(&slot_p) == std::cmp::Ordering::Greater,
+                None => true,
+            };
+            if should_insert {
+                for j in (i + 1..3).rev() {
+                    top[j] = top[j - 1];
                 }
-                None => {
-                    *slot = item;
-                    break;
-                }
+                top[i] = Some((k.as_str(), p));
+                break;
             }
         }
     }
@@ -1197,5 +1197,32 @@ mod tests {
         assert_eq!(res_large[0].candidate, "opt_254");
         assert_eq!(res_large[1].candidate, "opt_253");
         assert_eq!(res_large[2].candidate, "opt_252");
+
+        // 6. 同率タイ (Tie) を含むケースで先着順が維持され、正しく降順に整列する検証
+        let mut tie_probs = IndexMap::new();
+        tie_probs.insert("tie_a".to_string(), 0.40);
+        tie_probs.insert("tie_b".to_string(), 0.40);
+        tie_probs.insert("high".to_string(), 0.60);
+        tie_probs.insert("tie_c".to_string(), 0.40);
+        let res_tie = extract_top3_candidates(&tie_probs);
+        assert_eq!(res_tie.len(), 3);
+        assert_eq!(res_tie[0].candidate, "high");
+        assert!((res_tie[0].probability - 0.60).abs() < EPSILON);
+        assert_eq!(res_tie[1].candidate, "tie_a");
+        assert!((res_tie[1].probability - 0.40).abs() < EPSILON);
+        assert_eq!(res_tie[2].candidate, "tie_b");
+        assert!((res_tie[2].probability - 0.40).abs() < EPSILON);
+
+        // 7. 逆順 (昇順) 入力におけるスワップ・右シフト連鎖の整合性検証
+        let mut asc_probs = IndexMap::new();
+        asc_probs.insert("p1".to_string(), 0.10);
+        asc_probs.insert("p2".to_string(), 0.20);
+        asc_probs.insert("p3".to_string(), 0.30);
+        asc_probs.insert("p4".to_string(), 0.40);
+        let res_asc = extract_top3_candidates(&asc_probs);
+        assert_eq!(res_asc.len(), 3);
+        assert_eq!(res_asc[0].candidate, "p4");
+        assert_eq!(res_asc[1].candidate, "p3");
+        assert_eq!(res_asc[2].candidate, "p2");
     }
 }

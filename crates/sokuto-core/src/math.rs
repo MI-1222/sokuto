@@ -440,12 +440,9 @@ pub fn argmax(values: &[f64]) -> Result<usize> {
 
 /// 任意の確率値イテレータから加重平均スコア実数値 $\text{Score} \in [0.0, M-1.0]$ を単一パス走査で算出する。
 ///
-/// # 数理仕様
-/// 各段階レベル $k \in \{0, \dots, M-1\}$ に対して $\text{Score} = \sum k \cdot p_k$ を計算する。
-///
-/// - $O(M)$ 単一パス走査により、ゼロアロケーションで計算する。
-/// - $M < 2$ の場合は段階数不足エラーとして `CoreError::MathError` を返却する。
-/// - 非有限値(NaNまたは無限大)や負の確率値が含まれる場合は `CoreError::MathError` を返却する。
+/// # 概要
+/// - 各段階レベル $k \in \{0, \dots, M-1\}$ に対する加重平均期待値 $\hat{s} = E[S]$ を計算する。
+/// - [`score_moments_iter`] を呼び出し、単一パス走査で算出された期待値を抽出して返却する。
 ///
 /// # 引数
 /// - `iter`: 各段階レベルの確率値(`f64` または `&f64`)を提供するイテレータ。
@@ -457,32 +454,7 @@ where
     I: IntoIterator,
     I::Item: Borrow<f64>,
 {
-    let mut count: usize = 0;
-    let mut score = 0.0;
-
-    for (k, item) in iter.into_iter().enumerate() {
-        let p = *item.borrow();
-        if !p.is_finite() {
-            return Err(CoreError::MathError {
-                message: "確率値に非有限値(NaNまたは無限大)が含まれています。".to_string(),
-            });
-        }
-        if p < 0.0 {
-            return Err(CoreError::MathError {
-                message: format!("負の確率値が含まれています: {p}。"),
-            });
-        }
-        count += 1;
-        score += (k as f64) * p;
-    }
-
-    if count < 2 {
-        return Err(CoreError::MathError {
-            message: "Score の確率分布は 2 段階以上必要です。".to_string(),
-        });
-    }
-
-    Ok(score)
+    score_moments_iter(iter).map(|(_, mean, _)| mean)
 }
 
 /// Score 型の確率分布から加重平均スコア実数値を算出する。

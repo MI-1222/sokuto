@@ -61,11 +61,69 @@ impl Criteria {
         }
     }
 
+    /// Map 形式の参照を取得する。不一致時は質問種別に応じたエラーを返却する。
+    ///
+    /// # 引数
+    /// - `question_type`: 対象の質問タイプ名(例: `"choice"`)。
+    /// - `question_id`: 質問識別子(任意)。
+    ///
+    /// # エラー
+    /// - `Criteria::List` の場合は `CoreError::InvalidCriteriaType` を返却する。
+    /// - `Criteria::None` の場合は `CoreError::MissingCriteria` を返却する。
+    pub fn as_map_or_err(
+        &self,
+        question_type: &str,
+        question_id: Option<&str>,
+    ) -> Result<&IndexMap<String, String>> {
+        match self {
+            Self::Map(map) => Ok(map),
+            Self::List(_) => Err(CoreError::InvalidCriteriaType {
+                question_id: question_id.map(str::to_string),
+                question_type: question_type.to_string(),
+                expected: "Map (オブジェクト)",
+                actual: "List (配列)",
+            }),
+            Self::None => Err(CoreError::MissingCriteria {
+                question_id: question_id.map(str::to_string),
+                question_type: question_type.to_string(),
+            }),
+        }
+    }
+
     /// List 形式の参照を取得する。
     pub fn as_list(&self) -> Option<&[String]> {
         match self {
             Self::List(list) => Some(list),
             _ => None,
+        }
+    }
+
+    /// List 形式の参照を取得する。不一致時は質問種別に応じたエラーを返却する。
+    ///
+    /// # 引数
+    /// - `question_type`: 対象の質問タイプ名(例: `"score"`)。
+    /// - `question_id`: 質問識別子(任意)。
+    ///
+    /// # エラー
+    /// - `Criteria::Map` の場合は `CoreError::InvalidCriteriaType` を返却する。
+    /// - `Criteria::None` の場合は `CoreError::MissingCriteria` を返却する。
+    pub fn as_list_or_err(
+        &self,
+        question_type: &str,
+        question_id: Option<&str>,
+    ) -> Result<&[String]> {
+        match self {
+            Self::List(list) => Ok(list),
+            Self::Map(_) => Err(CoreError::InvalidCriteriaType {
+                question_id: question_id.map(str::to_string),
+                question_type: question_type.to_string(),
+                expected: "List (配列)",
+                actual: "Map (オブジェクト)",
+            }),
+            Self::None => Err(CoreError::MissingCriteria {
+                question_id: question_id.map(str::to_string),
+                question_type: question_type.to_string(),
+            }),
         }
     }
 
@@ -149,30 +207,13 @@ impl Question {
                             question_id: qid.clone(),
                             question_type: "choice".to_string(),
                         })?;
-                match criteria {
-                    Criteria::Map(map) => {
-                        let count = map.len();
-                        if count == 0 || count > 255 {
-                            return Err(CoreError::InvalidChoiceCount {
-                                question_id: qid,
-                                count,
-                            });
-                        }
-                    }
-                    Criteria::List(_) => {
-                        return Err(CoreError::InvalidCriteriaType {
-                            question_id: qid,
-                            question_type: "choice".to_string(),
-                            expected: "Map (オブジェクト)",
-                            actual: "List (配列)",
-                        });
-                    }
-                    Criteria::None => {
-                        return Err(CoreError::MissingCriteria {
-                            question_id: qid,
-                            question_type: "choice".to_string(),
-                        });
-                    }
+                let map = criteria.as_map_or_err("choice", question_id)?;
+                let count = map.len();
+                if count == 0 || count > 255 {
+                    return Err(CoreError::InvalidChoiceCount {
+                        question_id: qid,
+                        count,
+                    });
                 }
             }
             QuestionType::Score => {
@@ -183,30 +224,13 @@ impl Question {
                             question_id: qid.clone(),
                             question_type: "score".to_string(),
                         })?;
-                match criteria {
-                    Criteria::List(list) => {
-                        let count = list.len();
-                        if !(2..=10).contains(&count) {
-                            return Err(CoreError::InvalidScoreLevelCount {
-                                question_id: qid,
-                                count,
-                            });
-                        }
-                    }
-                    Criteria::Map(_) => {
-                        return Err(CoreError::InvalidCriteriaType {
-                            question_id: qid,
-                            question_type: "score".to_string(),
-                            expected: "List (配列)",
-                            actual: "Map (オブジェクト)",
-                        });
-                    }
-                    Criteria::None => {
-                        return Err(CoreError::MissingCriteria {
-                            question_id: qid,
-                            question_type: "score".to_string(),
-                        });
-                    }
+                let list = criteria.as_list_or_err("score", question_id)?;
+                let count = list.len();
+                if !(2..=10).contains(&count) {
+                    return Err(CoreError::InvalidScoreLevelCount {
+                        question_id: qid,
+                        count,
+                    });
                 }
             }
             QuestionType::Noul => {
@@ -852,5 +876,92 @@ impl StateBatchResponse {
     pub fn with_state_hash(mut self, state_hash: impl Into<String>) -> Self {
         self.state_hash = Some(state_hash.into());
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_criteria_as_map_or_err() {
+        let mut map = IndexMap::new();
+        map.insert("k1".to_string(), "v1".to_string());
+        let criteria_map = Criteria::Map(map);
+        let criteria_list = Criteria::List(vec!["item1".to_string()]);
+        let criteria_none = Criteria::None;
+
+        assert!(criteria_map.as_map_or_err("choice", Some("q1")).is_ok());
+
+        let err_list = criteria_list
+            .as_map_or_err("choice", Some("q1"))
+            .unwrap_err();
+        match err_list {
+            CoreError::InvalidCriteriaType {
+                question_id,
+                question_type,
+                expected,
+                actual,
+            } => {
+                assert_eq!(question_id, Some("q1".to_string()));
+                assert_eq!(question_type, "choice");
+                assert_eq!(expected, "Map (オブジェクト)");
+                assert_eq!(actual, "List (配列)");
+            }
+            _ => panic!("予期しないエラー型です: {err_list:?}。"),
+        }
+
+        let err_none = criteria_none.as_map_or_err("choice", None).unwrap_err();
+        match err_none {
+            CoreError::MissingCriteria {
+                question_id,
+                question_type,
+            } => {
+                assert_eq!(question_id, None);
+                assert_eq!(question_type, "choice");
+            }
+            _ => panic!("予期しないエラー型です: {err_none:?}。"),
+        }
+    }
+
+    #[test]
+    fn test_criteria_as_list_or_err() {
+        let mut map = IndexMap::new();
+        map.insert("k1".to_string(), "v1".to_string());
+        let criteria_map = Criteria::Map(map);
+        let criteria_list = Criteria::List(vec!["item1".to_string()]);
+        let criteria_none = Criteria::None;
+
+        assert!(criteria_list.as_list_or_err("score", Some("q2")).is_ok());
+
+        let err_map = criteria_map
+            .as_list_or_err("score", Some("q2"))
+            .unwrap_err();
+        match err_map {
+            CoreError::InvalidCriteriaType {
+                question_id,
+                question_type,
+                expected,
+                actual,
+            } => {
+                assert_eq!(question_id, Some("q2".to_string()));
+                assert_eq!(question_type, "score");
+                assert_eq!(expected, "List (配列)");
+                assert_eq!(actual, "Map (オブジェクト)");
+            }
+            _ => panic!("予期しないエラー型です: {err_map:?}。"),
+        }
+
+        let err_none = criteria_none.as_list_or_err("score", None).unwrap_err();
+        match err_none {
+            CoreError::MissingCriteria {
+                question_id,
+                question_type,
+            } => {
+                assert_eq!(question_id, None);
+                assert_eq!(question_type, "score");
+            }
+            _ => panic!("予期しないエラー型です: {err_none:?}。"),
+        }
     }
 }

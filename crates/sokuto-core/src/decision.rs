@@ -38,23 +38,7 @@ pub fn evaluate_choice_with_buf(
     temperature: f64,
     probs_buf: &mut [f64],
 ) -> Result<Answer> {
-    let map = match criteria {
-        Criteria::Map(m) => m,
-        Criteria::List(_) => {
-            return Err(CoreError::InvalidCriteriaType {
-                question_id: None,
-                question_type: "choice".to_string(),
-                expected: "Map (オブジェクト)",
-                actual: "List (配列)",
-            });
-        }
-        Criteria::None => {
-            return Err(CoreError::MissingCriteria {
-                question_id: None,
-                question_type: "choice".to_string(),
-            });
-        }
-    };
+    let map = criteria.as_map_or_err("choice", None)?;
 
     let k = map.len();
     if k == 0 || k > 255 {
@@ -167,23 +151,7 @@ pub fn evaluate_score_with_buf(
     temperature: f64,
     probs_buf: &mut [f64],
 ) -> Result<Answer> {
-    let list = match criteria {
-        Criteria::List(l) => l,
-        Criteria::Map(_) => {
-            return Err(CoreError::InvalidCriteriaType {
-                question_id: None,
-                question_type: "score".to_string(),
-                expected: "List (配列)",
-                actual: "Map (オブジェクト)",
-            });
-        }
-        Criteria::None => {
-            return Err(CoreError::MissingCriteria {
-                question_id: None,
-                question_type: "score".to_string(),
-            });
-        }
-    };
+    let list = criteria.as_list_or_err("score", None)?;
 
     let m = list.len();
     if !(2..=10).contains(&m) {

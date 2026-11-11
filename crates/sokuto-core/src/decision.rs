@@ -65,8 +65,8 @@ fn evaluate_choice_map_with_buf(
 
     // 候補識別子と確率値のマッピング構築。
     let mut probabilities = IndexMap::with_capacity(k);
-    for (idx, (key, _)) in map.iter().enumerate() {
-        probabilities.insert(key.clone(), probs_buf[idx]);
+    for (key, prob) in map.keys().zip(probs_buf.iter().copied()) {
+        probabilities.insert(key.clone(), prob);
     }
 
     Ok(Answer::choice(
@@ -163,13 +163,14 @@ fn evaluate_score_list_with_buf(
         .all(|(i, label)| !label.is_empty() && list[i + 1..].iter().all(|other| label != other));
 
     let mut probabilities = IndexMap::with_capacity(m);
-    for (k, &prob) in probs_buf.iter().enumerate() {
-        let key = if is_unique_and_non_empty {
-            list[k].clone()
-        } else {
-            k.to_string()
-        };
-        probabilities.insert(key, prob);
+    if is_unique_and_non_empty {
+        for (label, prob) in list.iter().zip(probs_buf.iter().copied()) {
+            probabilities.insert(label.clone(), prob);
+        }
+    } else {
+        for (k, prob) in probs_buf.iter().copied().enumerate() {
+            probabilities.insert(k.to_string(), prob);
+        }
     }
 
     Ok(Answer::score(score_val, probabilities, confidence))

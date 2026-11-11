@@ -270,30 +270,25 @@ impl InProcessDagExecutor {
 
                     // 並行実行を待機
                     let results = futures_util::future::join_all(tasks).await;
-
+                    let mut parallel_answers = Vec::with_capacity(results.len());
                     for res in results {
                         let (p_id, ans_res) = res.map_err(|e| {
                             DagError::ExecutionFailed(format!("並行タスク結合失敗: {e}。"))
                         })?;
                         let ans = ans_res.map_err(DagError::Runtime)?;
-                        let ctx_val = answer_to_context_value(&ans);
-                        context.insert(p_id.clone(), ctx_val);
-
-                        steps.insert(
-                            p_id.clone(),
-                            StepExecutionResult {
-                                node_id: p_id,
-                                node_type: DagNodeType::Inference,
-                                answer: Some(ans),
-                                duration_ms: step_start.elapsed().as_secs_f64() * 1000.0,
-                                next_node: node.join_node.clone(),
-                                reason: None,
-                            },
-                        );
+                        parallel_answers.push((p_id, ans));
                     }
 
                     let duration_ms = step_start.elapsed().as_secs_f64() * 1000.0;
                     let next_node = node.join_node.clone();
+                    record_parallel_results(
+                        parallel_answers,
+                        next_node.as_deref(),
+                        duration_ms,
+                        &mut context,
+                        &mut steps,
+                        &mut final_answer,
+                    );
 
                     steps.insert(
                         curr_node_id.clone(),
@@ -408,6 +403,44 @@ fn answer_to_context_value(answer: &Answer) -> NodeContextValue {
         AnswerPayload::Noul { probability } => {
             NodeContextValue::new(if *probability >= 0.5 { "true" } else { "false" }, conf)
         }
+    }
+}
+
+/// 並行実行されたタスク群の判定結果を `context`・`steps` へ反映し、最後のタスク結果を `final_answer` に設定する。
+///
+/// `futures_util::future::join_all` は入力タスク列 (`parallel_nodes`) の順序を保持するため、
+/// 最後のタスクの `Answer` を代表値として `final_answer` を更新し、後続の `Branch` ノードによる
+/// `field: "answer"` / `"confidence"` / `"route"` 参照および最終 `DagExecutionResult.final_answer` との整合を保つ。
+fn record_parallel_results(
+    parallel_answers: Vec<(String, Answer)>,
+    join_node: Option<&str>,
+    duration_ms: f64,
+    context: &mut IndexMap<String, NodeContextValue>,
+    steps: &mut IndexMap<String, StepExecutionResult>,
+    final_answer: &mut Option<Answer>,
+) {
+    let total = parallel_answers.len();
+    let next_node = join_node.map(str::to_string);
+
+    for (idx, (p_id, ans)) in parallel_answers.into_iter().enumerate() {
+        let ctx_val = answer_to_context_value(&ans);
+        context.insert(p_id.clone(), ctx_val);
+
+        if idx + 1 == total {
+            *final_answer = Some(ans.clone());
+        }
+
+        steps.insert(
+            p_id.clone(),
+            StepExecutionResult {
+                node_id: p_id,
+                node_type: DagNodeType::Inference,
+                answer: Some(ans),
+                duration_ms,
+                next_node: next_node.clone(),
+                reason: None,
+            },
+        );
     }
 }
 
@@ -930,5 +963,99 @@ mod tests {
             evaluate_conditions(&conditions[3..], Some(&ans), &context),
             Some("card_issue".to_string())
         );
+    }
+
+    #[test]
+    fn test_record_parallel_results_updates_final_answer_and_context() {
+        let mut context = IndexMap::new();
+        let mut steps = IndexMap::new();
+
+        // Parallel 通過前の古い final_answer が残っているケースも模擬する
+        let stale_answer = Answer::noul(0.05);
+        let mut final_answer = Some(stale_answer);
+
+        let task_a_ans = Answer::noul(0.92);
+        let task_b_ans = Answer::choice("priority_high", IndexMap::new(), 0.88);
+
+        record_parallel_results(
+            vec![
+                ("fraud_check".to_string(), task_a_ans),
+                ("priority_eval".to_string(), task_b_ans.clone()),
+            ],
+            Some("branch_after_parallel"),
+            1.25,
+            &mut context,
+            &mut steps,
+            &mut final_answer,
+        );
+
+        // 1. final_answer が最後の並行タスク (priority_eval) の結果で上書きされていること
+        assert_eq!(
+            final_answer.as_ref().and_then(|a| a.as_choice()),
+            Some("priority_high")
+        );
+        assert_eq!(final_answer.as_ref(), Some(&task_b_ans));
+
+        // 2. 両タスクの結果が context と steps に格納されていること
+        assert_eq!(
+            context.get("fraud_check").map(|c| c.value.as_str()),
+            Some("true")
+        );
+        assert_eq!(
+            context.get("priority_eval").map(|c| c.value.as_str()),
+            Some("priority_high")
+        );
+        assert_eq!(steps.len(), 2);
+        assert_eq!(
+            steps["fraud_check"].next_node.as_deref(),
+            Some("branch_after_parallel")
+        );
+        assert_eq!(
+            steps["priority_eval"].next_node.as_deref(),
+            Some("branch_after_parallel")
+        );
+
+        // 3. 後続 Branch ノードでの field: "answer" / "fraud_check.value" 評価が正しく動作すること
+        let branch_conditions = vec![
+            NodeCondition {
+                field: "answer".to_string(),
+                op: NodeConditionOp::Eq,
+                value: Some(serde_json::json!("priority_high")),
+                target_node: "handle_priority_high".to_string(),
+            },
+            NodeCondition {
+                field: "answer".to_string(),
+                op: NodeConditionOp::Eq,
+                value: Some(serde_json::json!(false)),
+                target_node: "stale_branch_should_not_trigger".to_string(),
+            },
+        ];
+        assert_eq!(
+            evaluate_conditions(&branch_conditions, final_answer.as_ref(), &context),
+            Some("handle_priority_high".to_string())
+        );
+
+        let context_branch_conditions = vec![NodeCondition {
+            field: "fraud_check.value".to_string(),
+            op: NodeConditionOp::Eq,
+            value: Some(serde_json::json!(true)),
+            target_node: "escalate_fraud".to_string(),
+        }];
+        assert_eq!(
+            evaluate_conditions(&context_branch_conditions, final_answer.as_ref(), &context),
+            Some("escalate_fraud".to_string())
+        );
+
+        // 4. 空結果時は既存の final_answer を維持すること
+        let mut unchanged = Some(Answer::noul(0.80));
+        record_parallel_results(
+            Vec::new(),
+            Some("join"),
+            0.1,
+            &mut context,
+            &mut steps,
+            &mut unchanged,
+        );
+        assert_eq!(unchanged.as_ref().and_then(|a| a.as_noul()), Some(0.80));
     }
 }

@@ -347,11 +347,7 @@ impl InProcessDagExecutor {
                                         probability: v,
                                     })
                                     .collect();
-                                list.sort_by(|a, b| {
-                                    b.probability
-                                        .partial_cmp(&a.probability)
-                                        .unwrap_or(std::cmp::Ordering::Equal)
-                                });
+                                list.sort_by(|a, b| b.probability.total_cmp(&a.probability));
                                 list
                             })
                             .unwrap_or_default();

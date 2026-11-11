@@ -524,9 +524,7 @@ pub fn filter_top_candidates(
         if select_k < scored_items.len() {
             // スコア降順 (高い順)。同値ならインデックス昇順 (先勝ち)
             scored_items.select_nth_unstable_by(select_k - 1, |a, b| {
-                b.0.partial_cmp(&a.0)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.1.cmp(&b.1))
+                b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1))
             });
             scored_items.truncate(select_k);
         }

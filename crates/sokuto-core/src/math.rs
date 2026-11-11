@@ -464,29 +464,42 @@ pub fn normalized_entropy_confidence(probabilities: &[f64]) -> Result<f64> {
     Ok((1.0 - h_norm).clamp(0.0, 1.0))
 }
 
-/// スライス内から最大値を持つ要素のインデックスを取得する。
+/// 任意の実数値イテレータ内から最大値を持つ要素のインデックスを単一パス走査で取得する。
 ///
 /// # 概要
+/// - $O(K)$ 単一パス走査により、ヒープメモリ割り当て(ゼロアロケーション)で最大値インデックスを算出する。
+/// - `IndexMap::values()` などの非連続コレクションからも中間 `Vec` を生成せずに探索できる。
 /// - 決定論的タイブレーク規則として、同一の最大値が複数存在する場合は「最小のインデックス(先勝ち)」を確定的に採択する。
-/// - 配列内に `NaN` が含まれている場合は `CoreError::MathError` を返却する。
+/// - 入力が空または非有限値(`NaN`, `±Inf`)を含む場合は `CoreError::MathError` を返却する。
 ///
 /// # 引数
-/// - `values`: 探索対象の実数値スライス(`f64`)。
+/// - `iter`: 探索対象の実数値(`f64` または `&f64`)を提供するイテレータ。
 ///
 /// # 戻り値
-/// - 成功時は最大値のインデックス(`usize`)、配列が空または非有限値を含む場合は `CoreError::MathError`。
-pub fn argmax(values: &[f64]) -> Result<usize> {
-    if values.is_empty() {
+/// - 成功時は最大値のインデックス(`usize`)、入力が空または非有限値を含む場合は `CoreError::MathError`。
+pub fn argmax_iter<I>(iter: I) -> Result<usize>
+where
+    I: IntoIterator,
+    I::Item: Borrow<f64>,
+{
+    let mut iter = iter.into_iter();
+    let first = iter.next().ok_or_else(|| CoreError::MathError {
+        question_id: None,
+        message: "探索対象のスライスが空です。".to_string(),
+    })?;
+    let first_val = *first.borrow();
+    if !first_val.is_finite() {
         return Err(CoreError::MathError {
             question_id: None,
-            message: "探索対象のスライスが空です。".to_string(),
+            message: "スライス内に非有限値(NaNまたは無限大)が含まれています。".to_string(),
         });
     }
 
     let mut best_index = 0;
-    let mut max_val = f64::NEG_INFINITY;
+    let mut max_val = first_val;
 
-    for (i, &val) in values.iter().enumerate() {
+    for (i, item) in iter.enumerate() {
+        let val = *item.borrow();
         if !val.is_finite() {
             return Err(CoreError::MathError {
                 question_id: None,
@@ -496,11 +509,28 @@ pub fn argmax(values: &[f64]) -> Result<usize> {
         // 厳密な不等号(val > max_val)を用いることで、同率値の場合は先頭インデックスを維持する。
         if val > max_val {
             max_val = val;
-            best_index = i;
+            best_index = i + 1;
         }
     }
 
     Ok(best_index)
+}
+
+/// スライス内から最大値を持つ要素のインデックスを取得する。
+///
+/// # 概要
+/// - [`argmax_iter`] を呼び出すゼロコストラッパーとして動作する。
+/// - 決定論的タイブレーク規則として、同一の最大値が複数存在する場合は「最小のインデックス(先勝ち)」を確定的に採択する。
+/// - 配列内に非有限値(`NaN`, `±Inf`)が含まれている場合は `CoreError::MathError` を返却する。
+///
+/// # 引数
+/// - `values`: 探索対象の実数値スライス(`f64`)。
+///
+/// # 戻り値
+/// - 成功時は最大値のインデックス(`usize`)、配列が空または非有限値を含む場合は `CoreError::MathError`。
+#[inline]
+pub fn argmax(values: &[f64]) -> Result<usize> {
+    argmax_iter(values)
 }
 
 /// 任意の確率値イテレータから加重平均スコア実数値 $\text{Score} \in [0.0, M-1.0]$ を単一パス走査で算出する。
@@ -1336,6 +1366,34 @@ mod tests {
         assert!(argmax(&nan_vals).is_err());
         let inf_vals = vec![1.0, f64::INFINITY];
         assert!(argmax(&inf_vals).is_err());
+    }
+
+    #[test]
+    fn test_argmax_iter() {
+        // 借用イテレータ・所有イテレータ・配列・IndexMap 等の各種入力で動作することを確認。
+        let values = vec![0.1, 0.8, 0.4];
+        assert_eq!(argmax_iter(values.iter()).unwrap(), 1);
+        assert_eq!(argmax_iter(values.clone()).unwrap(), 1);
+        assert_eq!(argmax_iter(values.into_iter()).unwrap(), 1);
+        assert_eq!(argmax_iter([0.1, 0.8, 0.4]).unwrap(), 1);
+
+        // 非連続コレクション (IndexMap::values) から直接計算できることを確認。
+        let mut map = indexmap::IndexMap::new();
+        map.insert("a", -5.0);
+        map.insert("b", -1.5);
+        map.insert("c", -1.5);
+        map.insert("d", -10.0);
+        assert_eq!(argmax_iter(map.values()).unwrap(), 1);
+
+        // 単一要素・最小負値境界 (f64::MIN)。
+        assert_eq!(argmax_iter([f64::MIN]).unwrap(), 0);
+        assert_eq!(argmax_iter([f64::MIN, -1.0]).unwrap(), 1);
+
+        // 異常系: 空イテレータおよび非有限値。
+        assert!(argmax_iter(std::iter::empty::<f64>()).is_err());
+        assert!(argmax_iter([f64::NAN, 1.0]).is_err());
+        assert!(argmax_iter([1.0, f64::INFINITY]).is_err());
+        assert!(argmax_iter([1.0, f64::NEG_INFINITY]).is_err());
     }
 
     #[test]

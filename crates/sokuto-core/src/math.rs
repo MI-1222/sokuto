@@ -6,6 +6,9 @@ use std::borrow::Borrow;
 
 use crate::error::{CoreError, Result};
 
+/// 確率分布の総和に対する有効性判定用の微小許容閾値。
+const WEIGHT_SUM_EPSILON: f64 = 1e-12;
+
 /// ロジット列から温度付きソフトマックス確率分布を計算し、指定されたバッファへ書き込む。
 ///
 /// # 概要
@@ -476,6 +479,7 @@ pub fn expected_score(probabilities: &[f64]) -> Result<f64> {
 /// - $O(M)$ 単一パス走査により、二重走査や中間 `Vec` 確保(ヒープアロケーション)を完全に排除する。
 /// - $M < 2$ の場合は段階数不足エラーとして `CoreError::MathError` を返却する。
 /// - 非有限値(NaNまたは無限大)や負の確率値が含まれる場合は `CoreError::MathError` を返却する。
+/// - 全要素がゼロまたは重みの総和が微小閾値以下($\le 10^{-12}$)の不正な分布の場合は `CoreError::MathError` を返却する。
 /// - 確率総和の丸め誤差や非正規化重みに対応するため、加重二乗和 $M_2$ を重みの総和で正規化して加重分散を算出する。
 ///
 /// # 引数
@@ -522,11 +526,13 @@ where
         });
     }
 
-    let var = if weight_sum > 0.0 {
-        (m2 / weight_sum).max(0.0)
-    } else {
-        0.0
-    };
+    if !weight_sum.is_finite() || weight_sum <= WEIGHT_SUM_EPSILON {
+        return Err(CoreError::MathError {
+            message: format!("確率値の総和が正数ではありません: {weight_sum}。"),
+        });
+    }
+
+    let var = (m2 / weight_sum).max(0.0);
 
     Ok((count, mean, var))
 }
@@ -1371,6 +1377,15 @@ mod tests {
         assert!(score_variance_iter([f64::INFINITY, 0.5]).is_err());
         assert!(normalized_variance_confidence_iter([-0.1, 1.1]).is_err());
         assert!(score_variance_ratio_iter([0.5, -0.5]).is_err());
+
+        // 異常系: 全要素ゼロおよび微小総和(破綻分布)の拒絶
+        assert!(score_moments_iter([0.0, 0.0, 0.0]).is_err());
+        assert!(score_moments(&[0.0, 0.0]).is_err());
+        assert!(expected_score(&[0.0, 0.0]).is_err());
+        assert!(score_variance(&[0.0, 0.0]).is_err());
+        assert!(normalized_variance_confidence(&[0.0, 0.0, 0.0, 0.0]).is_err());
+        assert!(score_variance_ratio(&[0.0, 0.0]).is_err());
+        assert!(score_moments_iter([1e-15, 1e-15]).is_err());
     }
 
     #[test]

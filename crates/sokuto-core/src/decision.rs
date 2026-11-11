@@ -6,6 +6,9 @@
 use indexmap::IndexMap;
 
 use crate::contract::CalibrationConfig;
+use crate::contract::model_spec::{
+    MAX_NUM_OPTIONS, MAX_SCORE_LEVELS, MIN_NUM_OPTIONS, MIN_SCORE_LEVELS,
+};
 use crate::error::{CoreError, Result};
 use crate::math::{
     argmax, composite_confidence, normalized_variance_confidence_from_variance, noul_probability,
@@ -51,7 +54,7 @@ pub fn evaluate_choice_with_buf(
     let map = criteria.as_map_or_err(QuestionType::Choice, question_id)?;
 
     let k = map.len();
-    if k == 0 || k > 255 {
+    if !(MIN_NUM_OPTIONS..=MAX_NUM_OPTIONS).contains(&k) {
         return Err(CoreError::InvalidChoiceCount {
             question_id: question_id.map(str::to_string),
             count: k,
@@ -170,7 +173,7 @@ pub fn evaluate_score_with_buf(
     let list = criteria.as_list_or_err(QuestionType::Score, question_id)?;
 
     let m = list.len();
-    if !(2..=10).contains(&m) {
+    if !(MIN_SCORE_LEVELS..=MAX_SCORE_LEVELS).contains(&m) {
         return Err(CoreError::InvalidScoreLevelCount {
             question_id: question_id.map(str::to_string),
             count: m,

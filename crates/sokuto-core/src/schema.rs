@@ -10,6 +10,9 @@ use serde::de::Deserializer;
 use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 
+use crate::contract::model_spec::{
+    MAX_NUM_OPTIONS, MAX_SCORE_LEVELS, MIN_NUM_OPTIONS, MIN_SCORE_LEVELS,
+};
 use crate::error::{CoreError, Result};
 use crate::gating::{DecisionRoute, GatingConfig, GatingMetadata, SystemRoutingSummary};
 
@@ -192,7 +195,7 @@ impl Question {
                         })?;
                 let map = criteria.as_map_or_err(QuestionType::Choice, question_id)?;
                 let count = map.len();
-                if count == 0 || count > 255 {
+                if !(MIN_NUM_OPTIONS..=MAX_NUM_OPTIONS).contains(&count) {
                     return Err(CoreError::InvalidChoiceCount {
                         question_id: qid,
                         count,
@@ -209,7 +212,7 @@ impl Question {
                         })?;
                 let list = criteria.as_list_or_err(QuestionType::Score, question_id)?;
                 let count = list.len();
-                if !(2..=10).contains(&count) {
+                if !(MIN_SCORE_LEVELS..=MAX_SCORE_LEVELS).contains(&count) {
                     return Err(CoreError::InvalidScoreLevelCount {
                         question_id: qid,
                         count,

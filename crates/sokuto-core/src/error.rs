@@ -4,6 +4,9 @@
 
 use thiserror::Error;
 
+use crate::contract::model_spec::{
+    MAX_NUM_OPTIONS, MAX_SCORE_LEVELS, MIN_NUM_OPTIONS, MIN_SCORE_LEVELS,
+};
 use crate::schema::QuestionType;
 
 /// 質問識別子(任意)に基づき、エラーメッセージ用のプレフィックス文字列を生成する。
@@ -22,8 +25,10 @@ pub type Result<T> = std::result::Result<T, CoreError>;
 pub enum CoreError {
     /// 選択肢の数が制限範囲外である場合のエラー(Choice 型は 1〜255 個)。
     #[error(
-        "{prefix}Choice 型の候補数は 1〜255 個である必要がありますが、{count} 個指定されました。",
-        prefix = question_prefix(question_id)
+        "{prefix}Choice 型の候補数は {min}〜{max} 個である必要がありますが、{count} 個指定されました。",
+        prefix = question_prefix(question_id),
+        min = MIN_NUM_OPTIONS,
+        max = MAX_NUM_OPTIONS
     )]
     InvalidChoiceCount {
         /// 対象の質問識別子(任意)。
@@ -34,8 +39,10 @@ pub enum CoreError {
 
     /// スコア評価尺度の段階数が範囲外である場合のエラー(Score 型は 2〜10 段階)。
     #[error(
-        "{prefix}Score 型の評価尺度数は 2〜10 段階である必要がありますが、{count} 個指定されました。",
-        prefix = question_prefix(question_id)
+        "{prefix}Score 型の評価尺度数は {min}〜{max} 段階である必要がありますが、{count} 個指定されました。",
+        prefix = question_prefix(question_id),
+        min = MIN_SCORE_LEVELS,
+        max = MAX_SCORE_LEVELS
     )]
     InvalidScoreLevelCount {
         /// 対象の質問識別子(任意)。

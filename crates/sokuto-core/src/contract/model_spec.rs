@@ -44,6 +44,12 @@ pub const MAX_NUM_OPTIONS: usize = 255;
 /// 最小候補数。
 pub const MIN_NUM_OPTIONS: usize = 1;
 
+/// Score 型で許容される最小評価段階数。
+pub const MIN_SCORE_LEVELS: usize = 2;
+
+/// Score 型で許容される最大評価段階数。
+pub const MAX_SCORE_LEVELS: usize = 10;
+
 /// 検証済みのモデル入力次元情報。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelInputDimensions {

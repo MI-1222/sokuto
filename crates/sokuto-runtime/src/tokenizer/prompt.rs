@@ -3,7 +3,9 @@
 //! Jev 互換の質問仕様 (`Question`) から、Python 学習パイプラインと
 //! 完全一致するプロンプトパーツおよび候補キー列を構築する。
 
-use sokuto_core::contract::model_spec::TOKEN_OPTION_MARKER;
+use sokuto_core::contract::model_spec::{
+    MAX_NUM_OPTIONS, MAX_SCORE_LEVELS, MIN_NUM_OPTIONS, MIN_SCORE_LEVELS, TOKEN_OPTION_MARKER,
+};
 use sokuto_core::schema::{Criteria, Question, QuestionType};
 
 use crate::error::{Result, RuntimeError};
@@ -50,9 +52,9 @@ pub fn format_prompt(question: &Question) -> Result<FormattedPrompt> {
             };
 
             let count = map.len();
-            if count == 0 || count > 255 {
+            if !(MIN_NUM_OPTIONS..=MAX_NUM_OPTIONS).contains(&count) {
                 return Err(RuntimeError::InvalidQuestion(format!(
-                    "Choice 型の候補数は 1〜255 件である必要がありますが、{count} 件指定されました。"
+                    "Choice 型の候補数は {MIN_NUM_OPTIONS}〜{MAX_NUM_OPTIONS} 件である必要がありますが、{count} 件指定されました。"
                 )));
             }
 
@@ -93,9 +95,9 @@ pub fn format_prompt(question: &Question) -> Result<FormattedPrompt> {
             };
 
             let count = list.len();
-            if !(2..=10).contains(&count) {
+            if !(MIN_SCORE_LEVELS..=MAX_SCORE_LEVELS).contains(&count) {
                 return Err(RuntimeError::InvalidQuestion(format!(
-                    "Score 型の段階数は 2〜10 段階である必要がありますが、{count} 段階指定されました。"
+                    "Score 型の段階数は {MIN_SCORE_LEVELS}〜{MAX_SCORE_LEVELS} 段階である必要がありますが、{count} 段階指定されました。"
                 )));
             }
 

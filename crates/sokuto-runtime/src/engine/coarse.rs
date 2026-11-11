@@ -6,7 +6,8 @@
 
 use indexmap::IndexMap;
 use sokuto_core::contract::model_spec::MAX_NUM_OPTIONS;
-use sokuto_core::schema::{AnswerPayload, Question, QuestionType};
+use sokuto_core::math::composite_confidence_iter;
+use sokuto_core::schema::{Answer, AnswerPayload, Question, QuestionType};
 
 use crate::engine::InferenceEngine;
 use crate::error::{Result, RuntimeError};
@@ -583,6 +584,31 @@ pub fn reconstruct_probabilities(
     full_probabilities
 }
 
+/// 縮小候補空間で得られた Choice 型 `Answer` を全候補空間 (`original_keys`) へ復元し、
+/// 復元後分布から複合確信度 $S_{\text{confidence}} = (1.0 - H_{\text{norm}}(p)) \times M(p)$ を再計算して更新する。
+///
+/// Coarse 段階で除外された候補を確率 `0.0` として全候補空間へ展開すると分母 $\ln K$ の変化に伴い
+/// 正規化エントロピーおよび複合確信度が変化するため、確率マップのみを更新した場合に生じる
+/// 確信度と分布・ゲーティング指標 (`gating.entropy`) の不整合を解消する。
+///
+/// # 引数
+/// - `answer`: 縮小空間での評価結果 (`AnswerPayload::Choice` の場合に確率分布と確信度を更新する)。
+/// - `original_keys`: リクエストされた全候補キーの順序付きスライス。
+pub fn reconstruct_choice_answer(answer: &mut Answer, original_keys: &[String]) -> Result<()> {
+    if let AnswerPayload::Choice {
+        probabilities,
+        confidence,
+        ..
+    } = &mut answer.payload
+    {
+        let full_probs = reconstruct_probabilities(original_keys, probabilities);
+        let recomputed_conf = composite_confidence_iter(full_probs.values())?;
+        *probabilities = full_probs;
+        *confidence = recomputed_conf;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -734,5 +760,40 @@ mod tests {
         assert!(result.selected.contains_key("none_2"));
         assert!(!result.selected.contains_key("none_3"));
         assert!(!result.selected.contains_key("regular_0"));
+    }
+
+    #[test]
+    fn test_reconstruct_choice_answer_recomputes_composite_confidence() {
+        let original_keys: Vec<String> = (0..77).map(|i| format!("cat_{i:02}")).collect();
+
+        // 縮小空間 (M=4) での評価結果を模擬
+        let mut sub_probs = IndexMap::new();
+        sub_probs.insert("cat_01".to_string(), 0.80);
+        sub_probs.insert("cat_05".to_string(), 0.20);
+        sub_probs.insert("cat_10".to_string(), 0.00);
+        sub_probs.insert("cat_20".to_string(), 0.00);
+
+        let sub_conf = sokuto_core::math::composite_confidence_iter(sub_probs.values()).unwrap();
+        let mut answer = Answer::choice("cat_01", sub_probs, sub_conf);
+
+        reconstruct_choice_answer(&mut answer, &original_keys)
+            .expect("全候補空間への復元と複合確信度の再計算に成功すること。");
+
+        let full_probs = answer.probabilities().expect("確率分布が存在すること。");
+        assert_eq!(full_probs.len(), 77);
+        assert_eq!(full_probs.get("cat_01"), Some(&0.80));
+        assert_eq!(full_probs.get("cat_05"), Some(&0.20));
+        assert_eq!(full_probs.get("cat_00"), Some(&0.0));
+
+        // 復元後の全候補空間 (K=77) に基づく composite_confidence と一致し、縮小空間 (M=4) 値から更新されていること
+        let full_vec: Vec<f64> = full_probs.values().copied().collect();
+        let expected_full_conf = sokuto_core::math::composite_confidence(&full_vec).unwrap();
+        let actual_conf = answer.confidence().expect("確信度が存在すること。");
+
+        assert!((actual_conf - expected_full_conf).abs() < 1e-12);
+        assert!(
+            (actual_conf - sub_conf).abs() > 1e-3,
+            "縮小空間 (M=4) と全候補空間 (K=77) で正規化エントロピーが変わるため確信度も更新されること。"
+        );
     }
 }

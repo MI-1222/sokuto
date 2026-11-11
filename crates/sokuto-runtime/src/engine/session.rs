@@ -7,8 +7,6 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use indexmap::IndexMap;
-
 use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_core::contract::model_spec::{
     ModelInputDimensions, OP_INDEX_PADDING, TENSOR_ATTENTION_MASK, TENSOR_INPUT_IDS, TENSOR_LOGITS,
@@ -16,7 +14,7 @@ use sokuto_core::contract::model_spec::{
 };
 use sokuto_core::decision::evaluate_question;
 use sokuto_core::gating::GatingConfig;
-use sokuto_core::schema::{Answer, AnswerPayload, Question, QuestionType};
+use sokuto_core::schema::{Answer, Question, QuestionType};
 
 use ort::session::Session;
 use ort::session::builder::SessionBuilder;
@@ -24,7 +22,7 @@ use ort::value::TensorRef;
 
 use crate::engine::coarse::{
     CoarseScorer, CoarseToFineConfig, LexicalCoarseScorer, filter_top_candidates,
-    reconstruct_probabilities,
+    reconstruct_choice_answer,
 };
 use crate::engine::config::{ExecutionProvider, SessionConfig, auto_intra_threads};
 use crate::engine::gating::{apply_gating_to_answer_with_energy, calculate_choice_energy};
@@ -527,29 +525,13 @@ impl InferenceEngine {
         let sub_logits = self.forward_question(&sub_tokenized)?;
 
         // 4. 縮小候補空間での決定数理解決 (M 候補の温度バケットが適用される)
-        let sub_answer = evaluate_question(&sub_question, &sub_logits, calib_config)
+        let mut answer = evaluate_question(&sub_question, &sub_logits, calib_config)
             .map_err(RuntimeError::Core)?;
 
-        // 5. 全候補空間に対する確率マップの再構成
-        let (selected, confidence, full_probabilities) = match sub_answer.payload {
-            AnswerPayload::Choice {
-                selected,
-                probabilities,
-                confidence,
-            } => {
-                let full = reconstruct_probabilities(&original_keys, &probabilities);
-                (selected, confidence, full)
-            }
-            _ => (
-                sub_answer.as_choice().unwrap_or("").to_string(),
-                sub_answer.confidence().unwrap_or(0.0),
-                IndexMap::new(),
-            ),
-        };
+        // 5. 全候補空間に対する確率マップの再構成および複合確信度の再計算
+        reconstruct_choice_answer(&mut answer, &original_keys)?;
 
-        let mut answer = Answer::choice(selected, full_probabilities, confidence);
-
-        // 6. ゲーティング判定の適用 (縮小空間での確信度・正規化自由エネルギーを尊重しつつ監査メタデータを付与)
+        // 6. ゲーティング判定の適用 (全候補空間基準の確信度と正規化自由エネルギーに基づき監査メタデータを付与)
         let energy = calculate_choice_energy(&sub_question, &sub_logits, calib_config);
         apply_gating_to_answer_with_energy(
             &mut answer,

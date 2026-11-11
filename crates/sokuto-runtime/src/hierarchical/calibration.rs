@@ -108,7 +108,7 @@ impl DirichletCalibrator {
             *logit = sum;
         }
 
-        Ok(softmax_f64(&logits))
+        Ok(sokuto_core::math::softmax(&logits, 1.0)?)
     }
 }
 
@@ -154,46 +154,23 @@ pub fn compute_fine_temperature(normalized_entropy: f64, gamma: f64) -> f64 {
 
 /// 細分類のロジットに温度スケーリングを適用した上で Softmax を計算する。
 ///
+/// 内部で `sokuto_core::math::softmax` に委譲し、有限値検査・極小温度クランプ・Max-trick を適用する。
+/// 有限な温度に対しては下限 `0.01` を保証する。
+///
 /// # 引数
 /// - `logits`: 第 2 パスで得られた未正規化ロジット。
-/// - `temperature`: スケーリング温度 ($T \ge 1.0$)。
-pub fn temperature_scaled_softmax(logits: &[f64], temperature: f64) -> Vec<f64> {
-    let temp = temperature.max(0.01);
-    let mut scaled = Vec::with_capacity(logits.len());
-    for &l in logits {
-        scaled.push(l / temp);
-    }
-    softmax_f64(&scaled)
-}
-
-/// ロジット列に対する数値的に安定な Softmax 計算。
-pub fn softmax_f64(logits: &[f64]) -> Vec<f64> {
-    if logits.is_empty() {
-        return Vec::new();
-    }
-
-    let max_logit = logits
-        .iter()
-        .copied()
-        .fold(f64::NEG_INFINITY, |a, b| if a > b { a } else { b });
-
-    let mut exps = Vec::with_capacity(logits.len());
-    let mut sum = 0.0;
-    for &l in logits {
-        let e = (l - max_logit).exp();
-        exps.push(e);
-        sum += e;
-    }
-
-    if sum <= 0.0 || !sum.is_finite() {
-        let uniform = 1.0 / (logits.len() as f64);
-        return vec![uniform; logits.len()];
-    }
-
-    for e in &mut exps {
-        *e /= sum;
-    }
-    exps
+/// - `temperature`: スケーリング温度 ($T > 0.0$)。
+///
+/// # エラー
+/// - `logits` が空の場合や非有限値 (`NaN` / `Inf`) を含む場合。
+/// - `temperature` が正の有限値でない場合。
+pub fn temperature_scaled_softmax(logits: &[f64], temperature: f64) -> Result<Vec<f64>> {
+    let temp = if temperature.is_finite() && temperature > 0.0 {
+        temperature.max(0.01)
+    } else {
+        temperature
+    };
+    Ok(sokuto_core::math::softmax(logits, temp)?)
 }
 
 /// 第 1 パス (大分類) 確率と第 2 パス (細分類) 確率を減衰周辺化結合し、全候補空間の確率分布を復元する。
@@ -371,5 +348,36 @@ mod tests {
         // 総和が 1.0
         let sum: f64 = full.values().sum();
         assert!((sum - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_temperature_scaled_softmax_valid_and_errors() {
+        // 温度 T = 1.0 と T = 2.0 のスケーリング確認
+        let logits = [2.0, 0.0];
+        let p_t1 = temperature_scaled_softmax(&logits, 1.0).unwrap();
+        let p_t2 = temperature_scaled_softmax(&logits, 2.0).unwrap();
+        assert!((p_t1.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+        assert!((p_t2.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+        assert!(p_t1[0] > p_t2[0]);
+
+        // 0.01 未満の正の温度は 0.01 にクランプされる
+        let p_tiny = temperature_scaled_softmax(&logits, 1e-4).unwrap();
+        let p_floor = temperature_scaled_softmax(&logits, 0.01).unwrap();
+        assert!((p_tiny[0] - p_floor[0]).abs() < 1e-12);
+
+        // 空スライスや非有限値、非正の温度はエラーになる
+        assert!(temperature_scaled_softmax(&[], 1.0).is_err());
+        assert!(temperature_scaled_softmax(&[f64::NAN, 1.0], 1.0).is_err());
+        assert!(temperature_scaled_softmax(&[f64::INFINITY, 1.0], 1.0).is_err());
+        assert!(temperature_scaled_softmax(&logits, 0.0).is_err());
+        assert!(temperature_scaled_softmax(&logits, -1.0).is_err());
+        assert!(temperature_scaled_softmax(&logits, f64::NAN).is_err());
+    }
+
+    #[test]
+    fn test_dirichlet_calibrate_rejects_non_finite_logits() {
+        let cal = DirichletCalibrator::identity(2);
+        // INFINITY 入力時はロジットが非有限となり、一様分布フォールバックせずエラーを返す
+        assert!(cal.calibrate(&[f64::INFINITY, 0.5]).is_err());
     }
 }

@@ -300,7 +300,7 @@ impl<'a> CoarseToFineRouter<'a> {
                 let base_temp = self
                     .calib_config
                     .get_temperature(QuestionType::Choice, self.mapping.coarse_categories.len());
-                let probs = temperature_scaled_softmax(&raw_logits, base_temp);
+                let probs = temperature_scaled_softmax(&raw_logits, base_temp)?;
                 let mut map = IndexMap::with_capacity(self.mapping.coarse_categories.len());
                 for (i, key) in self.mapping.coarse_categories.keys().enumerate() {
                     map.insert(key.clone(), probs[i]);
@@ -457,7 +457,7 @@ impl<'a> CoarseToFineRouter<'a> {
         let effective_temp = (base_temp * fine_temperature).max(0.01);
 
         // 生ロジットに対して実効温度で 1 回だけ Softmax を適用
-        let temp_scaled_probs = temperature_scaled_softmax(&raw_logits, effective_temp);
+        let temp_scaled_probs = temperature_scaled_softmax(&raw_logits, effective_temp)?;
 
         let mut evaluated_fine_probs = IndexMap::with_capacity(fine_candidates.len());
         for (i, (k, _)) in fine_candidates.iter().enumerate() {

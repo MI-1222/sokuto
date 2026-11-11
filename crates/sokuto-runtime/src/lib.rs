@@ -38,7 +38,7 @@ pub use hierarchical::{
     DirichletCalibrator, HierarchicalEngine, HierarchicalExecutionTrace, HierarchicalMapping,
     HierarchicalMappingBuilder, HierarchicalResult, HierarchicalRouterConfig,
     combine_and_reconstruct_probabilities, compute_fine_temperature, compute_normalized_entropy,
-    softmax_f64, temperature_scaled_softmax,
+    temperature_scaled_softmax,
 };
 pub use tokenizer::{BatchTokenizedQuestions, JevTokenizer, TokenizedQuestion};
 

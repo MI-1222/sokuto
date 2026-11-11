@@ -18,7 +18,7 @@ pub mod router;
 pub use calibration::{
     DEFAULT_COARSE_POWER_ALPHA, DEFAULT_ENTROPY_TEMP_GAMMA, DirichletCalibrator,
     combine_and_reconstruct_probabilities, compute_fine_temperature, compute_normalized_entropy,
-    softmax_f64, temperature_scaled_softmax,
+    temperature_scaled_softmax,
 };
 pub use mapping::{HierarchicalMapping, HierarchicalMappingBuilder};
 pub use router::{

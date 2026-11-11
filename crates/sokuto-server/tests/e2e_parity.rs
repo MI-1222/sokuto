@@ -351,7 +351,7 @@ async fn test_e2e_scenario_ec_hardware_defect_details() {
     let defect = actual.answers.get("is_hardware_defect").unwrap();
     let p_defect = defect.as_noul().unwrap();
     assert!((0.0..=1.0).contains(&p_defect));
-    let eff_conf = defect.effective_confidence().unwrap();
+    let eff_conf = defect.effective_confidence();
     assert!(eff_conf > 0.80);
 
     // Usage トークン数が 0 より大きいこと、completion_tokens が 0 であること

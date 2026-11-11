@@ -373,7 +373,7 @@ fn test_answer_payload_type_safety_and_roundtrip() {
     assert_eq!(ans_choice.as_score(), None);
     assert_eq!(ans_choice.as_noul(), None);
     assert_eq!(ans_choice.confidence(), Some(0.85));
-    assert_eq!(ans_choice.effective_confidence(), Some(0.85));
+    assert_eq!(ans_choice.effective_confidence(), 0.85);
     assert_eq!(ans_choice.question_type(), QuestionType::Choice);
 
     // シリアライズ検証: choice, probabilities, confidence のみが出力され、score, noul は出力されないこと。
@@ -410,7 +410,7 @@ fn test_answer_payload_type_safety_and_roundtrip() {
     assert_eq!(ans_score.as_choice(), None);
     assert_eq!(ans_score.as_noul(), None);
     assert_eq!(ans_score.confidence(), Some(0.75));
-    assert_eq!(ans_score.effective_confidence(), Some(0.75));
+    assert_eq!(ans_score.effective_confidence(), 0.75);
     assert_eq!(ans_score.question_type(), QuestionType::Score);
 
     let score_val = serde_json::to_value(&ans_score).unwrap();
@@ -430,7 +430,7 @@ fn test_answer_payload_type_safety_and_roundtrip() {
     assert_eq!(ans_noul.confidence(), None);
 
     // Noul の実効確信度: |2 * 0.92 - 1.0| = 0.84
-    assert!((ans_noul.effective_confidence().unwrap() - 0.84).abs() < 1e-6);
+    assert!((ans_noul.effective_confidence() - 0.84).abs() < 1e-6);
     assert_eq!(ans_noul.question_type(), QuestionType::Noul);
 
     let noul_val = serde_json::to_value(&ans_noul).unwrap();

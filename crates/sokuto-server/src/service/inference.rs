@@ -452,9 +452,7 @@ impl InferenceService {
         record_inference_metrics(inference_duration, question_count);
 
         for answer in answers.values() {
-            if let Some(conf) = answer.effective_confidence() {
-                record_confidence(conf);
-            }
+            record_confidence(answer.effective_confidence());
         }
 
         for (route_str, q_type_str, qid, route, confidence, reason) in route_records {

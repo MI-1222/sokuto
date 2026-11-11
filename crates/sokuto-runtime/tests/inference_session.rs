@@ -231,7 +231,7 @@ fn test_end_to_end_question_inference_and_decision() {
     assert!(noul_answer.is_noul());
     let noul_prob = noul_answer.as_noul().unwrap();
     assert!((0.0..=1.0).contains(&noul_prob));
-    let eff_conf = noul_answer.effective_confidence().unwrap();
+    let eff_conf = noul_answer.effective_confidence();
     assert!((0.0..=1.0).contains(&eff_conf));
 }
 

@@ -405,7 +405,7 @@ impl InProcessDagExecutor {
 
 /// Answer をコンテキスト値に変換する内部ヘルパー。
 fn answer_to_context_value(answer: &Answer) -> NodeContextValue {
-    let conf = answer.effective_confidence().unwrap_or(0.0);
+    let conf = answer.effective_confidence();
     match &answer.payload {
         AnswerPayload::Choice { selected, .. } => NodeContextValue::new(selected.clone(), conf),
         AnswerPayload::Score { value, .. } => NodeContextValue::new(format!("{value}"), conf),
@@ -439,7 +439,7 @@ fn matches_condition(
 
     // 1. confidence フィールドの比較
     if field == "confidence" {
-        let conf = answer.and_then(|a| a.effective_confidence()).unwrap_or(0.0);
+        let conf = answer.map(Answer::effective_confidence).unwrap_or(0.0);
         let target_val = match &cond.value {
             Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0),
             _ => 0.0,

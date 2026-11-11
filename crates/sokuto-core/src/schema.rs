@@ -746,8 +746,8 @@ impl Answer {
     ///
     /// # 戻り値
     /// - 判定結果に対応する 0.0〜1.0 の確信度実数値。
-    pub fn effective_confidence(&self) -> Option<f64> {
-        Some(self.payload.effective_confidence())
+    pub fn effective_confidence(&self) -> f64 {
+        self.payload.effective_confidence()
     }
 
     /// 判定ペイロードへの不変参照を取得する。

@@ -786,7 +786,7 @@ pub fn evaluate_answer_gating_opts(
     energy: Option<f64>,
     generate_prompt: bool,
 ) -> GatingMetadata {
-    let conf = answer.effective_confidence().unwrap_or(0.0).clamp(0.0, 1.0);
+    let conf = answer.effective_confidence().clamp(0.0, 1.0);
 
     // 質問種別の特定(question 定義からの取得、または answer の payload からの導出)。
     let question_type = question
@@ -940,7 +940,7 @@ pub fn evaluate_response_routing(answers: &IndexMap<String, Answer>) -> SystemRo
             Some(DecisionRoute::Fallback) => fallback_count += 1,
             None => {
                 // ゲーティング未適用の場合は実効確信度から簡易分類
-                let conf = answer.effective_confidence().unwrap_or(0.0);
+                let conf = answer.effective_confidence();
                 if conf >= DEFAULT_HIGH_CONFIDENCE_THRESHOLD {
                     auto_execute_count += 1;
                 } else if conf >= DEFAULT_LOW_CONFIDENCE_THRESHOLD {

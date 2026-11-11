@@ -233,13 +233,13 @@ fn test_effective_confidence_for_gating() {
     let mut probs = IndexMap::new();
     probs.insert("opt".to_string(), 1.0);
     let ans_choice = sokuto_core::Answer::choice("opt", probs, 0.92);
-    assert_eq!(ans_choice.effective_confidence(), Some(0.92));
+    assert_eq!(ans_choice.effective_confidence(), 0.92);
 
     // Noul: confidence は None だが、effective_confidence() では |2P - 1| が透過的に得られる
     let ans_noul_high = sokuto_core::Answer::noul(0.95);
     assert!(ans_noul_high.confidence().is_none());
-    assert!((ans_noul_high.effective_confidence().unwrap() - 0.90).abs() < 1e-6);
+    assert!((ans_noul_high.effective_confidence() - 0.90).abs() < 1e-6);
 
     let ans_noul_mid = sokuto_core::Answer::noul(0.50);
-    assert!((ans_noul_mid.effective_confidence().unwrap() - 0.0).abs() < 1e-6);
+    assert!((ans_noul_mid.effective_confidence() - 0.0).abs() < 1e-6);
 }

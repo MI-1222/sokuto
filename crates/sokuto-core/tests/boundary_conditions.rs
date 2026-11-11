@@ -38,7 +38,7 @@ mod distribution_extremes {
 
         let conf = answer.confidence().unwrap();
         assert!((conf - 1.0).abs() < 1e-6);
-        assert_eq!(answer.effective_confidence(), Some(1.0));
+        assert_eq!(answer.effective_confidence(), 1.0);
 
         // 完全アンダーフロー(10000.0)の極限ケース
         let extreme_logits = vec![10000.0, -10000.0, -10000.0];
@@ -75,7 +75,7 @@ mod distribution_extremes {
         let conf = answer.confidence().unwrap();
         assert!(conf < 1e-6);
         assert!((0.0..=1.0).contains(&conf));
-        assert!(answer.effective_confidence().unwrap() < 1e-6);
+        assert!(answer.effective_confidence() < 1e-6);
     }
 
     #[test]
@@ -100,7 +100,7 @@ mod distribution_extremes {
         let ans_bimodal = evaluate_score(&logits_bimodal, &criteria, 1.0).unwrap();
         assert!((ans_bimodal.as_score().unwrap() - 1.5).abs() < 1e-6);
         assert!(ans_bimodal.confidence().unwrap() < 1e-6);
-        assert_eq!(ans_bimodal.effective_confidence(), Some(0.0));
+        assert_eq!(ans_bimodal.effective_confidence(), 0.0);
 
         // 3. 隣接段階分裂: レベル 1 とレベル 2 のみに二分。
         // 分散 Var = 0.25, 確信度 C_var = 1.0 - 0.25 / 2.25 ≈ 0.888889。
@@ -119,17 +119,17 @@ mod distribution_extremes {
         let prob_tie = ans_tie.as_noul().unwrap();
         assert!((prob_tie - 0.5).abs() < 1e-6);
         assert!(ans_tie.confidence().is_none());
-        assert!((ans_tie.effective_confidence().unwrap() - 0.0).abs() < 1e-6);
+        assert!((ans_tie.effective_confidence() - 0.0).abs() < 1e-6);
 
         // 2. 真方向への絶対的確信。
         let ans_true = evaluate_noul(&[100.0, -100.0], 1.0).unwrap();
         assert!((ans_true.as_noul().unwrap() - 1.0).abs() < 1e-6);
-        assert!((ans_true.effective_confidence().unwrap() - 1.0).abs() < 1e-6);
+        assert!((ans_true.effective_confidence() - 1.0).abs() < 1e-6);
 
         // 3. 偽方向への絶対的確信。
         let ans_false = evaluate_noul(&[-100.0, 100.0], 1.0).unwrap();
         assert!((ans_false.as_noul().unwrap() - 0.0).abs() < 1e-6);
-        assert!((ans_false.effective_confidence().unwrap() - 1.0).abs() < 1e-6);
+        assert!((ans_false.effective_confidence() - 1.0).abs() < 1e-6);
     }
 }
 
@@ -466,7 +466,7 @@ mod deterministic_and_contract {
         );
         let ans_choice = evaluate_question(&q_choice, &[10.0, 0.0], &config).unwrap();
         assert_eq!(ans_choice.as_choice(), Some("red"));
-        assert!(ans_choice.effective_confidence().unwrap() > 0.99);
+        assert!(ans_choice.effective_confidence() > 0.99);
 
         // 2. Score
         let q_score = Question::new_score(
@@ -475,12 +475,12 @@ mod deterministic_and_contract {
         );
         let ans_score = evaluate_question(&q_score, &[0.0, 0.0, 10.0], &config).unwrap();
         assert!((ans_score.as_score().unwrap() - 2.0).abs() < 1e-3);
-        assert!(ans_score.effective_confidence().unwrap() > 0.99);
+        assert!(ans_score.effective_confidence() > 0.99);
 
         // 3. Noul
         let q_noul = Question::new_noul("空は青いか？");
         let ans_noul = evaluate_question(&q_noul, &[5.0, 0.0], &config).unwrap();
         assert!(ans_noul.as_noul().unwrap() > 0.99);
-        assert!(ans_noul.effective_confidence().unwrap() > 0.98);
+        assert!(ans_noul.effective_confidence() > 0.98);
     }
 }

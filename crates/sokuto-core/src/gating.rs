@@ -437,6 +437,290 @@ pub fn evaluate_answer_gating_with_energy(
     evaluate_answer_gating_opts(answer, question_id, question, config, energy, true)
 }
 
+/// 確信度ゲーティングにおける判定理由の構造化種別。
+///
+/// ルーティング決定ロジックと監査証跡用メッセージ生成を分離するために使用する。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RoutingReasonKind {
+    /// ハード自由エネルギー閾値超過による OOD 検知。
+    HardEnergyOod { energy: f64, threshold: f64 },
+    /// 緩和自由エネルギー閾値と不確実性の複合条件による OOD 検知。
+    HybridEnergyOod {
+        energy: f64,
+        loose_threshold: f64,
+        conf: f64,
+        min_conf: f64,
+        margin: f64,
+        min_margin: f64,
+    },
+    /// Choice 型の上位 2 候補拮抗によるマージンガード降格。
+    MarginGuardDemoted {
+        entropy_conf: f64,
+        high_threshold: f64,
+        margin: f64,
+        top_margin_threshold: f64,
+    },
+    /// 高確信度による自動実行承認。
+    HighConfidenceAuto { conf: f64, high_threshold: f64 },
+    /// 中確信度による二次検証・確認要求。
+    MediumConfidenceConfirm {
+        conf: f64,
+        low_threshold: f64,
+        high_threshold: f64,
+    },
+    /// 低確信度による安全弁フォールバック。
+    LowConfidenceFallback { conf: f64, low_threshold: f64 },
+}
+
+impl RoutingReasonKind {
+    /// OOD 安全弁によるフォールバック判定であるかどうかを返す。
+    fn is_ood(self) -> bool {
+        matches!(
+            self,
+            Self::HardEnergyOod { .. } | Self::HybridEnergyOod { .. }
+        )
+    }
+
+    /// 判定種別に対応する監査証跡用の説明文を生成する。
+    fn format_reason(self) -> String {
+        match self {
+            Self::HardEnergyOod { energy, threshold } => format!(
+                "正規化自由エネルギー({energy:.3} > {threshold:.3})が閾値を超過したため、未定義カテゴリまたは該当なし(OOD)として安全弁フォールバックを適用しました。"
+            ),
+            Self::HybridEnergyOod {
+                energy,
+                loose_threshold,
+                conf,
+                min_conf,
+                margin,
+                min_margin,
+            } => format!(
+                "正規化自由エネルギー({energy:.3} > {loose_threshold:.3})かつ不確実性(確信度={conf:.3} < {min_conf:.3} または マージン={margin:.3} < {min_margin:.3})の複合条件を満たしたため、該当なし(OOD)として安全弁フォールバックを適用しました。"
+            ),
+            Self::MarginGuardDemoted {
+                entropy_conf,
+                high_threshold,
+                margin,
+                top_margin_threshold,
+            } => format!(
+                "エントロピー確信度({entropy_conf:.3} >= {high_threshold:.3})は高水準ですが、上位2候補の確率差({margin:.3} < {top_margin_threshold:.3})が僅差のため確認要求に降格しました。"
+            ),
+            Self::HighConfidenceAuto {
+                conf,
+                high_threshold,
+            } => format!(
+                "実効確信度({conf:.3} >= {high_threshold:.3})が高水準であるため自動実行が承認されました。"
+            ),
+            Self::MediumConfidenceConfirm {
+                conf,
+                low_threshold,
+                high_threshold,
+            } => format!(
+                "実効確信度({conf:.3})が確認要求境界 [{low_threshold:.3}, {high_threshold:.3}) 内のため二次検証が必要です。"
+            ),
+            Self::LowConfidenceFallback {
+                conf,
+                low_threshold,
+            } => format!(
+                "実効確信度({conf:.3} < {low_threshold:.3})が低水準のため安全弁フォールバックを適用しました。"
+            ),
+        }
+    }
+}
+
+/// 判定結果の確率分布から Top-Margin と分布散らばり指標 (エントロピーまたは正規化分散) を算出する。
+fn compute_margin_and_entropy(answer: &Answer) -> (Option<f64>, Option<f64>) {
+    let margin = match &answer.payload {
+        AnswerPayload::Choice { probabilities, .. } => top_margin_iter(probabilities.values()).ok(),
+        AnswerPayload::Noul { probability } => {
+            let p_true = *probability;
+            let p_false = (1.0 - p_true).clamp(0.0, 1.0);
+            Some((p_true - p_false).abs().clamp(0.0, 1.0))
+        }
+        _ => None,
+    };
+
+    // ゼロアロケーション走査による分布エントロピー・散らばり指標の直接算出。
+    let entropy = match &answer.payload {
+        AnswerPayload::Choice { probabilities, .. } => {
+            normalized_entropy_iter(probabilities.values()).ok()
+        }
+        AnswerPayload::Score { confidence, .. } => {
+            // Score 型の場合、confidence は正規化分散確信度 C_var であるため、散らばり指標として正規化分散 (1 - C_var) を記録する。
+            Some((1.0 - confidence).clamp(0.0, 1.0))
+        }
+        AnswerPayload::Noul { probability } => {
+            // Noul 型の場合、二値確率分布 [p, 1 - p] に対する正規化シャノンエントロピー指標を記録する。
+            let p_true = probability.clamp(0.0, 1.0);
+            let p_false = 1.0 - p_true;
+            normalized_entropy(&[p_true, p_false]).ok()
+        }
+    };
+
+    (margin, entropy)
+}
+
+/// Choice 型に対する Energy-based OOD 安全弁を評価し、該当時はその根拠を返却する。
+fn evaluate_ood_trigger(
+    is_choice: bool,
+    energy: Option<f64>,
+    conf: f64,
+    margin: Option<f64>,
+    thresholds: &GatingThresholds,
+) -> Option<RoutingReasonKind> {
+    if !thresholds.ood_enabled || !is_choice {
+        return None;
+    }
+    let e = energy?;
+
+    if e > thresholds.energy_threshold {
+        return Some(RoutingReasonKind::HardEnergyOod {
+            energy: e,
+            threshold: thresholds.energy_threshold,
+        });
+    }
+
+    if let (Some(loose_th), Some(min_conf), Some(min_margin)) = (
+        thresholds.loose_energy_threshold,
+        thresholds.ood_min_confidence,
+        thresholds.ood_min_margin,
+    ) {
+        let m = margin.unwrap_or(0.0);
+        if e > loose_th && (conf < min_conf || m < min_margin) {
+            return Some(RoutingReasonKind::HybridEnergyOod {
+                energy: e,
+                loose_threshold: loose_th,
+                conf,
+                min_conf,
+                margin: m,
+                min_margin,
+            });
+        }
+    }
+
+    None
+}
+
+/// 確信度・エントロピー・マージン・自由エネルギーに基づき、最終的なルーティングと判定種別を決定する純粋関数。
+fn resolve_routing_decision(
+    is_choice: bool,
+    conf: f64,
+    entropy: Option<f64>,
+    margin: Option<f64>,
+    energy: Option<f64>,
+    thresholds: &GatingThresholds,
+) -> (DecisionRoute, RoutingReasonKind) {
+    // 1. OOD 検知時は最優先で Fallback へ短絡降格する。
+    if let Some(ood_kind) = evaluate_ood_trigger(is_choice, energy, conf, margin, thresholds) {
+        return (DecisionRoute::Fallback, ood_kind);
+    }
+
+    // 2. Choice 型のマージンガード判定:
+    //    純粋な分布平坦度指標であるエントロピー確信度 (1.0 - H_norm) を用いて、
+    //    複合確信度 (S_conf <= Margin) によるデッドコード化を回避する。
+    let entropy_confidence = if is_choice {
+        entropy.map(|h| (1.0 - h).clamp(0.0, 1.0))
+    } else {
+        None
+    };
+    if is_choice
+        && let Some(ent_conf) = entropy_confidence
+        && ent_conf >= thresholds.high_threshold - EPSILON
+        && let Some(m) = margin
+        && m < thresholds.top_margin_threshold - EPSILON
+    {
+        return (
+            DecisionRoute::ConfirmOrEscalate,
+            RoutingReasonKind::MarginGuardDemoted {
+                entropy_conf: ent_conf,
+                high_threshold: thresholds.high_threshold,
+                margin: m,
+                top_margin_threshold: thresholds.top_margin_threshold,
+            },
+        );
+    }
+
+    // 3. 実効確信度に基づく 3 段階ルーティング判定。
+    if conf >= thresholds.high_threshold - EPSILON {
+        return (
+            DecisionRoute::AutoExecute,
+            RoutingReasonKind::HighConfidenceAuto {
+                conf,
+                high_threshold: thresholds.high_threshold,
+            },
+        );
+    }
+
+    if conf >= thresholds.low_threshold - EPSILON {
+        return (
+            DecisionRoute::ConfirmOrEscalate,
+            RoutingReasonKind::MediumConfidenceConfirm {
+                conf,
+                low_threshold: thresholds.low_threshold,
+                high_threshold: thresholds.high_threshold,
+            },
+        );
+    }
+
+    (
+        DecisionRoute::Fallback,
+        RoutingReasonKind::LowConfidenceFallback {
+            conf,
+            low_threshold: thresholds.low_threshold,
+        },
+    )
+}
+
+/// エスカレーション時 (`AutoExecute` 以外) に上位候補と任意のプロンプト案を構築する。
+fn build_escalation_context(
+    answer: &Answer,
+    question_id: Option<&str>,
+    question: Option<&Question>,
+    margin: Option<f64>,
+    reason: &str,
+    generate_prompt: bool,
+) -> EscalationContext {
+    let top_candidates = match &answer.payload {
+        AnswerPayload::Choice { probabilities, .. }
+        | AnswerPayload::Score { probabilities, .. } => extract_top3_candidates(probabilities),
+        AnswerPayload::Noul { probability } => {
+            let p_true = *probability;
+            let p_false = (1.0 - p_true).clamp(0.0, 1.0);
+            let true_cand = CandidateProbability {
+                candidate: "true".to_string(),
+                probability: p_true,
+            };
+            let false_cand = CandidateProbability {
+                candidate: "false".to_string(),
+                probability: p_false,
+            };
+            if p_true >= p_false {
+                vec![true_cand, false_cand]
+            } else {
+                vec![false_cand, true_cand]
+            }
+        }
+    };
+
+    let prompt_template = if generate_prompt {
+        Some(build_escalation_prompt(
+            question_id,
+            question,
+            &top_candidates,
+            margin,
+        ))
+    } else {
+        None
+    };
+
+    EscalationContext {
+        top_candidates,
+        margin,
+        uncertainty_reason: reason.to_string(),
+        prompt_template,
+    }
+}
+
 /// 単一の `Answer` に対し、自由エネルギー情報およびプロンプト生成要否を指定して確信度ゲーティング評価を実施する。
 ///
 /// # 概要
@@ -470,193 +754,26 @@ pub fn evaluate_answer_gating_opts(
     let question_type = question
         .map(|q| q.question_type)
         .unwrap_or_else(|| answer.question_type());
-
     let is_choice = question_type == QuestionType::Choice;
 
-    let margin = match &answer.payload {
-        AnswerPayload::Choice { probabilities, .. } => top_margin_iter(probabilities.values()).ok(),
-        AnswerPayload::Noul { probability } => {
-            let p_true = *probability;
-            let p_false = (1.0 - p_true).clamp(0.0, 1.0);
-            Some((p_true - p_false).abs().clamp(0.0, 1.0))
-        }
-        _ => None,
-    };
+    let (margin, entropy) = compute_margin_and_entropy(answer);
 
-    // ゼロアロケーション走査による分布エントロピー・散らばり指標の直接算出。
-    let entropy = match &answer.payload {
-        AnswerPayload::Choice { probabilities, .. } => {
-            normalized_entropy_iter(probabilities.values()).ok()
-        }
-        AnswerPayload::Score { confidence, .. } => {
-            // Score 型の場合、confidence は正規化分散確信度 C_var であるため、散らばり指標として正規化分散 (1 - C_var) を記録する。
-            Some((1.0 - confidence).clamp(0.0, 1.0))
-        }
-        AnswerPayload::Noul { probability } => {
-            // Noul 型の場合、二値確率分布 [p, 1 - p] に対する正規化シャノンエントロピー指標を記録する。
-            let p_true = probability.clamp(0.0, 1.0);
-            let p_false = 1.0 - p_true;
-            normalized_entropy(&[p_true, p_false]).ok()
-        }
-    };
-
-    let thresholds = &config.thresholds;
-
-    let (is_ood, ood_reason) = if thresholds.ood_enabled && is_choice {
-        if let Some(e) = energy {
-            let is_hard_energy_ood = e > thresholds.energy_threshold;
-            let is_hybrid_ood = if let (Some(loose_th), Some(min_conf), Some(min_margin)) = (
-                thresholds.loose_energy_threshold,
-                thresholds.ood_min_confidence,
-                thresholds.ood_min_margin,
-            ) {
-                let m = margin.unwrap_or(0.0);
-                e > loose_th && (conf < min_conf || m < min_margin)
-            } else {
-                false
-            };
-
-            if is_hard_energy_ood {
-                (
-                    true,
-                    Some(format!(
-                        "正規化自由エネルギー({:.3} > {:.3})が閾値を超過したため、未定義カテゴリまたは該当なし(OOD)として安全弁フォールバックを適用しました。",
-                        e, thresholds.energy_threshold
-                    )),
-                )
-            } else if is_hybrid_ood {
-                let m = margin.unwrap_or(0.0);
-                (
-                    true,
-                    Some(format!(
-                        "正規化自由エネルギー({:.3} > {:.3})かつ不確実性(確信度={:.3} < {:.3} または マージン={:.3} < {:.3})の複合条件を満たしたため、該当なし(OOD)として安全弁フォールバックを適用しました。",
-                        e,
-                        thresholds.loose_energy_threshold.unwrap(),
-                        conf,
-                        thresholds.ood_min_confidence.unwrap(),
-                        m,
-                        thresholds.ood_min_margin.unwrap()
-                    )),
-                )
-            } else {
-                (false, None)
-            }
-        } else {
-            (false, None)
-        }
-    } else {
-        (false, None)
-    };
-
-    // 閾値判定とマージンガード (OOD 検知時は最優先で Fallback へ短絡降格)。
-    // Choice 型の場合、純粋な分布平坦度指標であるエントロピー確信度 (1.0 - H_norm) を算出し、
-    // 複合確信度 (S_conf <= Margin) によるデッドコード化を回避してマージンガードを判定する。
-    let entropy_confidence = if is_choice {
-        entropy.map(|h| (1.0 - h).clamp(0.0, 1.0))
-    } else {
-        None
-    };
-
-    let (route, reason) = if is_ood {
-        (
-            DecisionRoute::Fallback,
-            ood_reason.unwrap_or_else(|| {
-                "OOD 安全弁回路が作動したため安全弁フォールバックを適用しました。".to_string()
-            }),
-        )
-    } else if is_choice
-        && entropy_confidence.unwrap_or(0.0) >= thresholds.high_threshold - EPSILON
-        && margin.unwrap_or(1.0) < thresholds.top_margin_threshold - EPSILON
-    {
-        let ent_conf = entropy_confidence.unwrap_or(0.0);
-        let m = margin.unwrap_or(0.0);
-        (
-            DecisionRoute::ConfirmOrEscalate,
-            format!(
-                "エントロピー確信度({:.3} >= {:.3})は高水準ですが、上位2候補の確率差({:.3} < {:.3})が僅差のため確認要求に降格しました。",
-                ent_conf, thresholds.high_threshold, m, thresholds.top_margin_threshold
-            ),
-        )
-    } else if conf >= thresholds.high_threshold - EPSILON {
-        (
-            DecisionRoute::AutoExecute,
-            format!(
-                "実効確信度({:.3} >= {:.3})が高水準であるため自動実行が承認されました。",
-                conf, thresholds.high_threshold
-            ),
-        )
-    } else if conf >= thresholds.low_threshold - EPSILON {
-        (
-            DecisionRoute::ConfirmOrEscalate,
-            format!(
-                "実効確信度({:.3})が確認要求境界 [{:.3}, {:.3}) 内のため二次検証が必要です。",
-                conf, thresholds.low_threshold, thresholds.high_threshold
-            ),
-        )
-    } else {
-        (
-            DecisionRoute::Fallback,
-            format!(
-                "実効確信度({:.3} < {:.3})が低水準のため安全弁フォールバックを適用しました。",
-                conf, thresholds.low_threshold
-            ),
-        )
-    };
+    let (route, reason_kind) =
+        resolve_routing_decision(is_choice, conf, entropy, margin, energy, &config.thresholds);
+    let is_ood = reason_kind.is_ood();
+    let reason = reason_kind.format_reason();
 
     // エスカレーションコンテキストの遅延生成 (ConfirmOrEscalate または Fallback 時のみアロケーションを実行)。
-    let escalation = if route != DecisionRoute::AutoExecute {
-        let top_candidates = match &answer.payload {
-            AnswerPayload::Choice { probabilities, .. }
-            | AnswerPayload::Score { probabilities, .. } => extract_top3_candidates(probabilities),
-            AnswerPayload::Noul { probability } => {
-                let p_true = *probability;
-                let p_false = (1.0 - p_true).clamp(0.0, 1.0);
-                if p_true >= p_false {
-                    vec![
-                        CandidateProbability {
-                            candidate: "true".to_string(),
-                            probability: p_true,
-                        },
-                        CandidateProbability {
-                            candidate: "false".to_string(),
-                            probability: p_false,
-                        },
-                    ]
-                } else {
-                    vec![
-                        CandidateProbability {
-                            candidate: "false".to_string(),
-                            probability: p_false,
-                        },
-                        CandidateProbability {
-                            candidate: "true".to_string(),
-                            probability: p_true,
-                        },
-                    ]
-                }
-            }
-        };
-
-        let prompt_template = if generate_prompt {
-            Some(build_escalation_prompt(
-                question_id,
-                question,
-                &top_candidates,
-                margin,
-            ))
-        } else {
-            None
-        };
-
-        Some(EscalationContext {
-            top_candidates,
+    let escalation = (route != DecisionRoute::AutoExecute).then(|| {
+        build_escalation_context(
+            answer,
+            question_id,
+            question,
             margin,
-            uncertainty_reason: reason.clone(),
-            prompt_template,
-        })
-    } else {
-        None
-    };
+            &reason,
+            generate_prompt,
+        )
+    });
 
     GatingMetadata {
         route,
@@ -1265,5 +1382,48 @@ mod tests {
         assert_eq!(res_asc[0].candidate, "p4");
         assert_eq!(res_asc[1].candidate, "p3");
         assert_eq!(res_asc[2].candidate, "p2");
+    }
+
+    #[test]
+    fn test_evaluate_answer_gating_hybrid_ood_trigger() {
+        let mut probs = IndexMap::new();
+        probs.insert("opt_a".to_string(), 0.70);
+        probs.insert("opt_b".to_string(), 0.30);
+        // conf=0.60 (< 0.65), margin=0.40 (>= 0.20)
+        let answer = Answer::choice("opt_a", probs, 0.60);
+
+        let config = GatingConfig {
+            thresholds: GatingThresholds {
+                energy_threshold: -1.0,
+                loose_energy_threshold: Some(-2.5),
+                ood_min_confidence: Some(0.65),
+                ood_min_margin: Some(0.20),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // energy = -2.0 (> -2.5 かつ <= -1.0) で conf < 0.65 のためハイブリッド OOD が発動する。
+        let meta_ood = evaluate_answer_gating_with_energy(
+            &answer,
+            Some("q_hybrid"),
+            None,
+            &config,
+            Some(-2.0),
+        );
+        assert_eq!(meta_ood.route, DecisionRoute::Fallback);
+        assert!(meta_ood.is_ood);
+        assert!(meta_ood.reason.contains("複合条件"));
+
+        // energy = -3.0 (<= -2.5) の場合は OOD にならず通常の確信度判定 (ConfirmOrEscalate) となる。
+        let meta_id = evaluate_answer_gating_with_energy(
+            &answer,
+            Some("q_hybrid"),
+            None,
+            &config,
+            Some(-3.0),
+        );
+        assert_eq!(meta_id.route, DecisionRoute::ConfirmOrEscalate);
+        assert!(!meta_id.is_ood);
     }
 }

@@ -189,33 +189,19 @@ impl InferenceEngine {
 
         let mut answers = IndexMap::with_capacity(batch.dims.batch_size);
         let mut probs_buf = vec![0.0f64; batch.dims.num_options];
-        let num_options = batch.dims.num_options;
-
-        for (i, q_key) in batch.question_keys.iter().enumerate() {
-            let k_i = batch.candidate_counts[i];
-            let start_idx = i * num_options;
-            let valid_logits = &flat_logits[start_idx..start_idx + k_i];
-            let question = questions.get(q_key).expect("キーの一致が保証されている。");
-
-            let mut answer = evaluate_question_with_buf(
-                question,
-                valid_logits,
-                calib_config,
-                &mut probs_buf[..k_i],
-                Some(q_key.as_str()),
-            )?;
-            let energy = calculate_choice_energy(question, valid_logits, calib_config);
-            apply_gating_to_answer_with_energy(
-                &mut answer,
-                energy,
-                Some(state),
-                Some(q_key),
-                Some(question),
-                gating_config,
-                calib_config,
-            );
-            answers.insert(q_key.clone(), answer);
-        }
+        let ctx = BatchEvalContext {
+            state,
+            calib_config,
+            gating_config,
+        };
+        resolve_batch_answers(
+            &ctx,
+            &batch,
+            questions,
+            &flat_logits,
+            &mut probs_buf,
+            &mut answers,
+        )?;
 
         Ok(answers)
     }
@@ -275,32 +261,19 @@ impl InferenceEngine {
         self.forward_batch_tokenized_into(&batch, &mut scratchpad.flat_logits[..total_logits])?;
 
         let mut answers = IndexMap::with_capacity(batch.dims.batch_size);
-
-        for (i, q_key) in batch.question_keys.iter().enumerate() {
-            let k_i = batch.candidate_counts[i];
-            let start_idx = i * num_options;
-            let valid_logits = &scratchpad.flat_logits[start_idx..start_idx + k_i];
-            let question = questions.get(q_key).expect("キーの一致が保証されている。");
-
-            let mut answer = evaluate_question_with_buf(
-                question,
-                valid_logits,
-                calib_config,
-                &mut scratchpad.probs_buf[..k_i],
-                Some(q_key.as_str()),
-            )?;
-            let energy = calculate_choice_energy(question, valid_logits, calib_config);
-            apply_gating_to_answer_with_energy(
-                &mut answer,
-                energy,
-                Some(state),
-                Some(q_key),
-                Some(question),
-                gating_config,
-                calib_config,
-            );
-            answers.insert(q_key.clone(), answer);
-        }
+        let ctx = BatchEvalContext {
+            state,
+            calib_config,
+            gating_config,
+        };
+        resolve_batch_answers(
+            &ctx,
+            &batch,
+            questions,
+            &scratchpad.flat_logits[..total_logits],
+            &mut scratchpad.probs_buf,
+            &mut answers,
+        )?;
 
         Ok(answers)
     }
@@ -408,6 +381,11 @@ impl InferenceEngine {
 
         let state_ids = tokenizer.encode_state(state)?;
         let mut answers = IndexMap::with_capacity(questions.len());
+        let ctx = BatchEvalContext {
+            state,
+            calib_config,
+            gating_config,
+        };
 
         for chunk_slice in questions.iter().collect::<Vec<_>>().chunks(chunk_size) {
             let mut sub_questions = IndexMap::with_capacity(chunk_slice.len());
@@ -426,35 +404,14 @@ impl InferenceEngine {
             self.forward_batch_tokenized_into(&batch, &mut flat_logits)?;
 
             let mut probs_buf = vec![0.0f64; batch.dims.num_options];
-            let num_options = batch.dims.num_options;
-
-            for (i, q_key) in batch.question_keys.iter().enumerate() {
-                let k_i = batch.candidate_counts[i];
-                let start_idx = i * num_options;
-                let valid_logits = &flat_logits[start_idx..start_idx + k_i];
-                let question = sub_questions
-                    .get(q_key)
-                    .expect("キーの一致が保証されている。");
-
-                let mut answer = evaluate_question_with_buf(
-                    question,
-                    valid_logits,
-                    calib_config,
-                    &mut probs_buf[..k_i],
-                    Some(q_key.as_str()),
-                )?;
-                let energy = calculate_choice_energy(question, valid_logits, calib_config);
-                apply_gating_to_answer_with_energy(
-                    &mut answer,
-                    energy,
-                    Some(state),
-                    Some(q_key),
-                    Some(question),
-                    gating_config,
-                    calib_config,
-                );
-                answers.insert(q_key.clone(), answer);
-            }
+            resolve_batch_answers(
+                &ctx,
+                &batch,
+                &sub_questions,
+                &flat_logits,
+                &mut probs_buf,
+                &mut answers,
+            )?;
         }
 
         Ok(answers)
@@ -687,6 +644,11 @@ impl InferenceEngine {
         let mut answers = IndexMap::with_capacity(questions.len());
         let mut coarse_energies: IndexMap<String, Option<f64>> =
             IndexMap::with_capacity(original_keys_map.len());
+        let ctx = BatchEvalContext {
+            state,
+            calib_config,
+            gating_config,
+        };
 
         // 3. マイクロバッチ分割逐次推論
         for chunk_slice in processed_questions
@@ -720,31 +682,27 @@ impl InferenceEngine {
                     .get(q_key)
                     .expect("キーの一致が保証されている。");
 
-                let mut answer = evaluate_question_with_buf(
-                    question,
-                    valid_logits,
-                    calib_config,
-                    &mut probs_buf[..k_i],
-                    Some(q_key.as_str()),
-                )?;
-
-                let energy = calculate_choice_energy(question, valid_logits, calib_config);
-
-                // 縮小されていない質問にはここでゲーティングを適用
-                if !original_keys_map.contains_key(q_key) {
-                    let orig_q = questions.get(q_key);
-                    apply_gating_to_answer_with_energy(
-                        &mut answer,
-                        energy,
-                        Some(state),
-                        Some(q_key),
+                let answer = if !original_keys_map.contains_key(q_key) {
+                    let orig_q = questions.get(q_key).unwrap_or(question);
+                    resolve_and_gate_answer(
+                        &ctx,
+                        q_key,
                         orig_q,
-                        gating_config,
-                        calib_config,
-                    );
+                        valid_logits,
+                        &mut probs_buf[..k_i],
+                    )?
                 } else {
+                    let answer = evaluate_question_with_buf(
+                        question,
+                        valid_logits,
+                        calib_config,
+                        &mut probs_buf[..k_i],
+                        Some(q_key.as_str()),
+                    )?;
+                    let energy = calculate_choice_energy(question, valid_logits, calib_config);
                     coarse_energies.insert(q_key.clone(), energy);
-                }
+                    answer
+                };
                 answers.insert(q_key.clone(), answer);
             }
         }
@@ -873,5 +831,189 @@ impl InferenceEngine {
         }
 
         Ok(results)
+    }
+}
+
+/// バッチ推論結果の決定解決およびゲーティング適用に必要な共通コンテキスト。
+struct BatchEvalContext<'a> {
+    state: &'a str,
+    calib_config: &'a CalibrationConfig,
+    gating_config: Option<&'a GatingConfig>,
+}
+
+/// 単一質問の有効ロジットから決定プリミティブを解決し、エネルギー算出とゲーティングを適用する。
+///
+/// # 引数
+/// - `ctx`: 状態テキスト・較正設定・ゲーティング設定を保持する評価コンテキスト。
+/// - `q_key`: 質問識別子キー。
+/// - `question`: 決定解決およびエスカレーションプロンプト生成に用いる質問定義。
+/// - `valid_logits`: 該当質問の有効候補数 $K_i$ に切り出された生ロジット列。
+/// - `probs_buf`: Softmax 確率分布計算用の一時バッファ (`valid_logits` と同長)。
+fn resolve_and_gate_answer(
+    ctx: &BatchEvalContext<'_>,
+    q_key: &str,
+    question: &Question,
+    valid_logits: &[f64],
+    probs_buf: &mut [f64],
+) -> Result<Answer> {
+    let mut answer = evaluate_question_with_buf(
+        question,
+        valid_logits,
+        ctx.calib_config,
+        probs_buf,
+        Some(q_key),
+    )?;
+    let energy = calculate_choice_energy(question, valid_logits, ctx.calib_config);
+    apply_gating_to_answer_with_energy(
+        &mut answer,
+        energy,
+        Some(ctx.state),
+        Some(q_key),
+        Some(question),
+        ctx.gating_config,
+        ctx.calib_config,
+    );
+    Ok(answer)
+}
+
+/// トークナイズ済みバッチの全質問に対して決定解決とゲーティングを適用し、結果マップに格納する。
+///
+/// # 引数
+/// - `ctx`: 状態テキスト・較正設定・ゲーティング設定を保持する評価コンテキスト。
+/// - `batch`: バッチ次元・質問キー順・候補数を保持するトークナイズ済みバッチ。
+/// - `questions`: 質問識別子から質問定義を引くマップ。
+/// - `flat_logits`: 平坦化されたバッチ生ロジット列 (`batch_size * num_options`)。
+/// - `probs_buf`: バッチ内の最大候補数以上の作業バッファ。
+/// - `answers`: 解決済み `Answer` を格納する出力マップ。
+fn resolve_batch_answers(
+    ctx: &BatchEvalContext<'_>,
+    batch: &BatchTokenizedQuestions,
+    questions: &IndexMap<String, Question>,
+    flat_logits: &[f64],
+    probs_buf: &mut [f64],
+    answers: &mut IndexMap<String, Answer>,
+) -> Result<()> {
+    let num_options = batch.dims.num_options;
+    for (i, q_key) in batch.question_keys.iter().enumerate() {
+        let k_i = batch.candidate_counts[i];
+        let start_idx = i * num_options;
+        let valid_logits = &flat_logits[start_idx..start_idx + k_i];
+        let question = questions.get(q_key).expect("キーの一致が保証されている。");
+        let answer =
+            resolve_and_gate_answer(ctx, q_key, question, valid_logits, &mut probs_buf[..k_i])?;
+        answers.insert(q_key.clone(), answer);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sokuto_core::contract::model_spec::ModelInputDimensions;
+    use sokuto_core::gating::DecisionRoute;
+
+    #[test]
+    fn test_resolve_and_gate_answer_choice_and_noul() {
+        let calib_config = CalibrationConfig::default();
+        let gating_config = GatingConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let ctx = BatchEvalContext {
+            state: "テスト用入力テキスト",
+            calib_config: &calib_config,
+            gating_config: Some(&gating_config),
+        };
+
+        // 僅差の Choice ロジットは ConfirmOrEscalate と EscalationContext を付与する
+        let mut criteria = IndexMap::new();
+        criteria.insert("a".to_string(), "候補A".to_string());
+        criteria.insert("b".to_string(), "候補B".to_string());
+        let q_choice = Question::new_choice("選択せよ", criteria);
+        let mut probs_buf = [0.0f64; 2];
+        let ans_choice =
+            resolve_and_gate_answer(&ctx, "q_choice", &q_choice, &[0.2, 0.1], &mut probs_buf)
+                .unwrap();
+
+        assert_eq!(ans_choice.as_choice(), Some("a"));
+        let gating = ans_choice.gating.as_ref().unwrap();
+        assert_ne!(gating.route, DecisionRoute::AutoExecute);
+        assert!(gating.escalation.is_some());
+        assert!(gating.energy.is_some());
+
+        // 強い正の Noul ロジットは AutoExecute となる
+        let q_noul = Question::new_noul("有効か?");
+        let mut noul_buf = [0.0f64; 2];
+        let ans_noul =
+            resolve_and_gate_answer(&ctx, "q_noul", &q_noul, &[6.0, 0.0], &mut noul_buf).unwrap();
+        assert_eq!(ans_noul.as_noul().map(|p| p > 0.99), Some(true));
+        let noul_gating = ans_noul.gating.as_ref().unwrap();
+        assert_eq!(noul_gating.route, DecisionRoute::AutoExecute);
+    }
+
+    #[test]
+    fn test_resolve_batch_answers_slices_padded_logits() {
+        let calib_config = CalibrationConfig::default();
+        let gating_config = GatingConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let ctx = BatchEvalContext {
+            state: "バッチ文脈",
+            calib_config: &calib_config,
+            gating_config: Some(&gating_config),
+        };
+
+        let mut criteria = IndexMap::new();
+        criteria.insert("x".to_string(), "選択肢X".to_string());
+        criteria.insert("y".to_string(), "選択肢Y".to_string());
+        criteria.insert("z".to_string(), "選択肢Z".to_string());
+
+        let mut questions = IndexMap::new();
+        questions.insert("q1".to_string(), Question::new_choice("どれ?", criteria));
+        questions.insert("q2".to_string(), Question::new_noul("正しいか?"));
+
+        let batch = BatchTokenizedQuestions {
+            input_ids: vec![],
+            attention_mask: vec![],
+            op_indices: vec![],
+            dims: ModelInputDimensions {
+                batch_size: 2,
+                sequence_length: 1,
+                num_options: 3,
+            },
+            question_keys: vec!["q1".to_string(), "q2".to_string()],
+            candidate_counts: vec![3, 2],
+            option_keys_per_q: vec![
+                vec!["x".to_string(), "y".to_string(), "z".to_string()],
+                vec!["true".to_string(), "false".to_string()],
+            ],
+        };
+
+        // q2 のパディングスロット (+100.0) は candidate_counts = 2 により無視されるべき
+        let flat_logits = vec![-1.0, 5.0, 0.0, 0.0, 6.0, 100.0];
+        let mut probs_buf = vec![0.0f64; batch.dims.num_options];
+        let mut answers = IndexMap::new();
+
+        resolve_batch_answers(
+            &ctx,
+            &batch,
+            &questions,
+            &flat_logits,
+            &mut probs_buf,
+            &mut answers,
+        )
+        .unwrap();
+
+        assert_eq!(answers.len(), 2);
+        assert_eq!(answers.get("q1").and_then(|a| a.as_choice()), Some("y"));
+        assert!(answers.get("q1").and_then(|a| a.gating.as_ref()).is_some());
+        assert_eq!(
+            answers
+                .get("q2")
+                .and_then(|a| a.as_noul())
+                .map(|p| p < 0.05),
+            Some(true)
+        );
     }
 }

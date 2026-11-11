@@ -49,10 +49,7 @@ fn evaluate_choice_map_with_buf(
         .expect("best_idx は 0..k の範囲内であることが保証されている。");
 
     // 候補識別子と確率値のマッピング構築。
-    let mut probabilities = IndexMap::with_capacity(k);
-    for (key, prob) in map.keys().zip(probs_buf.iter().copied()) {
-        probabilities.insert(key.clone(), prob);
-    }
+    let probabilities = map.keys().cloned().zip(probs_buf.iter().copied()).collect();
 
     Ok(Answer::choice(
         selected_key.clone(),
@@ -136,16 +133,19 @@ fn evaluate_score_list_with_buf(
         .enumerate()
         .all(|(i, label)| !label.is_empty() && list[i + 1..].iter().all(|other| label != other));
 
-    let mut probabilities = IndexMap::with_capacity(m);
-    if is_unique_and_non_empty {
-        for (label, prob) in list.iter().zip(probs_buf.iter().copied()) {
-            probabilities.insert(label.clone(), prob);
-        }
+    let probabilities = if is_unique_and_non_empty {
+        list.iter()
+            .cloned()
+            .zip(probs_buf.iter().copied())
+            .collect()
     } else {
-        for (k, prob) in probs_buf.iter().copied().enumerate() {
-            probabilities.insert(k.to_string(), prob);
-        }
-    }
+        probs_buf
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(k, prob)| (k.to_string(), prob))
+            .collect()
+    };
 
     Ok(Answer::score(score_val, probabilities, confidence))
 }

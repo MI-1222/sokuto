@@ -6,9 +6,6 @@
 use indexmap::IndexMap;
 
 use crate::contract::CalibrationConfig;
-use crate::contract::model_spec::{
-    MAX_NUM_OPTIONS, MAX_SCORE_LEVELS, MIN_NUM_OPTIONS, MIN_SCORE_LEVELS,
-};
 use crate::error::{CoreError, Result};
 use crate::math::{
     argmax, composite_confidence, normalized_variance_confidence_from_variance, noul_probability,
@@ -24,43 +21,15 @@ fn attach_question_id<T>(res: Result<T>, question_id: Option<&str>) -> Result<T>
     }
 }
 
-/// 作業用バッファを活用し、Choice プリミティブの生ロジットから採択候補、確率分布、および複合確信度を算出する。
-///
-/// # 概要
-/// - 呼び出し側から作業用バッファスライス (`probs_buf`) を受け取ることで、推論バッチ処理における
-///   メモリヒープ確保を最小化する。
-/// - 候補キーの順序付きマップ (`Criteria::Map`) とロジット列を 1 対 1 で結合する。
-/// - 候補数 $K=1$ の特異点では、[`softmax_into`] および [`composite_confidence`] の特異点処理により確率 1.0・確信度 1.0 が算出される。
-/// - 最大確率を与える候補の採択には決定論的タイブレーク規則が適用され、同率最大時は先頭インデックスが採択される。
-/// - 確信度には、候補数 $K$ に非依存な正規化エントロピーと Top-Margin を統合した
-///   複合確信度スコア $S_{\text{confidence}} = (1.0 - H_{\text{norm}}) \times M(p)$ を採用する。
-///
-/// # 引数
-/// - `logits`: 未正規化の生ロジットスライス(`f64`)。
-/// - `criteria`: 候補識別子と説明文のマップを保持する評価基準。
-/// - `temperature`: 適用する較正温度パラメータ $\tau$。
-/// - `probs_buf`: 確率分布書き込み用の作業バッファスライス(`logits` と同長が必要)。
-/// - `question_id`: 質問識別子 (任意)。エラー発生時に診断メッセージへ反映される。
-///
-/// # 戻り値
-/// - 成功時は Choice 判定が格納された `Answer`、入力不正時は `CoreError`。
-pub fn evaluate_choice_with_buf(
+/// 検証済みの候補マップ (`map`) を用いて Choice プリミティブの生ロジットから判定結果を算出する内部ヘルパー。
+fn evaluate_choice_map_with_buf(
     logits: &[f64],
-    criteria: &Criteria,
+    map: &IndexMap<String, String>,
     temperature: f64,
     probs_buf: &mut [f64],
     question_id: Option<&str>,
 ) -> Result<Answer> {
-    let map = criteria.as_map_or_err(QuestionType::Choice, question_id)?;
-
     let k = map.len();
-    if !(MIN_NUM_OPTIONS..=MAX_NUM_OPTIONS).contains(&k) {
-        return Err(CoreError::InvalidChoiceCount {
-            question_id: question_id.map(str::to_string),
-            count: k,
-        });
-    }
-
     if logits.len() != k {
         return Err(CoreError::MathError {
             question_id: question_id.map(str::to_string),
@@ -107,6 +76,37 @@ pub fn evaluate_choice_with_buf(
     ))
 }
 
+/// 作業用バッファを活用し、Choice プリミティブの生ロジットから採択候補、確率分布、および複合確信度を算出する。
+///
+/// # 概要
+/// - 呼び出し側から作業用バッファスライス (`probs_buf`) を受け取ることで、推論バッチ処理における
+///   メモリヒープ確保を最小化する。
+/// - 候補キーの順序付きマップ (`Criteria::Map`) とロジット列を 1 対 1 で結合する。
+/// - 候補数 $K=1$ の特異点では、[`softmax_into`] および [`composite_confidence`] の特異点処理により確率 1.0・確信度 1.0 が算出される。
+/// - 最大確率を与える候補の採択には決定論的タイブレーク規則が適用され、同率最大時は先頭インデックスが採択される。
+/// - 確信度には、候補数 $K$ に非依存な正規化エントロピーと Top-Margin を統合した
+///   複合確信度スコア $S_{\text{confidence}} = (1.0 - H_{\text{norm}}) \times M(p)$ を採用する。
+///
+/// # 引数
+/// - `logits`: 未正規化の生ロジットスライス(`f64`)。
+/// - `criteria`: 候補識別子と説明文のマップを保持する評価基準。
+/// - `temperature`: 適用する較正温度パラメータ $\tau$。
+/// - `probs_buf`: 確率分布書き込み用の作業バッファスライス(`logits` と同長が必要)。
+/// - `question_id`: 質問識別子 (任意)。エラー発生時に診断メッセージへ反映される。
+///
+/// # 戻り値
+/// - 成功時は Choice 判定が格納された `Answer`、入力不正時は `CoreError`。
+pub fn evaluate_choice_with_buf(
+    logits: &[f64],
+    criteria: &Criteria,
+    temperature: f64,
+    probs_buf: &mut [f64],
+    question_id: Option<&str>,
+) -> Result<Answer> {
+    let map = criteria.validate_choice_map(question_id)?;
+    evaluate_choice_map_with_buf(logits, map, temperature, probs_buf, question_id)
+}
+
 /// Choice プリミティブの生ロジットから採択候補、確率分布、および正規化確信度を算出する。
 ///
 /// # 概要
@@ -116,45 +116,15 @@ pub fn evaluate_choice(logits: &[f64], criteria: &Criteria, temperature: f64) ->
     evaluate_choice_with_buf(logits, criteria, temperature, &mut probs_buf, None)
 }
 
-/// 作業用バッファを活用し、Score プリミティブの生ロジットから加重平均スコア実数値、確率分布、および分散確信度を算出する。
-///
-/// # 概要
-/// - 呼び出し側から作業用バッファスライス (`probs_buf`) を受け取ることでヒープ確保を最小化する。
-/// - 順序尺度評価配列 (`Criteria::List`) とロジット列を結合し、$M \in [2, 10]$ 段階の評価を行う。
-/// - 加重平均期待値 $\hat{s} = \sum_{k=0}^{M-1} k \cdot p_k$ を連続値スコアとして算出する。
-/// - 確信度には順序尺度のバイモーダル(両極端割れ)と低分散(隣接割れ)を適切に分離する
-///   正規化分散確信度 $C_{\text{var}} = 1.0 - \frac{4 \cdot \text{Var}\[S\]}{(M-1)^2}$ を採用する。
-/// - 確率マップのキーには、評価段階ラベルに重複がない場合はそのラベル名を用い、
-///   重複または空文字が存在する場合はインデックス文字列 (`"0"`, `"1"`, ...) を用いる。
-///   $M \le 10$ であるため、重複検査はヒープ確保を行わずにスタック上の二重走査で実施する。
-/// - 同一確率バッファに対する加重平均期待値と事後分散の算出は [`score_moments_iter`] による単一パス走査に集約し、二重走査を排除する。
-///
-/// # 引数
-/// - `logits`: 未正規化の生ロジットスライス(`f64`)。
-/// - `criteria`: 順序付けられた評価段階基準の配列。
-/// - `temperature`: 適用する較正温度パラメータ $\tau$。
-/// - `probs_buf`: 確率分布書き込み用の作業バッファスライス(`logits` と同長が必要)。
-/// - `question_id`: 質問識別子 (任意)。エラー発生時に診断メッセージへ反映される。
-///
-/// # 戻り値
-/// - 成功時は Score 判定が格納された `Answer`、入力不正時は `CoreError`。
-pub fn evaluate_score_with_buf(
+/// 検証済みの段階配列 (`list`) を用いて Score プリミティブの生ロジットから判定結果を算出する内部ヘルパー。
+fn evaluate_score_list_with_buf(
     logits: &[f64],
-    criteria: &Criteria,
+    list: &[String],
     temperature: f64,
     probs_buf: &mut [f64],
     question_id: Option<&str>,
 ) -> Result<Answer> {
-    let list = criteria.as_list_or_err(QuestionType::Score, question_id)?;
-
     let m = list.len();
-    if !(MIN_SCORE_LEVELS..=MAX_SCORE_LEVELS).contains(&m) {
-        return Err(CoreError::InvalidScoreLevelCount {
-            question_id: question_id.map(str::to_string),
-            count: m,
-        });
-    }
-
     if logits.len() != m {
         return Err(CoreError::MathError {
             question_id: question_id.map(str::to_string),
@@ -203,6 +173,39 @@ pub fn evaluate_score_with_buf(
     }
 
     Ok(Answer::score(score_val, probabilities, confidence))
+}
+
+/// 作業用バッファを活用し、Score プリミティブの生ロジットから加重平均スコア実数値、確率分布、および分散確信度を算出する。
+///
+/// # 概要
+/// - 呼び出し側から作業用バッファスライス (`probs_buf`) を受け取ることでヒープ確保を最小化する。
+/// - 順序尺度評価配列 (`Criteria::List`) とロジット列を結合し、$M \in [2, 10]$ 段階の評価を行う。
+/// - 加重平均期待値 $\hat{s} = \sum_{k=0}^{M-1} k \cdot p_k$ を連続値スコアとして算出する。
+/// - 確信度には順序尺度のバイモーダル(両極端割れ)と低分散(隣接割れ)を適切に分離する
+///   正規化分散確信度 $C_{\text{var}} = 1.0 - \frac{4 \cdot \text{Var}\[S\]}{(M-1)^2}$ を採用する。
+/// - 確率マップのキーには、評価段階ラベルに重複がない場合はそのラベル名を用い、
+///   重複または空文字が存在する場合はインデックス文字列 (`"0"`, `"1"`, ...) を用いる。
+///   $M \le 10$ であるため、重複検査はヒープ確保を行わずにスタック上の二重走査で実施する。
+/// - 同一確率バッファに対する加重平均期待値と事後分散の算出は [`score_moments_iter`] による単一パス走査に集約し、二重走査を排除する。
+///
+/// # 引数
+/// - `logits`: 未正規化の生ロジットスライス(`f64`)。
+/// - `criteria`: 順序付けられた評価段階基準の配列。
+/// - `temperature`: 適用する較正温度パラメータ $\tau$。
+/// - `probs_buf`: 確率分布書き込み用の作業バッファスライス(`logits` と同長が必要)。
+/// - `question_id`: 質問識別子 (任意)。エラー発生時に診断メッセージへ反映される。
+///
+/// # 戻り値
+/// - 成功時は Score 判定が格納された `Answer`、入力不正時は `CoreError`。
+pub fn evaluate_score_with_buf(
+    logits: &[f64],
+    criteria: &Criteria,
+    temperature: f64,
+    probs_buf: &mut [f64],
+    question_id: Option<&str>,
+) -> Result<Answer> {
+    let list = criteria.validate_score_list(question_id)?;
+    evaluate_score_list_with_buf(logits, list, temperature, probs_buf, question_id)
 }
 
 /// Score プリミティブの生ロジットから加重平均連続値スコア、確率分布、および分散確信度を算出する。
@@ -258,35 +261,16 @@ pub fn evaluate_question_with_buf(
     probs_buf: &mut [f64],
     question_id: Option<&str>,
 ) -> Result<Answer> {
-    // 質問定義のスキーマ検証を実施する。
-    question.validate(question_id)?;
-
     let res = match question.question_type {
         QuestionType::Choice => {
-            let criteria =
-                question
-                    .criteria
-                    .as_ref()
-                    .ok_or_else(|| CoreError::MissingCriteria {
-                        question_id: question_id.map(|s| s.to_string()),
-                        question_type: QuestionType::Choice,
-                    })?;
-            let k = criteria.len();
-            let temperature = config.get_temperature(QuestionType::Choice, k);
-            evaluate_choice_with_buf(logits, criteria, temperature, probs_buf, question_id)
+            let map = question.validate_choice_map(question_id)?;
+            let temperature = config.get_temperature(QuestionType::Choice, map.len());
+            evaluate_choice_map_with_buf(logits, map, temperature, probs_buf, question_id)
         }
         QuestionType::Score => {
-            let criteria =
-                question
-                    .criteria
-                    .as_ref()
-                    .ok_or_else(|| CoreError::MissingCriteria {
-                        question_id: question_id.map(|s| s.to_string()),
-                        question_type: QuestionType::Score,
-                    })?;
-            let m = criteria.len();
-            let temperature = config.get_temperature(QuestionType::Score, m);
-            evaluate_score_with_buf(logits, criteria, temperature, probs_buf, question_id)
+            let list = question.validate_score_list(question_id)?;
+            let temperature = config.get_temperature(QuestionType::Score, list.len());
+            evaluate_score_list_with_buf(logits, list, temperature, probs_buf, question_id)
         }
         QuestionType::Noul => {
             let temperature = config.get_temperature(QuestionType::Noul, 2);

@@ -119,6 +119,49 @@ impl Criteria {
         }
     }
 
+    /// Map 形式の参照を取得し、Choice 型の候補数境界 (`MIN_NUM_OPTIONS..=MAX_NUM_OPTIONS`) を検証する。
+    ///
+    /// # 引数
+    /// - `question_id`: 質問識別子(任意)。エラー発生時に診断メッセージへ反映される。
+    ///
+    /// # エラー
+    /// - `Criteria::List` の場合は [`CoreError::InvalidCriteriaType`] を返却する。
+    /// - 候補数が仕様範囲外の場合は [`CoreError::InvalidChoiceCount`] を返却する。
+    pub fn validate_choice_map(
+        &self,
+        question_id: Option<&str>,
+    ) -> Result<&IndexMap<String, String>> {
+        let map = self.as_map_or_err(QuestionType::Choice, question_id)?;
+        let count = map.len();
+        if !(MIN_NUM_OPTIONS..=MAX_NUM_OPTIONS).contains(&count) {
+            return Err(CoreError::InvalidChoiceCount {
+                question_id: question_id.map(str::to_string),
+                count,
+            });
+        }
+        Ok(map)
+    }
+
+    /// List 形式の参照を取得し、Score 型の段階数境界 (`MIN_SCORE_LEVELS..=MAX_SCORE_LEVELS`) を検証する。
+    ///
+    /// # 引数
+    /// - `question_id`: 質問識別子(任意)。エラー発生時に診断メッセージへ反映される。
+    ///
+    /// # エラー
+    /// - `Criteria::Map` の場合は [`CoreError::InvalidCriteriaType`] を返却する。
+    /// - 段階数が仕様範囲外の場合は [`CoreError::InvalidScoreLevelCount`] を返却する。
+    pub fn validate_score_list(&self, question_id: Option<&str>) -> Result<&[String]> {
+        let list = self.as_list_or_err(QuestionType::Score, question_id)?;
+        let count = list.len();
+        if !(MIN_SCORE_LEVELS..=MAX_SCORE_LEVELS).contains(&count) {
+            return Err(CoreError::InvalidScoreLevelCount {
+                question_id: question_id.map(str::to_string),
+                count,
+            });
+        }
+        Ok(list)
+    }
+
     /// 候補数または段階数を取得する。
     pub fn len(&self) -> usize {
         match self {
@@ -178,46 +221,50 @@ impl Question {
         }
     }
 
+    /// Choice 型質問の `criteria` 存在、型整合性、および候補数境界を検証し、候補マップへの参照を取得する。
+    ///
+    /// # 引数
+    /// - `question_id`: 質問識別子(任意)。エラー発生時に診断メッセージへ反映される。
+    pub fn validate_choice_map(
+        &self,
+        question_id: Option<&str>,
+    ) -> Result<&IndexMap<String, String>> {
+        let criteria = self
+            .criteria
+            .as_ref()
+            .ok_or_else(|| CoreError::MissingCriteria {
+                question_id: question_id.map(str::to_string),
+                question_type: QuestionType::Choice,
+            })?;
+        criteria.validate_choice_map(question_id)
+    }
+
+    /// Score 型質問の `criteria` 存在、型整合性、および段階数境界を検証し、段階配列への参照を取得する。
+    ///
+    /// # 引数
+    /// - `question_id`: 質問識別子(任意)。エラー発生時に診断メッセージへ反映される。
+    pub fn validate_score_list(&self, question_id: Option<&str>) -> Result<&[String]> {
+        let criteria = self
+            .criteria
+            .as_ref()
+            .ok_or_else(|| CoreError::MissingCriteria {
+                question_id: question_id.map(str::to_string),
+                question_type: QuestionType::Score,
+            })?;
+        criteria.validate_score_list(question_id)
+    }
+
     /// 質問スキーマの整合性を検証する。
     ///
     /// # 引数
     /// - `question_id`: 質問識別子 (任意)。エラー発生時に診断メッセージへ付与される。
     pub fn validate(&self, question_id: Option<&str>) -> Result<()> {
-        let qid = question_id.map(|s| s.to_string());
         match self.question_type {
             QuestionType::Choice => {
-                let criteria =
-                    self.criteria
-                        .as_ref()
-                        .ok_or_else(|| CoreError::MissingCriteria {
-                            question_id: qid.clone(),
-                            question_type: QuestionType::Choice,
-                        })?;
-                let map = criteria.as_map_or_err(QuestionType::Choice, question_id)?;
-                let count = map.len();
-                if !(MIN_NUM_OPTIONS..=MAX_NUM_OPTIONS).contains(&count) {
-                    return Err(CoreError::InvalidChoiceCount {
-                        question_id: qid,
-                        count,
-                    });
-                }
+                self.validate_choice_map(question_id)?;
             }
             QuestionType::Score => {
-                let criteria =
-                    self.criteria
-                        .as_ref()
-                        .ok_or_else(|| CoreError::MissingCriteria {
-                            question_id: qid.clone(),
-                            question_type: QuestionType::Score,
-                        })?;
-                let list = criteria.as_list_or_err(QuestionType::Score, question_id)?;
-                let count = list.len();
-                if !(MIN_SCORE_LEVELS..=MAX_SCORE_LEVELS).contains(&count) {
-                    return Err(CoreError::InvalidScoreLevelCount {
-                        question_id: qid,
-                        count,
-                    });
-                }
+                self.validate_score_list(question_id)?;
             }
             QuestionType::Noul => {
                 // Noul 型は criteria を要求しない。指定されている場合でも無視または許容する。

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
 use crate::math::{normalized_entropy, normalized_entropy_iter, top_margin_iter};
-use crate::schema::{Answer, AnswerPayload, Question, QuestionType};
+use crate::schema::{Answer, AnswerPayload, Question};
 
 /// デフォルトの高確信度閾値 (自動実行境界)。
 pub const DEFAULT_HIGH_CONFIDENCE_THRESHOLD: f64 = 0.70;
@@ -415,7 +415,7 @@ pub struct SystemRoutingSummary {
 /// # 引数
 /// - `answer`: 事後較正済みの判定結果。
 /// - `question_id`: 質問識別子(プロンプト構築用、任意)。
-/// - `question`: 質問定義(指示文やタイプ取得用、任意)。
+/// - `question`: 質問定義(プロンプト構築時の指示文取得用、任意)。
 /// - `config`: ゲーティング設定。
 ///
 /// # 戻り値
@@ -441,7 +441,7 @@ pub fn evaluate_answer_gating(
 /// # 引数
 /// - `answer`: 事後較正済みの判定結果。
 /// - `question_id`: 質問識別子(プロンプト構築用、任意)。
-/// - `question`: 質問定義(指示文やタイプ取得用、任意)。
+/// - `question`: 質問定義(プロンプト構築時の指示文取得用、任意)。
 /// - `config`: ゲーティング設定。
 /// - `energy`: 算出された正規化自由エネルギー値 (任意)。
 ///
@@ -749,11 +749,12 @@ fn build_escalation_context(
 ///   `EscalationContext.prompt_template` を `None` とする。
 /// - ランタイム層等で上位のリッチプロンプト(State 文脈や高度な推論理由等を含むプロンプト)に、
 ///   置換される前提の処理において、不要な二重アロケーションを抑止するために使用する。
+/// - Choice 専用の OOD 安全弁およびマージンガードの適用可否は、評価対象の実体である `answer.is_choice()` を基準に決定する。
 ///
 /// # 引数
 /// - `answer`: 事後較正済みの判定結果。
 /// - `question_id`: 質問識別子(プロンプト構築用、任意)。
-/// - `question`: 質問定義(指示文やタイプ取得用、任意)。
+/// - `question`: 質問定義(プロンプト構築時の指示文取得用、任意)。
 /// - `config`: ゲーティング設定。
 /// - `energy`: 算出された正規化自由エネルギー値 (任意)。
 /// - `generate_prompt`: デフォルトプロンプト案文字列を生成するかどうかのフラグ。
@@ -769,12 +770,7 @@ pub fn evaluate_answer_gating_opts(
     generate_prompt: bool,
 ) -> GatingMetadata {
     let conf = answer.effective_confidence().clamp(0.0, 1.0);
-
-    // 質問種別の特定(question 定義からの取得、または answer の payload からの導出)。
-    let question_type = question
-        .map(|q| q.question_type)
-        .unwrap_or_else(|| answer.question_type());
-    let is_choice = question_type == QuestionType::Choice;
+    let is_choice = answer.is_choice();
 
     let (margin, entropy) = compute_margin_and_entropy(answer);
 
@@ -1318,6 +1314,56 @@ mod tests {
         assert_eq!(meta.margin, None);
         assert!(meta.escalation.is_none());
         assert!(meta.reason.contains("実効確信度"));
+    }
+
+    #[test]
+    fn test_evaluate_answer_gating_uses_answer_type_on_question_mismatch() {
+        // 1. question が Choice でも answer が Noul の場合、Choice 専用のマージンガードや OOD 判定を誤適用しない。
+        let mut criteria = IndexMap::new();
+        criteria.insert("a".to_string(), "A".to_string());
+        criteria.insert("b".to_string(), "B".to_string());
+        let choice_question = Question::new_choice("選択せよ", criteria);
+
+        // Noul (p=0.92): conf=0.84, margin=0.84, ent_conf≈0.598 >= 0.50, margin < 0.90
+        let ans_noul = Answer::noul(0.92);
+        let strict_margin_cfg = GatingConfig {
+            enabled: true,
+            thresholds: GatingThresholds {
+                high_threshold: 0.50,
+                low_threshold: 0.35,
+                top_margin_threshold: 0.90,
+                ..Default::default()
+            },
+        };
+        let meta_noul = evaluate_answer_gating_opts(
+            &ans_noul,
+            Some("q_mismatch_noul"),
+            Some(&choice_question),
+            &strict_margin_cfg,
+            Some(0.5),
+            false,
+        );
+        assert_eq!(meta_noul.route, DecisionRoute::AutoExecute);
+        assert!(!meta_noul.is_ood);
+
+        // 2. question が Noul でも answer が Choice の場合、Choice 専用の OOD 安全弁が正しく機能する。
+        let noul_question = Question::new_noul("真偽を判定せよ");
+        let mut choice_probs = IndexMap::new();
+        choice_probs.insert("opt_a".to_string(), 0.90);
+        choice_probs.insert("opt_b".to_string(), 0.10);
+        let ans_choice = Answer::choice("opt_a", choice_probs, 0.90);
+        let default_cfg = GatingConfig::default();
+
+        let meta_choice = evaluate_answer_gating_opts(
+            &ans_choice,
+            Some("q_mismatch_choice"),
+            Some(&noul_question),
+            &default_cfg,
+            Some(0.5),
+            false,
+        );
+        assert_eq!(meta_choice.route, DecisionRoute::Fallback);
+        assert!(meta_choice.is_ood);
     }
 
     #[test]

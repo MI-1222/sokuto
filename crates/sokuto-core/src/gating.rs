@@ -183,18 +183,18 @@ impl GatingThresholds {
     /// - ハイブリッド OOD 閾値 (`loose_energy_threshold`, `ood_min_confidence`, `ood_min_margin`) は、
     ///   すべて指定またはすべて未指定のいずれかであることを検証する。
     pub fn validate(&self) -> Result<()> {
-        if self.high_threshold < 0.0 || self.high_threshold > 1.0 {
+        if !(0.0..=1.0).contains(&self.high_threshold) {
             return Err(CoreError::InvalidGatingConfig {
                 message: format!(
-                    "high_threshold ({}) は 0.0〜1.0 の範囲である必要があります。",
+                    "high_threshold ({}) は 0.0〜1.0 の有限実数である必要があります。",
                     self.high_threshold
                 ),
             });
         }
-        if self.low_threshold < 0.0 || self.low_threshold > 1.0 {
+        if !(0.0..=1.0).contains(&self.low_threshold) {
             return Err(CoreError::InvalidGatingConfig {
                 message: format!(
-                    "low_threshold ({}) は 0.0〜1.0 の範囲である必要があります。",
+                    "low_threshold ({}) は 0.0〜1.0 の有限実数である必要があります。",
                     self.low_threshold
                 ),
             });
@@ -207,10 +207,10 @@ impl GatingThresholds {
                 ),
             });
         }
-        if self.top_margin_threshold < 0.0 || self.top_margin_threshold > 1.0 {
+        if !(0.0..=1.0).contains(&self.top_margin_threshold) {
             return Err(CoreError::InvalidGatingConfig {
                 message: format!(
-                    "top_margin_threshold ({}) は 0.0〜1.0 の範囲である必要があります。",
+                    "top_margin_threshold ({}) は 0.0〜1.0 の有限実数である必要があります。",
                     self.top_margin_threshold
                 ),
             });
@@ -1560,6 +1560,47 @@ mod tests {
         ];
         for partial in partial_cases {
             assert!(partial.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn test_thresholds_reject_nan_and_out_of_range() {
+        for invalid_val in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.01, 1.01] {
+            let high_invalid = GatingThresholds {
+                high_threshold: invalid_val,
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    high_invalid.validate(),
+                    Err(CoreError::InvalidGatingConfig { .. })
+                ),
+                "high_threshold={invalid_val} は拒否されるべき。"
+            );
+
+            let low_invalid = GatingThresholds {
+                low_threshold: invalid_val,
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    low_invalid.validate(),
+                    Err(CoreError::InvalidGatingConfig { .. })
+                ),
+                "low_threshold={invalid_val} は拒否されるべき。"
+            );
+
+            let margin_invalid = GatingThresholds {
+                top_margin_threshold: invalid_val,
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    margin_invalid.validate(),
+                    Err(CoreError::InvalidGatingConfig { .. })
+                ),
+                "top_margin_threshold={invalid_val} は拒否されるべき。"
+            );
         }
     }
 }

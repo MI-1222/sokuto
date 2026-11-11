@@ -30,7 +30,7 @@ fn attach_question_id<T>(res: Result<T>, question_id: Option<&str>) -> Result<T>
 /// - 呼び出し側から作業用バッファスライス (`probs_buf`) を受け取ることで、推論バッチ処理における
 ///   メモリヒープ確保を最小化する。
 /// - 候補キーの順序付きマップ (`Criteria::Map`) とロジット列を 1 対 1 で結合する。
-/// - 候補数 $K=1$ の特異点では、ショートサーキットにより確信度 1.0・確率 1.0 を即座に返却する。
+/// - 候補数 $K=1$ の特異点では、[`softmax_into`] および [`composite_confidence`] の特異点処理により確率 1.0・確信度 1.0 が算出される。
 /// - 最大確率を与える候補の採択には決定論的タイブレーク規則が適用され、同率最大時は先頭インデックスが採択される。
 /// - 確信度には、候補数 $K$ に非依存な正規化エントロピーと Top-Margin を統合した
 ///   複合確信度スコア $S_{\text{confidence}} = (1.0 - H_{\text{norm}}) \times M(p)$ を採用する。
@@ -80,31 +80,6 @@ pub fn evaluate_choice_with_buf(
                 logits_len = logits.len()
             ),
         });
-    }
-
-    // 候補数 1 の特異点処理。
-    if k == 1 {
-        if !temperature.is_finite() || temperature <= 0.0 {
-            return Err(CoreError::MathError {
-                question_id: question_id.map(str::to_string),
-                message: format!(
-                    "温度パラメータは正の有限実数である必要があります: {temperature}。"
-                ),
-            });
-        }
-        if !logits[0].is_finite() {
-            return Err(CoreError::MathError {
-                question_id: question_id.map(str::to_string),
-                message: "ロジットに非有限値(NaNまたは無限大)が含まれています。".to_string(),
-            });
-        }
-        probs_buf[0] = 1.0;
-        let (first_key, _) = map
-            .get_index(0)
-            .expect("k == 1 なので必ず先頭要素が存在する。");
-        let mut probabilities = IndexMap::with_capacity(1);
-        probabilities.insert(first_key.clone(), 1.0);
-        return Ok(Answer::choice(first_key.clone(), probabilities, 1.0));
     }
 
     // ゼロアロケーション版ソフトマックスの実行。

@@ -308,25 +308,25 @@ pub fn top_margin(probabilities: &[f64]) -> Result<f64> {
     top_margin_iter(probabilities)
 }
 
-/// 任意の確率値イテレータから、正規化エントロピーと Top-Margin を統合した複合確信度スコア $S_{\text{confidence}} \in [0.0, 1.0]$ を単一パス走査で算出する。
+/// 任意の確率値イテレータから、複合確信度スコア $S_{\text{confidence}} \in [0.0, 1.0]$ と最大確率インデックスを単一パス走査で同時に算出する。
 ///
 /// # 数理仕様
 /// $$S_{\text{confidence}} = \begin{cases} 1.0 & (K = 1) \\ (1.0 - H_{\text{norm}}(p)) \times M(p) & (K \ge 2) \end{cases}$$
 ///
-/// - $O(K)$ 単一パス走査により、要素数 $K$、エントロピー累積値 $-\sum p \ln p$、上位2候補 $p_{(1)}, p_{(2)}$ を同時に集計する。
-/// - 同一スライスの2回走査を回避し、ゼロアロケーションかつキャッシュ局所性を最大化する。
+/// - $O(K)$ 単一パス走査により、要素数 $K$、エントロピー累積値 $-\sum p \ln p$、上位2候補 $p_{(1)}, p_{(2)}$、
+///   および最大確率インデックス(`argmax`)を同時に集計する。
+/// - `argmax` と [`composite_confidence_iter`] の2回走査を統合し、推論ホットパスにおける走査回数と非有限値検査を半減させる。
+/// - 決定論的タイブレーク規則として、厳密な不等号(`p > max1`)により同率最大時は最小インデックス(先勝ち)を採択する。
 /// - $K=0$ の場合は空配列エラーとして `CoreError::MathError` を返却する。
-/// - $K=1$ の特異点では $1.0$(不確実性なし・完全確信)を即座に返却する。
-/// - 同率タイブレーク時はマージンが $0.0$ となるため、複合確信度も厳密に $0.0$ に収束する。
+/// - $K=1$ の特異点では `(1.0, 0)` を即座に返却する。
 /// - 非有限値(NaNまたは無限大)や負の確率値が含まれる場合は `CoreError::MathError` を返却する。
-/// - 戻り値は浮動小数点誤差を考慮して `[0.0, 1.0]` の閉区間にクランプされる。
 ///
 /// # 引数
 /// - `iter`: 確率値(`f64` または `&f64`)を提供するイテレータ。
 ///
 /// # 戻り値
-/// - 成功時は `[0.0, 1.0]` にクランプされた複合確信度スコア、不正時または空時は `CoreError::MathError`。
-pub fn composite_confidence_iter<I>(iter: I) -> Result<f64>
+/// - 成功時は `(複合確信度スコア, 最大確率インデックス)` のタプル、不正時または空時は `CoreError::MathError`。
+pub fn composite_confidence_and_argmax_iter<I>(iter: I) -> Result<(f64, usize)>
 where
     I: IntoIterator,
     I::Item: Borrow<f64>,
@@ -335,6 +335,7 @@ where
     let mut entropy = 0.0;
     let mut max1 = f64::NEG_INFINITY;
     let mut max2 = f64::NEG_INFINITY;
+    let mut best_idx: usize = 0;
 
     for item in iter {
         let p = *item.borrow();
@@ -351,17 +352,20 @@ where
             });
         }
 
-        count += 1;
         if p > 0.0 {
             entropy -= p * p.ln();
         }
 
+        // 厳密な不等号 (p > max1) を用いることで、同率最大時は最小インデックスを維持する。
         if p > max1 {
             max2 = max1;
             max1 = p;
+            best_idx = count;
         } else if p > max2 {
             max2 = p;
         }
+
+        count += 1;
     }
 
     match count {
@@ -369,7 +373,7 @@ where
             question_id: None,
             message: "確率分布配列が空です。".to_string(),
         }),
-        1 => Ok(1.0),
+        1 => Ok((1.0, 0)),
         _ => {
             let max_entropy = (count as f64).ln();
             let h_norm = if max_entropy <= 0.0 {
@@ -379,9 +383,50 @@ where
             };
             let margin = (max1 - max2).clamp(0.0, 1.0);
             let score = (1.0 - h_norm) * margin;
-            Ok(score.clamp(0.0, 1.0))
+            Ok((score.clamp(0.0, 1.0), best_idx))
         }
     }
+}
+
+/// 確率分布スライスから複合確信度スコア $S_{\text{confidence}} \in [0.0, 1.0]$ と最大確率インデックスを単一パス走査で同時に算出する。
+///
+/// - [`composite_confidence_and_argmax_iter`] を呼び出すゼロコストラッパーとして動作する。
+///
+/// # 引数
+/// - `probabilities`: 各候補の確率分布スライス(`f64`)。
+///
+/// # 戻り値
+/// - 成功時は `(複合確信度スコア, 最大確率インデックス)` のタプル、不正時は `CoreError::MathError`。
+#[inline]
+pub fn composite_confidence_and_argmax(probabilities: &[f64]) -> Result<(f64, usize)> {
+    composite_confidence_and_argmax_iter(probabilities)
+}
+
+/// 任意の確率値イテレータから、正規化エントロピーと Top-Margin を統合した複合確信度スコア $S_{\text{confidence}} \in [0.0, 1.0]$ を単一パス走査で算出する。
+///
+/// # 数理仕様
+/// $$S_{\text{confidence}} = \begin{cases} 1.0 & (K = 1) \\ (1.0 - H_{\text{norm}}(p)) \times M(p) & (K \ge 2) \end{cases}$$
+///
+/// - 実装は [`composite_confidence_and_argmax_iter`] へ委譲し、ロジックの重複を排除している。
+/// - $O(K)$ 単一パス走査により、要素数 $K$、エントロピー累積値 $-\sum p \ln p$、上位2候補 $p_{(1)}, p_{(2)}$ を同時に集計する。
+/// - $K=0$ の場合は空配列エラーとして `CoreError::MathError` を返却する。
+/// - $K=1$ の特異点では $1.0$(不確実性なし・完全確信)を即座に返却する。
+/// - 同率タイブレーク時はマージンが $0.0$ となるため、複合確信度も厳密に $0.0$ に収束する。
+/// - 非有限値(NaNまたは無限大)や負の確率値が含まれる場合は `CoreError::MathError` を返却する。
+/// - 戻り値は浮動小数点誤差を考慮して `[0.0, 1.0]` の閉区間にクランプされる。
+///
+/// # 引数
+/// - `iter`: 確率値(`f64` または `&f64`)を提供するイテレータ。
+///
+/// # 戻り値
+/// - 成功時は `[0.0, 1.0]` にクランプされた複合確信度スコア、不正時または空時は `CoreError::MathError`。
+#[inline]
+pub fn composite_confidence_iter<I>(iter: I) -> Result<f64>
+where
+    I: IntoIterator,
+    I::Item: Borrow<f64>,
+{
+    composite_confidence_and_argmax_iter(iter).map(|(confidence, _)| confidence)
 }
 
 /// 確率分布から、正規化エントロピーと Top-Margin を統合した複合確信度スコア $S_{\text{confidence}} \in [0.0, 1.0]$ を算出する。
@@ -1724,6 +1769,39 @@ mod tests {
                 "スライス版とイテレータ版で計算結果が不一致です: {dist:?}。"
             );
         }
+    }
+
+    #[test]
+    fn test_composite_confidence_and_argmax_parity() {
+        // 1. K=1 の特異点 (値が 0.0 のケースを含む)。
+        assert_eq!(composite_confidence_and_argmax(&[1.0]).unwrap(), (1.0, 0));
+        assert_eq!(composite_confidence_and_argmax(&[0.0]).unwrap(), (1.0, 0));
+
+        // 2. 同率タイブレーク (先勝ち) と各最大位置の一致検証。
+        let cases = vec![
+            vec![0.25, 0.25, 0.25, 0.25],
+            vec![0.1, 0.4, 0.4, 0.1],
+            vec![0.05, 0.15, 0.80],
+            vec![0.90, 0.05, 0.05],
+            vec![0.10, 0.50, 0.40],
+        ];
+        for dist in cases {
+            let (conf, idx) = composite_confidence_and_argmax(&dist).unwrap();
+            let (iter_conf, iter_idx) = composite_confidence_and_argmax_iter(dist.iter()).unwrap();
+            let expected_conf = composite_confidence(&dist).unwrap();
+            let expected_idx = argmax(&dist).unwrap();
+
+            assert_eq!(idx, expected_idx);
+            assert_eq!(iter_idx, expected_idx);
+            assert!((conf - expected_conf).abs() < 1e-12);
+            assert!((iter_conf - expected_conf).abs() < 1e-12);
+        }
+
+        // 3. 異常系 (空・非有限値・負値)。
+        assert!(composite_confidence_and_argmax(&[]).is_err());
+        assert!(composite_confidence_and_argmax(&[0.5, f64::NAN]).is_err());
+        assert!(composite_confidence_and_argmax(&[0.5, f64::INFINITY]).is_err());
+        assert!(composite_confidence_and_argmax(&[-0.01, 1.01]).is_err());
     }
 
     #[test]

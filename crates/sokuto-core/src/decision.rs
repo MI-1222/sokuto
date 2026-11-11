@@ -8,8 +8,8 @@ use indexmap::IndexMap;
 use crate::contract::CalibrationConfig;
 use crate::error::{CoreError, Result};
 use crate::math::{
-    argmax, composite_confidence, normalized_variance_confidence_from_variance, noul_probability,
-    score_moments_iter, softmax_into,
+    composite_confidence_and_argmax, normalized_variance_confidence_from_variance,
+    noul_probability, score_moments_iter, softmax_into,
 };
 use crate::schema::{Answer, Criteria, Question, QuestionType};
 
@@ -54,14 +54,12 @@ fn evaluate_choice_map_with_buf(
     // ゼロアロケーション版ソフトマックスの実行。
     attach_question_id(softmax_into(logits, probs_buf, temperature), question_id)?;
 
-    // 決定論的タイブレーク付き最大値インデックスの取得。
-    let best_idx = attach_question_id(argmax(probs_buf), question_id)?;
+    // 決定論的タイブレーク付き最大値インデックスおよび複合確信度スコアの単一パス算出。
+    let (confidence, best_idx) =
+        attach_question_id(composite_confidence_and_argmax(probs_buf), question_id)?;
     let (selected_key, _) = map
         .get_index(best_idx)
         .expect("best_idx は 0..k の範囲内であることが保証されている。");
-
-    // 候補数非依存の複合確信度スコア S_confidence = (1 - H_norm) * M(p) の算出。
-    let confidence = attach_question_id(composite_confidence(probs_buf), question_id)?;
 
     // 候補識別子と確率値のマッピング構築。
     let mut probabilities = IndexMap::with_capacity(k);
@@ -82,7 +80,7 @@ fn evaluate_choice_map_with_buf(
 /// - 呼び出し側から作業用バッファスライス (`probs_buf`) を受け取ることで、推論バッチ処理における
 ///   メモリヒープ確保を最小化する。
 /// - 候補キーの順序付きマップ (`Criteria::Map`) とロジット列を 1 対 1 で結合する。
-/// - 候補数 $K=1$ の特異点では、[`softmax_into`] および [`composite_confidence`] の特異点処理により確率 1.0・確信度 1.0 が算出される。
+/// - 候補数 $K=1$ の特異点では、[`softmax_into`] および [`composite_confidence_and_argmax`] の特異点処理により確率 1.0・確信度 1.0 が算出される。
 /// - 最大確率を与える候補の採択には決定論的タイブレーク規則が適用され、同率最大時は先頭インデックスが採択される。
 /// - 確信度には、候補数 $K$ に非依存な正規化エントロピーと Top-Margin を統合した
 ///   複合確信度スコア $S_{\text{confidence}} = (1.0 - H_{\text{norm}}) \times M(p)$ を採用する。

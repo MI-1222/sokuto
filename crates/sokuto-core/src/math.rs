@@ -667,10 +667,38 @@ pub fn score_variance(probabilities: &[f64]) -> Result<f64> {
     score_variance_iter(probabilities)
 }
 
+/// 段階数 $M$ と事後分散 $\text{Var}[S]$ から、理論最大分散に対する分散比率 $\text{VarRatio} \in [0.0, 1.0]$ を算出する内部ヘルパー。
+///
+/// # 概要
+/// - $M$ 段階評価における理論上の最大分散 $V_{\max} = \frac{(M-1)^2}{4}$ (両極端に 0.5 ずつ配分された二峰性分布)で事後分散を正規化する。
+/// - $M < 2$ または $V_{\max} \le 0$ の場合は分散比率を定義できないため、0.0 を返却する。
+///
+/// # 数理仕様
+/// $$\text{VarRatio} = \text{clamp}\left(\frac{\text{Var}[S]}{V_{\max}}, 0.0, 1.0\right), \quad V_{\max} = \frac{(M-1)^2}{4}$$
+///
+/// # 引数
+/// - `m`: 評価段階数 $M$。
+/// - `var`: 算出済みの事後分散 $\text{Var}[S]$。
+///
+/// # 戻り値
+/// - `[0.0, 1.0]` の閉区間にクランプされた分散比率。
+#[inline]
+fn score_variance_ratio_from_moments(m: usize, var: f64) -> f64 {
+    if m < 2 {
+        return 0.0;
+    }
+    let max_var = ((m - 1) as f64).powi(2) / 4.0;
+    if max_var <= 0.0 {
+        0.0
+    } else {
+        (var / max_var).clamp(0.0, 1.0)
+    }
+}
+
 /// 段階数 $M$ と事後分散 $\text{Var}[S]$ から、最大可能分散で正規化した確信度 $C_{\text{var}} \in [0.0, 1.0]$ を算出する。
 ///
 /// # 概要
-/// - $M$ 段階評価における理論上の最大分散 $V_{\max} = \frac{(M-1)^2}{4}$ (両極端に 0.5 ずつ配分された二峰性分布)を用いて事後分散を正規化する。
+/// - [`score_variance_ratio_from_moments`] により理論上の最大分散 $V_{\max} = \frac{(M-1)^2}{4}$ で正規化した分散比率を取得し、その補数として確信度を算出する。
 /// - $M < 2$ の場合は分散による不確実性を定義できないため、確信度 1.0 を返却する。
 ///
 /// # 数理仕様
@@ -684,15 +712,7 @@ pub fn score_variance(probabilities: &[f64]) -> Result<f64> {
 /// - `[0.0, 1.0]` の閉区間にクランプされた正規化分散確信度。
 #[inline]
 pub fn normalized_variance_confidence_from_variance(m: usize, var: f64) -> f64 {
-    if m < 2 {
-        return 1.0;
-    }
-    let max_var = ((m - 1) as f64).powi(2) / 4.0;
-    if max_var <= 0.0 {
-        return 1.0;
-    }
-    let confidence = 1.0 - (var / max_var);
-    confidence.clamp(0.0, 1.0)
+    1.0 - score_variance_ratio_from_moments(m, var)
 }
 
 /// 任意の確率値イテレータから、最大可能分散で正規化した確信度 $C_{\text{var}} \in [0.0, 1.0]$ を単一パス走査で算出する。
@@ -732,21 +752,14 @@ pub fn normalized_variance_confidence(probabilities: &[f64]) -> Result<f64> {
 /// 任意の確率値イテレータから、理論最大分散に対する事後分散の比率 $\text{VarRatio} \in [0.0, 1.0]$ を単一パス走査で算出する。
 ///
 /// # 備考
-/// - [`score_moments_iter`] を呼び出し、単一パス走査で段階数と事後分散を取得して分散比率を計算する。
+/// - [`score_moments_iter`] と [`score_variance_ratio_from_moments`] を呼び出し、単一パス走査で段階数と事後分散を取得して分散比率を計算する。
 pub fn score_variance_ratio_iter<I>(iter: I) -> Result<f64>
 where
     I: IntoIterator,
     I::Item: Borrow<f64>,
 {
     let (m, _, var) = score_moments_iter(iter)?;
-    let max_var = ((m - 1) as f64).powi(2) / 4.0;
-
-    if max_var <= 0.0 {
-        return Ok(0.0);
-    }
-
-    let ratio = var / max_var;
-    Ok(ratio.clamp(0.0, 1.0))
+    Ok(score_variance_ratio_from_moments(m, var))
 }
 
 /// Score 型の確率分布から、理論最大分散に対する事後分散の比率 $\text{VarRatio} \in [0.0, 1.0]$ を算出する。
@@ -1931,6 +1944,22 @@ mod tests {
         // 3. 異常系
         assert!(score_variance_ratio(&[]).is_err());
         assert!(score_variance_ratio(&[1.0]).is_err());
+
+        // 4. 内部ヘルパーと確信度の相補性・境界条件検証 (M < 2, クランプ境界)
+        assert_eq!(score_variance_ratio_from_moments(0, 1.0), 0.0);
+        assert_eq!(score_variance_ratio_from_moments(1, 1.0), 0.0);
+        assert_eq!(normalized_variance_confidence_from_variance(0, 1.0), 1.0);
+        assert_eq!(normalized_variance_confidence_from_variance(1, 1.0), 1.0);
+
+        assert_eq!(score_variance_ratio_from_moments(4, -0.5), 0.0);
+        assert_eq!(score_variance_ratio_from_moments(4, 10.0), 1.0);
+        assert_eq!(normalized_variance_confidence_from_variance(4, -0.5), 1.0);
+        assert_eq!(normalized_variance_confidence_from_variance(4, 10.0), 0.0);
+
+        let p_partial = vec![0.1, 0.2, 0.3, 0.4];
+        let partial_ratio = score_variance_ratio(&p_partial).unwrap();
+        let partial_conf = normalized_variance_confidence(&p_partial).unwrap();
+        assert!((partial_ratio + partial_conf - 1.0).abs() < 1e-12);
     }
 
     #[test]

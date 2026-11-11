@@ -39,7 +39,8 @@ impl fmt::Display for QuestionType {
 
 /// 柔軟な評価基準(Criteria)データ構造。
 ///
-/// 質問タイプに応じて Map、List、または未指定(None)のいずれかをとる。
+/// 質問タイプに応じて Map または List のいずれかをとる。
+/// 評価基準が存在しない状態(Noul 型など)は `Option<Criteria>::None` で表現する。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -48,8 +49,6 @@ pub enum Criteria {
     Map(IndexMap<String, String>),
     /// Score 型向け: 順序付けられた評価段階基準の配列(2〜10段階)。
     List(Vec<String>),
-    /// Noul 型向け、または評価基準が指定されていない状態。
-    None,
 }
 
 impl Criteria {
@@ -57,7 +56,7 @@ impl Criteria {
     pub fn as_map(&self) -> Option<&IndexMap<String, String>> {
         match self {
             Self::Map(map) => Some(map),
-            _ => None,
+            Self::List(_) => None,
         }
     }
 
@@ -69,7 +68,6 @@ impl Criteria {
     ///
     /// # エラー
     /// - `Criteria::List` の場合は `CoreError::InvalidCriteriaType` を返却する。
-    /// - `Criteria::None` の場合は `CoreError::MissingCriteria` を返却する。
     pub fn as_map_or_err(
         &self,
         question_type: QuestionType,
@@ -83,10 +81,6 @@ impl Criteria {
                 expected: "Map (オブジェクト)",
                 actual: "List (配列)",
             }),
-            Self::None => Err(CoreError::MissingCriteria {
-                question_id: question_id.map(str::to_string),
-                question_type,
-            }),
         }
     }
 
@@ -94,7 +88,7 @@ impl Criteria {
     pub fn as_list(&self) -> Option<&[String]> {
         match self {
             Self::List(list) => Some(list),
-            _ => None,
+            Self::Map(_) => None,
         }
     }
 
@@ -106,7 +100,6 @@ impl Criteria {
     ///
     /// # エラー
     /// - `Criteria::Map` の場合は `CoreError::InvalidCriteriaType` を返却する。
-    /// - `Criteria::None` の場合は `CoreError::MissingCriteria` を返却する。
     pub fn as_list_or_err(
         &self,
         question_type: QuestionType,
@@ -120,16 +113,7 @@ impl Criteria {
                 expected: "List (配列)",
                 actual: "Map (オブジェクト)",
             }),
-            Self::None => Err(CoreError::MissingCriteria {
-                question_id: question_id.map(str::to_string),
-                question_type,
-            }),
         }
-    }
-
-    /// 未指定(None)であるかどうかを判定する。
-    pub fn is_none(&self) -> bool {
-        matches!(self, Self::None)
     }
 
     /// 候補数または段階数を取得する。
@@ -137,7 +121,6 @@ impl Criteria {
         match self {
             Self::Map(map) => map.len(),
             Self::List(list) => list.len(),
-            Self::None => 0,
         }
     }
 
@@ -904,7 +887,6 @@ mod tests {
         map.insert("k1".to_string(), "v1".to_string());
         let criteria_map = Criteria::Map(map);
         let criteria_list = Criteria::List(vec!["item1".to_string()]);
-        let criteria_none = Criteria::None;
 
         assert!(
             criteria_map
@@ -929,20 +911,6 @@ mod tests {
             }
             _ => panic!("予期しないエラー型です: {err_list:?}。"),
         }
-
-        let err_none = criteria_none
-            .as_map_or_err(QuestionType::Choice, None)
-            .unwrap_err();
-        match err_none {
-            CoreError::MissingCriteria {
-                question_id,
-                question_type,
-            } => {
-                assert_eq!(question_id, None);
-                assert_eq!(question_type, QuestionType::Choice);
-            }
-            _ => panic!("予期しないエラー型です: {err_none:?}。"),
-        }
     }
 
     #[test]
@@ -951,7 +919,6 @@ mod tests {
         map.insert("k1".to_string(), "v1".to_string());
         let criteria_map = Criteria::Map(map);
         let criteria_list = Criteria::List(vec!["item1".to_string()]);
-        let criteria_none = Criteria::None;
 
         assert!(
             criteria_list
@@ -975,20 +942,6 @@ mod tests {
                 assert_eq!(actual, "Map (オブジェクト)");
             }
             _ => panic!("予期しないエラー型です: {err_map:?}。"),
-        }
-
-        let err_none = criteria_none
-            .as_list_or_err(QuestionType::Score, None)
-            .unwrap_err();
-        match err_none {
-            CoreError::MissingCriteria {
-                question_id,
-                question_type,
-            } => {
-                assert_eq!(question_id, None);
-                assert_eq!(question_type, QuestionType::Score);
-            }
-            _ => panic!("予期しないエラー型です: {err_none:?}。"),
         }
     }
 }

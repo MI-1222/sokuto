@@ -59,7 +59,51 @@ fn test_deserialize_mixed_request() {
 
     let q_angry = request.questions.get("is_angry").unwrap();
     assert_eq!(q_angry.question_type, QuestionType::Noul);
-    assert!(q_angry.criteria.is_none() || q_angry.criteria.as_ref().unwrap().is_none());
+    assert!(q_angry.criteria.is_none());
+}
+
+/// 明示的な `"criteria": null` を含むリクエストのデシリアライズおよびバリデーション互換性テスト。
+#[test]
+fn test_explicit_null_criteria_deserialization() {
+    let noul_payload = json!({
+        "state": "テキスト",
+        "questions": {
+            "is_spam": {
+                "type": "noul",
+                "instructions": "スパムか判定せよ。",
+                "criteria": null
+            }
+        }
+    });
+
+    let noul_req: SystemOneRequest = serde_json::from_value(noul_payload).unwrap();
+    assert!(noul_req.validate().is_ok());
+    let q_spam = noul_req.questions.get("is_spam").unwrap();
+    assert!(q_spam.criteria.is_none());
+
+    // シリアライズ時は skip_serializing_if により criteria キーが省略されること。
+    let serialized = serde_json::to_value(&noul_req).unwrap();
+    assert!(serialized["questions"]["is_spam"].get("criteria").is_none());
+
+    // Choice 型で明示的に criteria: null を渡した場合は MissingCriteria になること。
+    let choice_null_payload = json!({
+        "state": "テキスト",
+        "questions": {
+            "category": {
+                "type": "choice",
+                "instructions": "分類せよ。",
+                "criteria": null
+            }
+        }
+    });
+    let choice_req: SystemOneRequest = serde_json::from_value(choice_null_payload).unwrap();
+    assert_eq!(
+        choice_req.validate().unwrap_err(),
+        CoreError::MissingCriteria {
+            question_id: Some("category".to_string()),
+            question_type: QuestionType::Choice,
+        }
+    );
 }
 
 /// 構造化オブジェクトや配列形式の State を受け入れるテスト。

@@ -221,7 +221,7 @@ impl EscalationPromptBuilder {
                         let _ = writeln!(prompt, "  - 段階 {}: {}", i, desc);
                     }
                 }
-                Some(Criteria::None) | None => {
+                None => {
                     if q.question_type == QuestionType::Noul {
                         prompt.push_str("- **判定形式**: 二値判定 (true / false)\n");
                     }

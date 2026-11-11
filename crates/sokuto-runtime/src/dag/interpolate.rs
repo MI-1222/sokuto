@@ -118,7 +118,7 @@ pub fn interpolate_question(
             }
             Some(Criteria::List(new_list))
         }
-        Some(Criteria::None) | None => None,
+        None => None,
     };
 
     match question.question_type {

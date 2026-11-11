@@ -278,7 +278,6 @@ impl GuardrailPipeline {
                     }
                     Some(Criteria::List(new_list))
                 }
-                Some(Criteria::None) => Some(Criteria::None),
                 None => None,
             };
 

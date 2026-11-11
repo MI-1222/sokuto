@@ -445,9 +445,8 @@ mod tests {
         let logits = vec![1.0, 2.0];
         assert!(evaluate_choice(&logits, &criteria, 1.0).is_err());
 
-        // 不正な criteria 種別 (List や None)
+        // 不正な criteria 種別 (List)
         assert!(evaluate_choice(&logits, &Criteria::List(vec!["A".to_string()]), 1.0).is_err());
-        assert!(evaluate_choice(&logits, &Criteria::None, 1.0).is_err());
 
         // K=1 特異点における非有限値(NaN, Inf, -Inf)のエラー検出。
         assert!(matches!(

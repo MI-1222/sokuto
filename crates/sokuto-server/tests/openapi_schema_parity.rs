@@ -283,22 +283,36 @@ fn test_criteria_untagged_schema_compatibility() {
         "Criteria スキーマがオブジェクト定義として存在すること。"
     );
 
-    // 空オブジェクトに縮退せず、oneOf としてバリアントが定義されていることを厳密に検証
+    // 空オブジェクトに縮退せず、oneOf として 2 バリアント(Map, List)が定義されていることを厳密に検証
     let one_of = criteria_schema["oneOf"]
         .as_array()
         .expect("Criteria は oneOf 配列として定義されている必要があります。");
     assert_eq!(
         one_of.len(),
-        3,
-        "Criteria は Map, List, None の 3 バリアントを持つ必要があります。"
+        2,
+        "Criteria は Map, List の 2 バリアントを持つ必要があります。"
     );
 
     // 1. Choice Map (object)
     assert!(one_of.iter().any(|s| s["type"] == "object"));
     // 2. Score List (array)
     assert!(one_of.iter().any(|s| s["type"] == "array"));
-    // 3. Noul None (null)
-    assert!(one_of.iter().any(|s| s["type"] == "null"));
+    // 3. null は Option<Criteria> 側で表現するため Criteria 自体には含まない
+    assert!(!one_of.iter().any(|s| s["type"] == "null"));
+
+    // Question.properties.criteria が null と Criteria 参照の 2 要素の oneOf になっていること
+    let question_criteria =
+        &spec_json["components"]["schemas"]["Question"]["properties"]["criteria"];
+    let q_one_of = question_criteria["oneOf"]
+        .as_array()
+        .expect("Question.criteria は oneOf 配列として定義されている必要があります。");
+    assert_eq!(q_one_of.len(), 2);
+    assert!(q_one_of.iter().any(|s| s["type"] == "null"));
+    assert!(
+        q_one_of
+            .iter()
+            .any(|s| s["$ref"] == "#/components/schemas/Criteria")
+    );
 
     // Map 形式
     let mut map = IndexMap::new();
@@ -311,11 +325,6 @@ fn test_criteria_untagged_schema_compatibility() {
     let c_list = Criteria::List(vec!["段階1".to_string(), "段階2".to_string()]);
     let json_list = serde_json::to_value(&c_list).unwrap();
     assert!(json_list.is_array());
-
-    // None 形式
-    let c_none = Criteria::None;
-    let json_none = serde_json::to_value(&c_none).unwrap();
-    assert!(json_none.is_null());
 }
 
 #[test]

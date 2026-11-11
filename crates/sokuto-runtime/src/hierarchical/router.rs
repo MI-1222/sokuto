@@ -9,7 +9,7 @@ use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_core::gating::{
     CandidateProbability, DecisionRoute, EscalationContext, GatingConfig, GatingMetadata,
 };
-use sokuto_core::math::{normalized_entropy, top_margin};
+use sokuto_core::math::normalized_entropy;
 use sokuto_core::schema::{Answer, Criteria, Question, QuestionType};
 
 use crate::engine::InferenceEngine;
@@ -500,30 +500,13 @@ impl<'a> CoarseToFineRouter<'a> {
                 })
         });
 
-        let default_winner = sorted_full[0].0.to_string();
-        let default_winner_prob = sorted_full[0].1;
-
-        let mut final_winner = default_winner.clone();
-        let mut catchall_bias_triggered = false;
-
-        if self.config.enable_catchall_bias {
-            // ネガティブ候補で閾値以上のものを探索
-            for (key, &prob) in &full_probabilities {
-                let desc = self
-                    .mapping
-                    .fine_criteria
-                    .get(key)
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
-                if self.mapping.is_negative_candidate(key, desc)
-                    && prob >= self.config.catchall_threshold
-                {
-                    final_winner = key.clone();
-                    catchall_bias_triggered = true;
-                    break;
-                }
-            }
-        }
+        let (final_winner, final_confidence, final_margin, catchall_bias_triggered) =
+            resolve_winner_with_catchall_bias(
+                self.mapping,
+                &sorted_full,
+                self.config.enable_catchall_bias,
+                self.config.catchall_threshold,
+            )?;
 
         // --- Step 7: 全候補空間基準での Gating 再計算 ---
         let all_probs_slice: Vec<f64> = all_fine_keys
@@ -532,16 +515,6 @@ impl<'a> CoarseToFineRouter<'a> {
             .collect();
 
         let final_norm_entropy = normalized_entropy(&all_probs_slice).unwrap_or(0.0);
-        let final_margin = top_margin(&all_probs_slice).unwrap_or(0.0);
-
-        let final_confidence = if catchall_bias_triggered {
-            full_probabilities
-                .get(&final_winner)
-                .copied()
-                .unwrap_or(default_winner_prob)
-        } else {
-            default_winner_prob
-        };
 
         // 生ロジットから正規化自由エネルギーを正確に算出
         let fine_energy = crate::engine::gating::calculate_choice_energy(
@@ -597,6 +570,71 @@ impl<'a> CoarseToFineRouter<'a> {
 
         Ok(HierarchicalResult { answer, trace })
     }
+}
+
+/// 受け皿候補バイアス (`catchall_bias`) を適用して最終勝者・確信度・マージンを決定する。
+///
+/// 確率降順にソート済みの `sorted_full` を先頭から走査するため、閾値以上のネガティブ候補が
+/// 複数存在する場合でも走査順に依存せず最大確率の候補 (同率時は定義順先頭) を採択する。
+/// また、2 位以下のネガティブ候補を昇格させた場合も、`final_winner` 以外の最大確率候補
+/// (次点候補) との差 `(final_confidence - runner_up_prob).clamp(0.0, 1.0)` でマージンを再計算する。
+///
+/// # 引数
+/// - `mapping`: 階層マッピング定義。
+/// - `sorted_full`: 確率降順 (同率時は定義順昇順) にソート済みの全細分類確率一覧。
+/// - `enable_catchall_bias`: 受け皿候補バイアスを有効にするか。
+/// - `catchall_threshold`: 受け皿候補優先採択の確率閾値。
+///
+/// # 戻り値
+/// `(final_winner, final_confidence, final_margin, catchall_bias_triggered)` のタプル。
+fn resolve_winner_with_catchall_bias(
+    mapping: &HierarchicalMapping,
+    sorted_full: &[(&str, f64)],
+    enable_catchall_bias: bool,
+    catchall_threshold: f64,
+) -> Result<(String, f64, f64, bool)> {
+    let (default_winner, default_winner_prob) = sorted_full
+        .first()
+        .copied()
+        .ok_or_else(|| RuntimeError::InvalidQuestion("全細分類の確率分布が空です。".to_string()))?;
+
+    let mut final_winner = default_winner.to_string();
+    let mut final_confidence = default_winner_prob;
+    let mut catchall_bias_triggered = false;
+
+    if enable_catchall_bias {
+        for &(key, prob) in sorted_full {
+            let desc = mapping
+                .fine_criteria
+                .get(key)
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            if mapping.is_negative_candidate(key, desc) && prob >= catchall_threshold {
+                final_winner = key.to_string();
+                final_confidence = prob;
+                catchall_bias_triggered = true;
+                break;
+            }
+        }
+    }
+
+    let final_margin = if sorted_full.len() <= 1 {
+        1.0
+    } else if let Some((_, runner_up_prob)) = sorted_full
+        .iter()
+        .find(|(k, _)| *k != final_winner.as_str())
+    {
+        (final_confidence - *runner_up_prob).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    Ok((
+        final_winner,
+        final_confidence,
+        final_margin,
+        catchall_bias_triggered,
+    ))
 }
 
 /// `AutoExecute` 以外のルーティング時に、`GatingMetadata` へ `EscalationContext` を付与する。
@@ -1046,5 +1084,64 @@ mod tests {
             assert!(prompt.contains(instructions));
             assert!(prompt.contains("card_payment_not_recognised"));
         }
+    }
+
+    #[test]
+    fn test_catchall_bias_selects_highest_prob_negative_and_recomputes_margin() {
+        let mut builder = HierarchicalMapping::builder("CatchallTest");
+        // 定義順では other を先に、none を後に配置して走査順依存バグを再現できるようにする。
+        builder.add_category(
+            "ops",
+            "カード操作",
+            vec![
+                ("card_lost", "カードを紛失した。"),
+                ("other", "その他の問い合わせ。"),
+                ("card_damaged", "カードが破損した。"),
+                ("none", "該当なし。"),
+            ],
+        );
+        let mapping = builder.build().expect("マッピング構築に成功すること。");
+
+        // 元の Top-1 は card_lost (0.50)、Top-2 は none (0.28) なので元のマージンは 0.22。
+        let sorted_full = vec![
+            ("card_lost", 0.50),
+            ("none", 0.28),
+            ("other", 0.14),
+            ("card_damaged", 0.08),
+        ];
+
+        // 1. enable_catchall_bias = true: 定義順の other (0.14) ではなく最大確率の none (0.28) を選ぶ。
+        let (winner, conf, margin, triggered) =
+            resolve_winner_with_catchall_bias(&mapping, &sorted_full, true, 0.10)
+                .expect("勝者解決に成功すること。");
+        assert!(triggered);
+        assert_eq!(winner, "none");
+        assert!((conf - 0.28).abs() < 1e-9);
+        // 2 位以下からの昇格時は次点候補 (card_lost=0.50) との差によりマージンが 0.0 へ再計算される。
+        assert!((margin - 0.0).abs() < 1e-9);
+
+        // 2. 元々 1 位がネガティブ候補の場合は 1 位と 2 位の差がマージンとなる。
+        let sorted_top1_neg = vec![
+            ("none", 0.75),
+            ("card_lost", 0.15),
+            ("other", 0.10),
+            ("card_damaged", 0.00),
+        ];
+        let (winner2, conf2, margin2, triggered2) =
+            resolve_winner_with_catchall_bias(&mapping, &sorted_top1_neg, true, 0.10)
+                .expect("勝者解決に成功すること。");
+        assert!(triggered2);
+        assert_eq!(winner2, "none");
+        assert!((conf2 - 0.75).abs() < 1e-9);
+        assert!((margin2 - 0.60).abs() < 1e-9);
+
+        // 3. enable_catchall_bias = false: デフォルト勝者 card_lost と元のマージン 0.22 を維持する。
+        let (winner3, conf3, margin3, triggered3) =
+            resolve_winner_with_catchall_bias(&mapping, &sorted_full, false, 0.10)
+                .expect("勝者解決に成功すること。");
+        assert!(!triggered3);
+        assert_eq!(winner3, "card_lost");
+        assert!((conf3 - 0.50).abs() < 1e-9);
+        assert!((margin3 - 0.22).abs() < 1e-9);
     }
 }

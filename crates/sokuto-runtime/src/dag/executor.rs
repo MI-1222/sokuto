@@ -429,6 +429,29 @@ pub fn evaluate_conditions(
     None
 }
 
+/// 条件値 (`serde_json::Value`) を有限な `f64` として解釈する。
+///
+/// JSON 数値リテラルに加えて、`"3"` や `"3.0"` のような数値文字列もパースして返却する。
+fn parse_condition_f64(value: Option<&serde_json::Value>) -> Option<f64> {
+    let val = value?;
+    val.as_f64()
+        .or_else(|| val.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+        .filter(|n| n.is_finite())
+}
+
+/// 2 つの有限浮動小数点数を許容誤差 `1e-6` 付きで比較する。
+fn compare_f64_with_op(lhs: f64, op: NodeConditionOp, rhs: f64) -> bool {
+    match op {
+        NodeConditionOp::Eq => (lhs - rhs).abs() < 1e-6,
+        NodeConditionOp::Neq => (lhs - rhs).abs() >= 1e-6,
+        NodeConditionOp::Gt => lhs > rhs + 1e-6,
+        NodeConditionOp::Gte => lhs >= rhs - 1e-6,
+        NodeConditionOp::Lt => lhs < rhs - 1e-6,
+        NodeConditionOp::Lte => lhs <= rhs + 1e-6,
+        _ => false,
+    }
+}
+
 /// 単一条件の適合判定を行う。
 fn matches_condition(
     cond: &NodeCondition,
@@ -440,19 +463,15 @@ fn matches_condition(
     // 1. confidence フィールドの比較
     if field == "confidence" {
         let conf = answer.map(Answer::effective_confidence).unwrap_or(0.0);
-        let target_val = match &cond.value {
-            Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0),
-            _ => 0.0,
+        let Some(target_val) = parse_condition_f64(cond.value.as_ref()) else {
+            return false;
         };
-        return match cond.op {
-            NodeConditionOp::ConfidenceGte | NodeConditionOp::Gte => conf >= target_val - 1e-6,
-            NodeConditionOp::ConfidenceLt | NodeConditionOp::Lt => conf < target_val - 1e-6,
-            NodeConditionOp::Gt => conf > target_val + 1e-6,
-            NodeConditionOp::Lte => conf <= target_val + 1e-6,
-            NodeConditionOp::Eq => (conf - target_val).abs() < 1e-6,
-            NodeConditionOp::Neq => (conf - target_val).abs() >= 1e-6,
-            _ => false,
+        let normalized_op = match cond.op {
+            NodeConditionOp::ConfidenceGte => NodeConditionOp::Gte,
+            NodeConditionOp::ConfidenceLt => NodeConditionOp::Lt,
+            other => other,
         };
+        return compare_f64_with_op(conf, normalized_op, target_val);
     }
 
     // 2. route (ゲーティングルート) フィールドの比較
@@ -500,16 +519,8 @@ fn matches_condition(
             }
 
             // 数値による直接判定 (確率値そのものの閾値比較)
-            if let Some(target_num) = cond.value.as_ref().and_then(|v| v.as_f64()) {
-                return match cond.op {
-                    NodeConditionOp::Eq => (noul_val - target_num).abs() < 1e-6,
-                    NodeConditionOp::Neq => (noul_val - target_num).abs() >= 1e-6,
-                    NodeConditionOp::Gt => noul_val > target_num + 1e-6,
-                    NodeConditionOp::Gte => noul_val >= target_num - 1e-6,
-                    NodeConditionOp::Lt => noul_val < target_num - 1e-6,
-                    NodeConditionOp::Lte => noul_val <= target_num + 1e-6,
-                    _ => false,
-                };
+            if let Some(target_num) = parse_condition_f64(cond.value.as_ref()) {
+                return compare_f64_with_op(noul_val, cond.op, target_num);
             }
         }
 
@@ -537,16 +548,8 @@ fn matches_condition(
 
         // Score (数値) 型判定
         if let Some(score_val) = ans.as_score() {
-            let target_num = cond.value.as_ref().and_then(|v| v.as_f64()).unwrap_or(0.0);
-            return match cond.op {
-                NodeConditionOp::Eq => (score_val - target_num).abs() < 1e-6,
-                NodeConditionOp::Neq => (score_val - target_num).abs() >= 1e-6,
-                NodeConditionOp::Gt => score_val > target_num + 1e-6,
-                NodeConditionOp::Gte => score_val >= target_num - 1e-6,
-                NodeConditionOp::Lt => score_val < target_num - 1e-6,
-                NodeConditionOp::Lte => score_val <= target_num + 1e-6,
-                _ => false,
-            };
+            return parse_condition_f64(cond.value.as_ref())
+                .is_some_and(|target_num| compare_f64_with_op(score_val, cond.op, target_num));
         }
     }
 
@@ -574,7 +577,9 @@ fn matches_condition(
                 };
             }
             "confidence" => {
-                let target_num = cond.value.as_ref().and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let Some(target_num) = parse_condition_f64(cond.value.as_ref()) else {
+                    return false;
+                };
                 return match cond.op {
                     NodeConditionOp::ConfidenceGte | NodeConditionOp::Gte => {
                         ctx_val.confidence >= target_num - 1e-6
@@ -670,5 +675,119 @@ mod tests {
 
         let target = evaluate_conditions(&conditions, None, &context);
         assert_eq!(target, Some("escalate_fraud".to_string()));
+    }
+
+    #[test]
+    fn test_evaluate_conditions_score_and_numeric_string_values() {
+        let context = IndexMap::new();
+        let score_three = Answer::score(3.0, IndexMap::new(), 0.90);
+
+        // 1. 文字列数値 ("3", " 3.0 ") が正しくパースされ、数値リテラル同様に判定されること
+        assert_eq!(
+            evaluate_conditions(
+                &[NodeCondition {
+                    field: "answer".to_string(),
+                    op: NodeConditionOp::Eq,
+                    value: Some(serde_json::json!("3")),
+                    target_node: "exact_three".to_string(),
+                }],
+                Some(&score_three),
+                &context,
+            ),
+            Some("exact_three".to_string())
+        );
+
+        assert_eq!(
+            evaluate_conditions(
+                &[NodeCondition {
+                    field: "value".to_string(),
+                    op: NodeConditionOp::Gte,
+                    value: Some(serde_json::json!(" 3.0 ")),
+                    target_node: "gte_three".to_string(),
+                }],
+                Some(&score_three),
+                &context,
+            ),
+            Some("gte_three".to_string())
+        );
+
+        // 2. "4.0" が 0.0 にフォールバックして score_val > 0.0 と誤判定されないこと
+        assert_eq!(
+            evaluate_conditions(
+                &[NodeCondition {
+                    field: "answer".to_string(),
+                    op: NodeConditionOp::Gt,
+                    value: Some(serde_json::json!("4.0")),
+                    target_node: "gt_four".to_string(),
+                }],
+                Some(&score_three),
+                &context,
+            ),
+            None
+        );
+
+        // 3. 非数値文字列・NaN・None が 0.0 にフォールバックして誤マッチしないこと
+        let score_zero = Answer::score(0.0, IndexMap::new(), 0.90);
+        for invalid_val in [
+            Some(serde_json::json!("not_a_number")),
+            Some(serde_json::json!("NaN")),
+            None,
+        ] {
+            assert_eq!(
+                evaluate_conditions(
+                    &[NodeCondition {
+                        field: "answer".to_string(),
+                        op: NodeConditionOp::Gt,
+                        value: invalid_val.clone(),
+                        target_node: "should_not_match".to_string(),
+                    }],
+                    Some(&score_three),
+                    &context,
+                ),
+                None
+            );
+            assert_eq!(
+                evaluate_conditions(
+                    &[NodeCondition {
+                        field: "answer".to_string(),
+                        op: NodeConditionOp::Eq,
+                        value: invalid_val,
+                        target_node: "should_not_match_zero".to_string(),
+                    }],
+                    Some(&score_zero),
+                    &context,
+                ),
+                None
+            );
+        }
+
+        // 4. Noul 確率判定および confidence 判定でも文字列数値が解釈されること
+        let noul_high = Answer::noul(0.82);
+        assert_eq!(
+            evaluate_conditions(
+                &[NodeCondition {
+                    field: "answer".to_string(),
+                    op: NodeConditionOp::Gte,
+                    value: Some(serde_json::json!("0.80")),
+                    target_node: "noul_pass".to_string(),
+                }],
+                Some(&noul_high),
+                &context,
+            ),
+            Some("noul_pass".to_string())
+        );
+        assert_eq!(
+            evaluate_conditions(
+                &[NodeCondition {
+                    field: "confidence".to_string(),
+                    op: NodeConditionOp::ConfidenceGte,
+                    value: Some(serde_json::json!("0.85")),
+                    target_node: "conf_pass".to_string(),
+                }],
+                Some(&score_three),
+                &context,
+            ),
+            Some("conf_pass".to_string())
+        );
     }
 }

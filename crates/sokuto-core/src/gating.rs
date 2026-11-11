@@ -125,14 +125,21 @@ pub struct GatingThresholds {
     pub energy_temperature: Option<f64>,
 
     /// ハイブリッド OOD 判定用の緩和正規化自由エネルギー閾値 (任意)。
+    ///
+    /// 有効化する場合は [`Self::ood_min_confidence`] および [`Self::ood_min_margin`] と合わせて
+    /// 3 項目すべてを指定し、かつ [`Self::energy_threshold`] 以下の有限実数を設定する必要がある。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loose_energy_threshold: Option<f64>,
 
     /// ハイブリッド OOD 判定用の最小確信度閾値 (任意)。
+    ///
+    /// [`Self::loose_energy_threshold`] および [`Self::ood_min_margin`] と同時に指定する。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ood_min_confidence: Option<f64>,
 
     /// ハイブリッド OOD 判定用の最小マージン閾値 (任意)。
+    ///
+    /// [`Self::loose_energy_threshold`] および [`Self::ood_min_confidence`] と同時に指定する。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ood_min_margin: Option<f64>,
 }
@@ -169,6 +176,12 @@ impl GatingThresholds {
     }
 
     /// 閾値設定値の数学的妥当性を検証する。
+    ///
+    /// - 確信度・マージン関連閾値が `[0.0, 1.0]` に収まり、`low_threshold <= high_threshold` であることを検証する。
+    /// - `energy_threshold` が有限実数であり、`energy_temperature` 指定時は正の有限実数であることを検証する。
+    /// - `loose_energy_threshold` 指定時は有限実数かつ `loose_energy_threshold <= energy_threshold` であることを検証する。
+    /// - ハイブリッド OOD 閾値 (`loose_energy_threshold`, `ood_min_confidence`, `ood_min_margin`) は、
+    ///   すべて指定またはすべて未指定のいずれかであることを検証する。
     pub fn validate(&self) -> Result<()> {
         if self.high_threshold < 0.0 || self.high_threshold > 1.0 {
             return Err(CoreError::InvalidGatingConfig {
@@ -220,6 +233,23 @@ impl GatingThresholds {
                 ),
             });
         }
+        if let Some(loose_th) = self.loose_energy_threshold {
+            if !loose_th.is_finite() {
+                return Err(CoreError::InvalidGatingConfig {
+                    message: format!(
+                        "loose_energy_threshold ({loose_th}) は有限実数である必要があります。"
+                    ),
+                });
+            }
+            if loose_th > self.energy_threshold {
+                return Err(CoreError::InvalidGatingConfig {
+                    message: format!(
+                        "loose_energy_threshold ({loose_th}) は energy_threshold ({}) 以下である必要があります。",
+                        self.energy_threshold
+                    ),
+                });
+            }
+        }
         if let Some(c) = self.ood_min_confidence
             && !(0.0..=1.0).contains(&c)
         {
@@ -238,6 +268,14 @@ impl GatingThresholds {
                     "ood_min_margin ({}) は 0.0〜1.0 の範囲である必要があります。",
                     m
                 ),
+            });
+        }
+        let hybrid_set_count = usize::from(self.loose_energy_threshold.is_some())
+            + usize::from(self.ood_min_confidence.is_some())
+            + usize::from(self.ood_min_margin.is_some());
+        if hybrid_set_count != 0 && hybrid_set_count != 3 {
+            return Err(CoreError::InvalidGatingConfig {
+                message: "ハイブリッド OOD 判定を有効化する場合、loose_energy_threshold、ood_min_confidence、ood_min_margin は 3 つすべて指定するか、すべて未指定にする必要があります。".to_string(),
             });
         }
         Ok(())
@@ -1425,5 +1463,83 @@ mod tests {
         );
         assert_eq!(meta_id.route, DecisionRoute::ConfirmOrEscalate);
         assert!(!meta_id.is_ood);
+    }
+
+    #[test]
+    fn test_hybrid_ood_thresholds_validation() {
+        // 1. 3 項目すべて妥当に指定された場合は検証成功 (境界値 loose == energy を含む)。
+        let valid_hybrid = GatingThresholds {
+            energy_threshold: -1.0,
+            loose_energy_threshold: Some(-2.5),
+            ood_min_confidence: Some(0.65),
+            ood_min_margin: Some(0.20),
+            ..Default::default()
+        };
+        assert!(valid_hybrid.validate().is_ok());
+
+        let boundary_equal = GatingThresholds {
+            energy_threshold: -1.0,
+            loose_energy_threshold: Some(-1.0),
+            ood_min_confidence: Some(0.65),
+            ood_min_margin: Some(0.20),
+            ..Default::default()
+        };
+        assert!(boundary_equal.validate().is_ok());
+
+        // 2. loose_energy_threshold が非有限値 (NaN / +inf / -inf) の場合は拒否。
+        for non_finite in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let invalid = GatingThresholds {
+                energy_threshold: -1.0,
+                loose_energy_threshold: Some(non_finite),
+                ood_min_confidence: Some(0.65),
+                ood_min_margin: Some(0.20),
+                ..Default::default()
+            };
+            assert!(invalid.validate().is_err());
+        }
+
+        // 3. loose_energy_threshold > energy_threshold (閾値逆転) の場合は拒否。
+        let reversed_energy = GatingThresholds {
+            energy_threshold: -1.0,
+            loose_energy_threshold: Some(-0.5),
+            ood_min_confidence: Some(0.65),
+            ood_min_margin: Some(0.20),
+            ..Default::default()
+        };
+        assert!(reversed_energy.validate().is_err());
+
+        // 4. ハイブリッド OOD 項目の一部のみが設定された場合は拒否。
+        let partial_cases = [
+            GatingThresholds {
+                loose_energy_threshold: Some(-2.5),
+                ..Default::default()
+            },
+            GatingThresholds {
+                ood_min_confidence: Some(0.65),
+                ..Default::default()
+            },
+            GatingThresholds {
+                ood_min_margin: Some(0.20),
+                ..Default::default()
+            },
+            GatingThresholds {
+                loose_energy_threshold: Some(-2.5),
+                ood_min_confidence: Some(0.65),
+                ..Default::default()
+            },
+            GatingThresholds {
+                loose_energy_threshold: Some(-2.5),
+                ood_min_margin: Some(0.20),
+                ..Default::default()
+            },
+            GatingThresholds {
+                ood_min_confidence: Some(0.65),
+                ood_min_margin: Some(0.20),
+                ..Default::default()
+            },
+        ];
+        for partial in partial_cases {
+            assert!(partial.validate().is_err());
+        }
     }
 }

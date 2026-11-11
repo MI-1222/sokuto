@@ -328,31 +328,7 @@ impl<'a> CoarseToFineRouter<'a> {
 
         // 決定論的降順ソート (確率同値時は元の大分類インデックス昇順)
         let all_coarse_keys = self.mapping.all_coarse_keys();
-        let mut sorted_coarse: Vec<(&str, f64)> = all_coarse_keys
-            .iter()
-            .map(|k| {
-                (
-                    k.as_str(),
-                    coarse_probabilities.get(k).copied().unwrap_or(0.0),
-                )
-            })
-            .collect();
-
-        sorted_coarse.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| {
-                    let idx_a = all_coarse_keys
-                        .iter()
-                        .position(|k| k == a.0)
-                        .unwrap_or(usize::MAX);
-                    let idx_b = all_coarse_keys
-                        .iter()
-                        .position(|k| k == b.0)
-                        .unwrap_or(usize::MAX);
-                    idx_a.cmp(&idx_b)
-                })
-        });
+        let sorted_coarse = sort_probabilities_descending(all_coarse_keys, &coarse_probabilities);
 
         if sorted_coarse.is_empty() {
             return Err(RuntimeError::InvalidQuestion(
@@ -474,31 +450,7 @@ impl<'a> CoarseToFineRouter<'a> {
 
         // --- Step 6: 決定論的勝者選定および受け皿候補バイアス ---
         let all_fine_keys = self.mapping.all_fine_keys();
-        let mut sorted_full: Vec<(&str, f64)> = all_fine_keys
-            .iter()
-            .map(|k| {
-                (
-                    k.as_str(),
-                    full_probabilities.get(k).copied().unwrap_or(0.0),
-                )
-            })
-            .collect();
-
-        sorted_full.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| {
-                    let idx_a = all_fine_keys
-                        .iter()
-                        .position(|k| k == a.0)
-                        .unwrap_or(usize::MAX);
-                    let idx_b = all_fine_keys
-                        .iter()
-                        .position(|k| k == b.0)
-                        .unwrap_or(usize::MAX);
-                    idx_a.cmp(&idx_b)
-                })
-        });
+        let sorted_full = sort_probabilities_descending(all_fine_keys, &full_probabilities);
 
         let (final_winner, final_confidence, final_margin, catchall_bias_triggered) =
             resolve_winner_with_catchall_bias(
@@ -570,6 +522,31 @@ impl<'a> CoarseToFineRouter<'a> {
 
         Ok(HierarchicalResult { answer, trace })
     }
+}
+
+/// 候補キー順と確率マップから、確率降順 (同値時は元の定義順昇順) に並べた `(key, prob)` 列を返す。
+///
+/// 事前に出現インデックスをタプル `(usize, &str, f64)` として保持し、
+/// `f64::total_cmp` で全順序比較を行うことで $O(K \log K)$ で決定論的にソートする。
+fn sort_probabilities_descending<'a>(
+    keys: &'a [String],
+    probabilities: &IndexMap<String, f64>,
+) -> Vec<(&'a str, f64)> {
+    let mut items: Vec<(usize, &'a str, f64)> = keys
+        .iter()
+        .enumerate()
+        .map(|(idx, k)| {
+            (
+                idx,
+                k.as_str(),
+                probabilities.get(k).copied().unwrap_or(0.0),
+            )
+        })
+        .collect();
+
+    items.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+
+    items.into_iter().map(|(_, k, p)| (k, p)).collect()
 }
 
 /// 受け皿候補バイアス (`catchall_bias`) を適用して最終勝者・確信度・マージンを決定する。
@@ -1143,5 +1120,29 @@ mod tests {
         assert_eq!(winner3, "card_lost");
         assert!((conf3 - 0.50).abs() < 1e-9);
         assert!((margin3 - 0.22).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_sort_probabilities_descending_orders_and_breaks_ties() {
+        let keys = vec![
+            "k0".to_string(),
+            "k1".to_string(),
+            "k2".to_string(),
+            "k3".to_string(),
+            "k4_missing".to_string(),
+        ];
+        let mut probs = IndexMap::new();
+        probs.insert("k0".to_string(), 0.25);
+        probs.insert("k1".to_string(), 0.50);
+        probs.insert("k2".to_string(), 0.25);
+        probs.insert("k3".to_string(), 0.00);
+
+        let sorted = sort_probabilities_descending(&keys, &probs);
+        let ordered_keys: Vec<&str> = sorted.iter().map(|(k, _)| *k).collect();
+
+        // 確率降順 (k1=0.50 が先頭) かつ同値 (0.25 の k0, k2 / 0.00 の k3, k4_missing) は元の定義順を保つ。
+        assert_eq!(ordered_keys, vec!["k1", "k0", "k2", "k3", "k4_missing"]);
+        assert!((sorted[0].1 - 0.50).abs() < 1e-12);
+        assert!((sorted[4].1 - 0.0).abs() < 1e-12);
     }
 }

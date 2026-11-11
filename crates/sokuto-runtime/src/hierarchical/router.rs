@@ -8,14 +8,15 @@ use serde::{Deserialize, Serialize};
 use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_core::gating::{
     CandidateProbability, DecisionRoute, EscalationContext, GatingConfig, GatingMetadata,
+    evaluate_answer_gating_opts,
 };
-use sokuto_core::math::normalized_entropy;
 use sokuto_core::schema::{Answer, Criteria, Question, QuestionType};
 
 use crate::engine::InferenceEngine;
 use crate::engine::cache::{CachedStateFeatures, DualSessionEngine};
 use crate::engine::coarse::{HierarchicalCoarseScorer, ModelDrivenCoarseScorer};
 use crate::engine::escalation::build_rich_escalation_prompt;
+use crate::engine::gating::{calculate_choice_energy_with_config, resolve_gating_config};
 use crate::error::{Result, RuntimeError};
 use crate::hierarchical::calibration::{
     DEFAULT_COARSE_POWER_ALPHA, DEFAULT_ENTROPY_TEMP_GAMMA, DirichletCalibrator,
@@ -452,7 +453,7 @@ impl<'a> CoarseToFineRouter<'a> {
         let all_fine_keys = self.mapping.all_fine_keys();
         let sorted_full = sort_probabilities_descending(all_fine_keys, &full_probabilities);
 
-        let (final_winner, final_confidence, final_margin, catchall_bias_triggered) =
+        let (final_winner, final_confidence, _final_margin, catchall_bias_triggered) =
             resolve_winner_with_catchall_bias(
                 self.mapping,
                 &sorted_full,
@@ -460,48 +461,25 @@ impl<'a> CoarseToFineRouter<'a> {
                 self.config.catchall_threshold,
             )?;
 
-        // --- Step 7: 全候補空間基準での Gating 再計算 ---
-        let all_probs_slice: Vec<f64> = all_fine_keys
-            .iter()
-            .map(|k| full_probabilities.get(k).copied().unwrap_or(0.0))
-            .collect();
-
-        let final_norm_entropy = normalized_entropy(&all_probs_slice).unwrap_or(0.0);
-
-        // 生ロジットから正規化自由エネルギーを正確に算出
-        let fine_energy = crate::engine::gating::calculate_choice_energy(
+        // --- Step 7: 全候補空間基準での Gating 判定 (OOD 安全弁含む) ---
+        let fine_energy = calculate_choice_energy_with_config(
             &fine_question,
             &raw_logits,
             self.calib_config,
+            gating_config,
         );
+        let resolved_gating_config = resolve_gating_config(gating_config, self.calib_config);
 
-        // Gating 判定
-        let default_gating_config = GatingConfig::default();
-        let gc = gating_config.unwrap_or(&default_gating_config);
-        let final_route = if final_confidence >= gc.thresholds.high_threshold
-            && final_margin >= gc.thresholds.top_margin_threshold
-        {
-            DecisionRoute::AutoExecute
-        } else if final_confidence < gc.thresholds.low_threshold {
-            DecisionRoute::Fallback
-        } else {
-            DecisionRoute::ConfirmOrEscalate
-        };
-
+        let mut answer = Answer::choice(final_winner, full_probabilities, final_confidence);
         let gating = build_final_gating_metadata(
             self.mapping,
             state,
             instructions,
-            &sorted_full,
-            final_route,
-            final_confidence,
-            final_norm_entropy,
-            final_margin,
+            &answer,
+            &resolved_gating_config,
             fine_energy,
         );
-
-        let answer =
-            Answer::choice(final_winner, full_probabilities, final_confidence).with_gating(gating);
+        answer = answer.with_gating(gating);
 
         let trace = HierarchicalExecutionTrace {
             top1_coarse,
@@ -614,6 +592,29 @@ fn resolve_winner_with_catchall_bias(
     ))
 }
 
+/// 全細分類定義を含む `Question` を構築し、System 2 への CoT 委託プロンプト案を生成する。
+fn build_hierarchical_escalation_prompt(
+    mapping: &HierarchicalMapping,
+    state: &str,
+    instructions: &str,
+    gating: &GatingMetadata,
+    top_candidates: &[CandidateProbability],
+) -> String {
+    let escalation_question = Question {
+        question_type: QuestionType::Choice,
+        instructions: instructions.to_string(),
+        criteria: Some(Criteria::Map(mapping.fine_criteria.clone())),
+    };
+
+    build_rich_escalation_prompt(
+        Some(state),
+        None,
+        Some(&escalation_question),
+        gating,
+        top_candidates,
+    )
+}
+
 /// `AutoExecute` 以外のルーティング時に、`GatingMetadata` へ `EscalationContext` を付与する。
 ///
 /// 全細分類定義 (`mapping.fine_criteria`) を含む `Question` を構築し、
@@ -630,19 +631,8 @@ fn attach_escalation_context(
         return;
     }
 
-    let escalation_question = Question {
-        question_type: QuestionType::Choice,
-        instructions: instructions.to_string(),
-        criteria: Some(Criteria::Map(mapping.fine_criteria.clone())),
-    };
-
-    let prompt_template = build_rich_escalation_prompt(
-        Some(state),
-        None,
-        Some(&escalation_question),
-        gating,
-        &top_candidates,
-    );
+    let prompt_template =
+        build_hierarchical_escalation_prompt(mapping, state, instructions, gating, &top_candidates);
 
     gating.escalation = Some(EscalationContext {
         top_candidates,
@@ -654,41 +644,34 @@ fn attach_escalation_context(
 
 /// 通常ルーティング終了時 (Step 7) の `GatingMetadata` を構築する。
 ///
-/// `final_route != DecisionRoute::AutoExecute` の場合は、全候補空間へ復元された確率分布の上位 3 候補を抽出し、
-/// `EscalationContext` および System 2 委託プロンプト案を付与する。
-#[allow(clippy::too_many_arguments)]
+/// コア層の [`evaluate_answer_gating_opts`] へ自由エネルギー `fine_energy` とともに評価を委譲し、
+/// OOD 安全弁・マージンガード・3 系統ルーティング判定・`is_ood` フラグ・監査理由を一貫して算出する。
+/// `route != DecisionRoute::AutoExecute` の場合は、全候補定義を含む `Question` を構築して
+/// [`build_rich_escalation_prompt`] による System 2 委託プロンプト案を `EscalationContext` へ格納する。
 fn build_final_gating_metadata(
     mapping: &HierarchicalMapping,
     state: &str,
     instructions: &str,
-    sorted_full: &[(&str, f64)],
-    final_route: DecisionRoute,
-    final_confidence: f64,
-    final_norm_entropy: f64,
-    final_margin: f64,
+    answer: &Answer,
+    gating_config: &GatingConfig,
     fine_energy: Option<f64>,
 ) -> GatingMetadata {
-    let mut gating = GatingMetadata {
-        route: final_route,
-        confidence: final_confidence,
-        entropy: Some(final_norm_entropy),
-        margin: Some(final_margin),
-        energy: fine_energy,
-        is_ood: false,
-        reason: format!("Hierarchical decision routing (route={})", final_route),
-        escalation: None,
-    };
+    let mut gating =
+        evaluate_answer_gating_opts(answer, None, None, gating_config, fine_energy, false);
 
-    if final_route != DecisionRoute::AutoExecute {
-        let top_candidates: Vec<CandidateProbability> = sorted_full
-            .iter()
-            .take(3)
-            .map(|(k, p)| CandidateProbability {
-                candidate: (*k).to_string(),
-                probability: *p,
-            })
-            .collect();
-        attach_escalation_context(mapping, state, instructions, &mut gating, top_candidates);
+    if gating.route != DecisionRoute::AutoExecute {
+        let rich_prompt = gating.escalation.as_ref().map(|esc| {
+            build_hierarchical_escalation_prompt(
+                mapping,
+                state,
+                instructions,
+                &gating,
+                &esc.top_candidates,
+            )
+        });
+        if let (Some(esc), Some(prompt)) = (&mut gating.escalation, rich_prompt) {
+            esc.prompt_template = Some(prompt);
+        }
     }
 
     gating
@@ -995,43 +978,53 @@ mod tests {
         let mapping = HierarchicalMapping::banking77();
         let state = "カードの請求金額に身に覚えのない引き落としがあります。";
         let instructions = "お客様のお問い合わせ内容に最も適合するカテゴリを選択してください。";
-        let sorted_full = vec![
-            ("card_payment_not_recognised", 0.42),
-            ("direct_debit_payment_not_recognised", 0.31),
-            ("compromised_card", 0.12),
-            ("lost_or_stolen_card", 0.05),
-        ];
+        let gating_config = GatingConfig::default();
 
         // 1. AutoExecute 時はゼロアロケーション契約により escalation が None であること
+        let mut auto_probs = IndexMap::new();
+        auto_probs.insert("card_payment_not_recognised".to_string(), 0.85);
+        auto_probs.insert("direct_debit_payment_not_recognised".to_string(), 0.10);
+        auto_probs.insert("compromised_card".to_string(), 0.03);
+        auto_probs.insert("lost_or_stolen_card".to_string(), 0.02);
+        let auto_answer = Answer::choice("card_payment_not_recognised", auto_probs, 0.85);
+
         let auto_meta = build_final_gating_metadata(
             &mapping,
             state,
             instructions,
-            &sorted_full,
-            DecisionRoute::AutoExecute,
-            0.85,
-            0.12,
-            0.40,
+            &auto_answer,
+            &gating_config,
             Some(-2.5),
         );
         assert_eq!(auto_meta.route, DecisionRoute::AutoExecute);
+        assert!(!auto_meta.is_ood);
         assert!(auto_meta.escalation.is_none());
 
         // 2. ConfirmOrEscalate / Fallback 時は上位 3 候補と委託プロンプトが付与されること
-        for route in [DecisionRoute::ConfirmOrEscalate, DecisionRoute::Fallback] {
+        let mut mid_probs = IndexMap::new();
+        mid_probs.insert("card_payment_not_recognised".to_string(), 0.42);
+        mid_probs.insert("direct_debit_payment_not_recognised".to_string(), 0.31);
+        mid_probs.insert("compromised_card".to_string(), 0.15);
+        mid_probs.insert("lost_or_stolen_card".to_string(), 0.12);
+
+        let confirm_answer = Answer::choice("card_payment_not_recognised", mid_probs.clone(), 0.42);
+        let fallback_answer = Answer::choice("card_payment_not_recognised", mid_probs, 0.25);
+
+        for (answer, expected_route) in [
+            (confirm_answer, DecisionRoute::ConfirmOrEscalate),
+            (fallback_answer, DecisionRoute::Fallback),
+        ] {
             let meta = build_final_gating_metadata(
                 &mapping,
                 state,
                 instructions,
-                &sorted_full,
-                route,
-                0.42,
-                0.55,
-                0.11,
+                &answer,
+                &gating_config,
                 Some(-1.2),
             );
-            assert_eq!(meta.route, route);
-            assert_eq!(meta.margin, Some(0.11));
+            assert_eq!(meta.route, expected_route);
+            assert!(!meta.is_ood);
+            assert!((meta.margin.unwrap() - 0.11).abs() < 1e-9);
             assert_eq!(meta.energy, Some(-1.2));
 
             let esc = meta
@@ -1049,7 +1042,7 @@ mod tests {
                 "direct_debit_payment_not_recognised"
             );
             assert_eq!(esc.top_candidates[2].candidate, "compromised_card");
-            assert_eq!(esc.margin, Some(0.11));
+            assert!((esc.margin.unwrap() - 0.11).abs() < 1e-9);
             assert_eq!(esc.uncertainty_reason, meta.reason);
 
             let prompt = esc
@@ -1061,6 +1054,126 @@ mod tests {
             assert!(prompt.contains(instructions));
             assert!(prompt.contains("card_payment_not_recognised"));
         }
+    }
+
+    #[test]
+    fn test_final_gating_metadata_ood_safety_valve() {
+        use sokuto_core::gating::GatingThresholds;
+
+        let mapping = HierarchicalMapping::banking77();
+        let state = "今日の東京の天気と明日の傘の必要性を教えてください。";
+        let instructions = "お客様のお問い合わせ内容に最も適合するカテゴリを選択してください。";
+
+        // 見かけの softmax 確信度とマージンが高くても、自由エネルギーが閾値超過なら OOD 発動
+        let mut probs = IndexMap::new();
+        probs.insert("card_payment_not_recognised".to_string(), 0.90);
+        probs.insert("direct_debit_payment_not_recognised".to_string(), 0.05);
+        probs.insert("compromised_card".to_string(), 0.05);
+        let high_conf_answer = Answer::choice("card_payment_not_recognised", probs.clone(), 0.90);
+
+        let default_gc = GatingConfig::default(); // ood_enabled=true, energy_threshold=-1.0
+        let ood_meta = build_final_gating_metadata(
+            &mapping,
+            state,
+            instructions,
+            &high_conf_answer,
+            &default_gc,
+            Some(0.25),
+        );
+        assert_eq!(ood_meta.route, DecisionRoute::Fallback);
+        assert!(ood_meta.is_ood);
+        assert_eq!(ood_meta.energy, Some(0.25));
+        assert!(ood_meta.reason.contains("OOD"));
+        let esc = ood_meta
+            .escalation
+            .as_ref()
+            .expect("OOD Fallback 時は EscalationContext が必須であること。");
+        let prompt = esc
+            .prompt_template
+            .as_ref()
+            .expect("OOD 警告付きプロンプトが生成されていること。");
+        assert!(prompt.contains("Out-of-Distribution"));
+
+        // ood_enabled: false の場合は同じエネルギーでも AutoExecute になること
+        let disabled_ood_gc = GatingConfig {
+            enabled: true,
+            thresholds: GatingThresholds {
+                ood_enabled: false,
+                ..Default::default()
+            },
+        };
+        let non_ood_meta = build_final_gating_metadata(
+            &mapping,
+            state,
+            instructions,
+            &high_conf_answer,
+            &disabled_ood_gc,
+            Some(0.25),
+        );
+        assert_eq!(non_ood_meta.route, DecisionRoute::AutoExecute);
+        assert!(!non_ood_meta.is_ood);
+        assert!(non_ood_meta.escalation.is_none());
+
+        // ハイブリッド OOD (loose_energy_threshold + 低マージン) による Fallback 発動
+        let mut close_probs = IndexMap::new();
+        close_probs.insert("card_payment_not_recognised".to_string(), 0.52);
+        close_probs.insert("direct_debit_payment_not_recognised".to_string(), 0.45);
+        close_probs.insert("compromised_card".to_string(), 0.03);
+        let close_answer = Answer::choice("card_payment_not_recognised", close_probs, 0.52);
+
+        let hybrid_gc = GatingConfig {
+            enabled: true,
+            thresholds: GatingThresholds {
+                ood_enabled: true,
+                energy_threshold: 0.0,
+                loose_energy_threshold: Some(-1.5),
+                ood_min_confidence: Some(0.40),
+                ood_min_margin: Some(0.15),
+                ..Default::default()
+            },
+        };
+        let hybrid_meta = build_final_gating_metadata(
+            &mapping,
+            state,
+            instructions,
+            &close_answer,
+            &hybrid_gc,
+            Some(-1.0),
+        );
+        assert_eq!(hybrid_meta.route, DecisionRoute::Fallback);
+        assert!(hybrid_meta.is_ood);
+    }
+
+    #[test]
+    fn test_final_gating_metadata_margin_guard_demotion() {
+        let mapping = HierarchicalMapping::banking77();
+        let state = "カードの引き落としについて確認したいです。";
+        let instructions = "お客様のお問い合わせ内容に最も適合するカテゴリを選択してください。";
+        let gating_config = GatingConfig::default();
+
+        // 多クラス空間 (例: 10クラス中上位2候補に集中し残りが 0) でエントロピー確信度 >= 0.70 だが
+        // 上位2候補が僅差 (margin = 0.04 < 0.15) のとき、マージンガードにより ConfirmOrEscalate へ降格する。
+        let mut probs = IndexMap::new();
+        probs.insert("card_payment_not_recognised".to_string(), 0.52);
+        probs.insert("direct_debit_payment_not_recognised".to_string(), 0.48);
+        for key in mapping.all_fine_keys().iter().skip(2).take(18) {
+            probs.insert(key.clone(), 0.0);
+        }
+        // confidence を 0.30 (< low_threshold=0.35) にしても、entropy_conf >= 0.70 かつ margin < 0.15 なら
+        // コア層のマージンガードが先に発火して ConfirmOrEscalate に降格される。
+        let answer = Answer::choice("card_payment_not_recognised", probs, 0.30);
+
+        let meta = build_final_gating_metadata(
+            &mapping,
+            state,
+            instructions,
+            &answer,
+            &gating_config,
+            Some(-3.0),
+        );
+        assert_eq!(meta.route, DecisionRoute::ConfirmOrEscalate);
+        assert!(!meta.is_ood);
+        assert!(meta.escalation.is_some());
     }
 
     #[test]

@@ -27,12 +27,11 @@ fn evaluate_choice_map_with_buf(
     map: &IndexMap<String, String>,
     temperature: f64,
     probs_buf: &mut [f64],
-    question_id: Option<&str>,
 ) -> Result<Answer> {
     let k = map.len();
     if logits.len() != k {
         return Err(CoreError::MathError {
-            question_id: question_id.map(str::to_string),
+            question_id: None,
             message: format!(
                 "ロジットの要素数({logits_len})が候補数({k})と一致しません。",
                 logits_len = logits.len()
@@ -41,11 +40,10 @@ fn evaluate_choice_map_with_buf(
     }
 
     // ゼロアロケーション版ソフトマックスの実行(出力バッファ長検証を含む)。
-    attach_question_id(softmax_into(logits, probs_buf, temperature), question_id)?;
+    softmax_into(logits, probs_buf, temperature)?;
 
     // 決定論的タイブレーク付き最大値インデックスおよび複合確信度スコアの単一パス算出。
-    let (confidence, best_idx) =
-        attach_question_id(composite_confidence_and_argmax(probs_buf), question_id)?;
+    let (confidence, best_idx) = composite_confidence_and_argmax(probs_buf)?;
     let (selected_key, _) = map
         .get_index(best_idx)
         .expect("best_idx は 0..k の範囲内であることが保証されている。");
@@ -90,8 +88,10 @@ pub fn evaluate_choice_with_buf(
     probs_buf: &mut [f64],
     question_id: Option<&str>,
 ) -> Result<Answer> {
-    let map = criteria.validate_choice_map(question_id)?;
-    evaluate_choice_map_with_buf(logits, map, temperature, probs_buf, question_id)
+    let res = criteria
+        .validate_choice_map(None)
+        .and_then(|map| evaluate_choice_map_with_buf(logits, map, temperature, probs_buf));
+    attach_question_id(res, question_id)
 }
 
 /// Choice プリミティブの生ロジットから採択候補、確率分布、および正規化確信度を算出する。
@@ -109,12 +109,11 @@ fn evaluate_score_list_with_buf(
     list: &[String],
     temperature: f64,
     probs_buf: &mut [f64],
-    question_id: Option<&str>,
 ) -> Result<Answer> {
     let m = list.len();
     if logits.len() != m {
         return Err(CoreError::MathError {
-            question_id: question_id.map(str::to_string),
+            question_id: None,
             message: format!(
                 "ロジットの要素数({logits_len})が段階数({m})と一致しません。",
                 logits_len = logits.len()
@@ -123,11 +122,10 @@ fn evaluate_score_list_with_buf(
     }
 
     // ゼロアロケーション版ソフトマックス確率分布の算出(出力バッファ長検証を含む)。
-    attach_question_id(softmax_into(logits, probs_buf, temperature), question_id)?;
+    softmax_into(logits, probs_buf, temperature)?;
 
     // 単一パス走査による加重平均期待値(スコア)および事後分散の算出。
-    let (m_observed, score_val, var) =
-        attach_question_id(score_moments_iter(probs_buf.iter()), question_id)?;
+    let (m_observed, score_val, var) = score_moments_iter(probs_buf.iter())?;
 
     // 順序尺度分散確信度の算出。
     let confidence = normalized_variance_confidence_from_variance(m_observed, var);
@@ -181,8 +179,10 @@ pub fn evaluate_score_with_buf(
     probs_buf: &mut [f64],
     question_id: Option<&str>,
 ) -> Result<Answer> {
-    let list = criteria.validate_score_list(question_id)?;
-    evaluate_score_list_with_buf(logits, list, temperature, probs_buf, question_id)
+    let res = criteria
+        .validate_score_list(None)
+        .and_then(|list| evaluate_score_list_with_buf(logits, list, temperature, probs_buf));
+    attach_question_id(res, question_id)
 }
 
 /// Score プリミティブの生ロジットから加重平均連続値スコア、確率分布、および分散確信度を算出する。
@@ -240,16 +240,14 @@ pub fn evaluate_question_with_buf(
     question_id: Option<&str>,
 ) -> Result<Answer> {
     let res = match question.question_type {
-        QuestionType::Choice => {
-            let map = question.validate_choice_map(question_id)?;
+        QuestionType::Choice => question.validate_choice_map(None).and_then(|map| {
             let temperature = config.get_temperature(QuestionType::Choice, map.len());
-            evaluate_choice_map_with_buf(logits, map, temperature, probs_buf, question_id)
-        }
-        QuestionType::Score => {
-            let list = question.validate_score_list(question_id)?;
+            evaluate_choice_map_with_buf(logits, map, temperature, probs_buf)
+        }),
+        QuestionType::Score => question.validate_score_list(None).and_then(|list| {
             let temperature = config.get_temperature(QuestionType::Score, list.len());
-            evaluate_score_list_with_buf(logits, list, temperature, probs_buf, question_id)
-        }
+            evaluate_score_list_with_buf(logits, list, temperature, probs_buf)
+        }),
         QuestionType::Noul => {
             let temperature = config.get_temperature(QuestionType::Noul, 2);
             evaluate_noul(logits, temperature)
@@ -619,5 +617,53 @@ mod tests {
             err_score,
             CoreError::InvalidScoreLevelCount { .. }
         ));
+
+        // 6. evaluate_choice_with_buf / evaluate_score_with_buf / evaluate_question_with_buf における
+        //    softmax_into 失敗時にも外周の attach_question_id で question_id が 1 回のみ付与されること
+        let valid_choice_criteria = valid_q.criteria.as_ref().unwrap();
+        let mut choice_buf = [0.0; 2];
+        let err_choice_nan = evaluate_choice_with_buf(
+            &[f64::NAN, 1.0],
+            valid_choice_criteria,
+            1.0,
+            &mut choice_buf,
+            Some("choice_nan"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err_choice_nan
+                .to_string()
+                .matches("質問 'choice_nan': ")
+                .count(),
+            1
+        );
+
+        let valid_score_criteria = Criteria::List(vec!["1".to_string(), "2".to_string()]);
+        let mut score_nan_buf = [0.0; 2];
+        let err_score_nan = evaluate_score_with_buf(
+            &[1.0, f64::NAN],
+            &valid_score_criteria,
+            1.0,
+            &mut score_nan_buf,
+            Some("score_nan"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err_score_nan
+                .to_string()
+                .matches("質問 'score_nan': ")
+                .count(),
+            1
+        );
+
+        let err_q_nan = evaluate_question_with_buf(
+            &valid_q,
+            &[f64::NAN, 1.0],
+            &config,
+            &mut choice_buf,
+            Some("q_nan"),
+        )
+        .unwrap_err();
+        assert_eq!(err_q_nan.to_string().matches("質問 'q_nan': ").count(), 1);
     }
 }

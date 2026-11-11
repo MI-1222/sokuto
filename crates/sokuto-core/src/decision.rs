@@ -197,23 +197,24 @@ pub fn evaluate_score(logits: &[f64], criteria: &Criteria, temperature: f64) -> 
 /// Noul プリミティブの生ロジットから真偽確率判定結果を算出する。
 ///
 /// # 概要
-/// - 入力ロジットの先頭 2 要素 $(z_{\text{true}}, z_{\text{false}})$ の差分から、
+/// - 入力ロジットの 2 要素 $(z_{\text{true}}, z_{\text{false}})$ の差分から、
 ///   数値安定シグモイド関数により言明が真である確率 $P(\text{true}) \in [0.0, 1.0]$ を直接算出する。
 /// - Jev 公式 API 契約に従い、Noul 型の判定結果では `choice`, `score`, `probabilities`, `confidence`
 ///   をすべて `None` とし、`noul: Some(P(true))` のみを格納した `Answer` を返却する。
+/// - Choice や Score と同様に、入力ロジット要素数が 2 と一致しない場合は `CoreError::MathError` として拒否する。
 ///
 /// # 引数
-/// - `logits`: 生ロジットスライス(`f64`)。先頭 2 要素がそれぞれ真・偽に対応する。
+/// - `logits`: 生ロジットスライス(`f64`)。真・偽に対応する厳密に 2 要素が必要。
 /// - `temperature`: 適用する較正温度パラメータ $\tau$。
 ///
 /// # 戻り値
-/// - 成功時は Noul 判定が格納された `Answer`、要素数不足等の場合は `CoreError`。
+/// - 成功時は Noul 判定が格納された `Answer`、要素数不一致等の場合は `CoreError`。
 pub fn evaluate_noul(logits: &[f64], temperature: f64) -> Result<Answer> {
-    if logits.len() < 2 {
+    if logits.len() != 2 {
         return Err(CoreError::MathError {
             question_id: None,
             message: format!(
-                "Noul 判定には真・偽に対応する 2 要素以上のロジットが必要です(指定数: {})。",
+                "Noul 判定には真・偽に対応する厳密に 2 要素のロジットが必要です(指定数: {})。",
                 logits.len()
             ),
         });
@@ -472,8 +473,19 @@ mod tests {
         let prob = answer.as_noul().unwrap();
         assert!(prob > 0.90 && prob <= 1.0);
 
-        // 異常系: ロジット数が 2 未満
-        assert!(evaluate_noul(&[1.0], 1.0).is_err());
+        // 異常系: ロジット数が 2 以外 (不足・過剰)
+        assert!(matches!(
+            evaluate_noul(&[], 1.0),
+            Err(CoreError::MathError { .. })
+        ));
+        assert!(matches!(
+            evaluate_noul(&[1.0], 1.0),
+            Err(CoreError::MathError { .. })
+        ));
+        assert!(matches!(
+            evaluate_noul(&[1.0, 0.0, 0.5], 1.0),
+            Err(CoreError::MathError { .. })
+        ));
     }
 
     #[test]

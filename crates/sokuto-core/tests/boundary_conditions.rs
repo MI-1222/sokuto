@@ -259,6 +259,12 @@ mod structural_bounds {
             evaluate_noul(&[1.0], 1.0),
             Err(CoreError::MathError { .. })
         ));
+
+        // 長さ 3 (異常系: 過剰要素)
+        assert!(matches!(
+            evaluate_noul(&[1.0, 0.0, -1.0], 1.0),
+            Err(CoreError::MathError { .. })
+        ));
     }
 
     #[test]

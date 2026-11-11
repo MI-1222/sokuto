@@ -448,149 +448,204 @@ fn compare_f64_with_op(lhs: f64, op: NodeConditionOp, rhs: f64) -> bool {
     }
 }
 
+/// コンテキストノード参照 (`node_id.prop`) で参照可能なプロパティ種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextProp {
+    /// 先行ノードの回答値 (`value` / `answer`)。
+    Value,
+    /// 先行ノードの確信度 (`confidence`)。
+    Confidence,
+}
+
+/// `NodeCondition.field` 文字列をパースした型安全な評価対象フィールド。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConditionField<'a> {
+    /// 現在のノードの実効確信度 (`confidence`)。
+    Confidence,
+    /// 現在のノードのゲーティングルート (`route`)。
+    Route,
+    /// 現在のノードの判定結果値 (`answer` / `value`)。
+    Answer,
+    /// 先行ノードの出力コンテキスト参照 (`<node_id>.<prop>`)。
+    ContextProperty { node_id: &'a str, prop: ContextProp },
+    /// 未定義または構文不正なフィールド名。
+    Unknown,
+}
+
+impl<'a> ConditionField<'a> {
+    /// フィールド名文字列を `ConditionField` にパースする。
+    fn parse(field: &'a str) -> Self {
+        match field {
+            "confidence" => Self::Confidence,
+            "route" => Self::Route,
+            "answer" | "value" => Self::Answer,
+            _ => match field.split_once('.') {
+                Some((node_id, "value" | "answer")) => Self::ContextProperty {
+                    node_id,
+                    prop: ContextProp::Value,
+                },
+                Some((node_id, "confidence")) => Self::ContextProperty {
+                    node_id,
+                    prop: ContextProp::Confidence,
+                },
+                _ => Self::Unknown,
+            },
+        }
+    }
+}
+
 /// 単一条件の適合判定を行う。
 fn matches_condition(
     cond: &NodeCondition,
     answer: Option<&Answer>,
     context: &IndexMap<String, NodeContextValue>,
 ) -> bool {
-    let field = cond.field.as_str();
-
-    // 1. confidence フィールドの比較
-    if field == "confidence" {
-        let conf = answer.map(Answer::effective_confidence).unwrap_or(0.0);
-        let Some(target_val) = parse_condition_f64(cond.value.as_ref()) else {
-            return false;
-        };
-        let normalized_op = match cond.op {
-            NodeConditionOp::ConfidenceGte => NodeConditionOp::Gte,
-            NodeConditionOp::ConfidenceLt => NodeConditionOp::Lt,
-            other => other,
-        };
-        return compare_f64_with_op(conf, normalized_op, target_val);
+    match ConditionField::parse(&cond.field) {
+        ConditionField::Confidence => matches_confidence(cond, answer),
+        ConditionField::Route => matches_route(cond, answer),
+        ConditionField::Answer => answer.is_some_and(|ans| matches_answer_value(cond, ans)),
+        ConditionField::ContextProperty { node_id, prop } => context
+            .get(node_id)
+            .is_some_and(|ctx_val| matches_context_property(cond, ctx_val, prop)),
+        ConditionField::Unknown => false,
     }
+}
 
-    // 2. route (ゲーティングルート) フィールドの比較
-    if field == "route" {
-        let route_str = answer
-            .and_then(|a| a.gating.as_ref())
-            .map(|g| match g.route {
-                DecisionRoute::AutoExecute => "auto_execute",
-                DecisionRoute::ConfirmOrEscalate => "confirm_or_escalate",
-                DecisionRoute::Fallback => "fallback",
-            })
-            .unwrap_or("auto_execute");
+/// `confidence` フィールドに対する閾値比較を評価する。
+fn matches_confidence(cond: &NodeCondition, answer: Option<&Answer>) -> bool {
+    let conf = answer.map(Answer::effective_confidence).unwrap_or(0.0);
+    let Some(target_val) = parse_condition_f64(cond.value.as_ref()) else {
+        return false;
+    };
+    let normalized_op = match cond.op {
+        NodeConditionOp::ConfidenceGte => NodeConditionOp::Gte,
+        NodeConditionOp::ConfidenceLt => NodeConditionOp::Lt,
+        other => other,
+    };
+    compare_f64_with_op(conf, normalized_op, target_val)
+}
 
-        let target_str = cond.value.as_ref().and_then(|v| v.as_str()).unwrap_or("");
+/// `route` (ゲーティングルート) フィールドの一致比較を評価する。
+fn matches_route(cond: &NodeCondition, answer: Option<&Answer>) -> bool {
+    let route_str = answer
+        .and_then(|a| a.gating.as_ref())
+        .map(|g| match g.route {
+            DecisionRoute::AutoExecute => "auto_execute",
+            DecisionRoute::ConfirmOrEscalate => "confirm_or_escalate",
+            DecisionRoute::Fallback => "fallback",
+        })
+        .unwrap_or("auto_execute");
+
+    let target_str = cond.value.as_ref().and_then(|v| v.as_str()).unwrap_or("");
+    match cond.op {
+        NodeConditionOp::Eq => route_str == target_str,
+        NodeConditionOp::Neq => route_str != target_str,
+        _ => false,
+    }
+}
+
+/// `answer` / `value` フィールドに対する型別 (Noul / Choice / Score) 条件評価を行う。
+fn matches_answer_value(cond: &NodeCondition, ans: &Answer) -> bool {
+    if let Some(noul_val) = ans.as_noul() {
+        return matches_noul_value(cond, noul_val);
+    }
+    if let Some(choice_val) = ans.as_choice() {
+        return matches_choice_value(cond, choice_val);
+    }
+    if let Some(score_val) = ans.as_score() {
+        return parse_condition_f64(cond.value.as_ref())
+            .is_some_and(|target_num| compare_f64_with_op(score_val, cond.op, target_num));
+    }
+    false
+}
+
+/// Noul 判定の真偽確率に対する真偽値または数値閾値比較を評価する。
+fn matches_noul_value(cond: &NodeCondition, noul_val: f64) -> bool {
+    let target_bool = match &cond.value {
+        Some(serde_json::Value::Bool(b)) => Some(*b),
+        Some(serde_json::Value::String(s)) => match s.as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(tb) = target_bool {
+        let is_true = noul_val >= 0.5;
         return match cond.op {
-            NodeConditionOp::Eq => route_str == target_str,
-            NodeConditionOp::Neq => route_str != target_str,
+            NodeConditionOp::Eq => is_true == tb,
+            NodeConditionOp::Neq => is_true != tb,
             _ => false,
         };
     }
 
-    // 3. answer / value フィールドの比較
-    if (field == "answer" || field == "value")
-        && let Some(ans) = answer
-    {
-        // Noul (言明真実確率値 f64: 0.0〜1.0) 型判定
-        if let Some(noul_val) = ans.as_noul() {
-            // bool リテラルまたは文字列による判定 (true: >= 0.5, false: < 0.5)
-            let target_bool = match &cond.value {
-                Some(serde_json::Value::Bool(b)) => Some(*b),
-                Some(serde_json::Value::String(s)) => match s.as_str() {
-                    "true" => Some(true),
-                    "false" => Some(false),
-                    _ => None,
-                },
-                _ => None,
+    parse_condition_f64(cond.value.as_ref())
+        .is_some_and(|target_num| compare_f64_with_op(noul_val, cond.op, target_num))
+}
+
+/// Choice 判定の選択キーに対する文字列比較および集合包含 (`In`) 比較を評価する。
+fn matches_choice_value(cond: &NodeCondition, choice_val: &str) -> bool {
+    match cond.op {
+        NodeConditionOp::Eq => {
+            let target_str = cond.value.as_ref().and_then(|v| v.as_str()).unwrap_or("");
+            choice_val == target_str
+        }
+        NodeConditionOp::Neq => {
+            let target_str = cond.value.as_ref().and_then(|v| v.as_str()).unwrap_or("");
+            choice_val != target_str
+        }
+        NodeConditionOp::In => cond
+            .value
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| {
+                arr.iter()
+                    .any(|item| item.as_str().is_some_and(|s| s == choice_val))
+            }),
+        _ => false,
+    }
+}
+
+/// 先行ノードのコンテキストプロパティ (`value` / `confidence`) を評価する。
+fn matches_context_property(
+    cond: &NodeCondition,
+    ctx_val: &NodeContextValue,
+    prop: ContextProp,
+) -> bool {
+    match prop {
+        ContextProp::Value => {
+            let num_str;
+            let target_str = match &cond.value {
+                Some(serde_json::Value::String(s)) => s.as_str(),
+                Some(serde_json::Value::Bool(true)) => "true",
+                Some(serde_json::Value::Bool(false)) => "false",
+                Some(serde_json::Value::Number(n)) => {
+                    num_str = n.to_string();
+                    num_str.as_str()
+                }
+                _ => "",
             };
-            if let Some(tb) = target_bool {
-                let is_true = noul_val >= 0.5;
-                return match cond.op {
-                    NodeConditionOp::Eq => is_true == tb,
-                    NodeConditionOp::Neq => is_true != tb,
-                    _ => false,
-                };
-            }
-
-            // 数値による直接判定 (確率値そのものの閾値比較)
-            if let Some(target_num) = parse_condition_f64(cond.value.as_ref()) {
-                return compare_f64_with_op(noul_val, cond.op, target_num);
-            }
-        }
-
-        // Choice (文字列) 型判定
-        if let Some(choice_val) = ans.as_choice() {
             match cond.op {
-                NodeConditionOp::Eq => {
-                    let target_str = cond.value.as_ref().and_then(|v| v.as_str()).unwrap_or("");
-                    return choice_val == target_str;
-                }
-                NodeConditionOp::Neq => {
-                    let target_str = cond.value.as_ref().and_then(|v| v.as_str()).unwrap_or("");
-                    return choice_val != target_str;
-                }
-                NodeConditionOp::In => {
-                    if let Some(serde_json::Value::Array(arr)) = &cond.value {
-                        return arr
-                            .iter()
-                            .any(|item| item.as_str().is_some_and(|s| s == choice_val));
-                    }
-                }
-                _ => {}
+                NodeConditionOp::Eq => ctx_val.value == target_str,
+                NodeConditionOp::Neq => ctx_val.value != target_str,
+                _ => false,
             }
         }
-
-        // Score (数値) 型判定
-        if let Some(score_val) = ans.as_score() {
-            return parse_condition_f64(cond.value.as_ref())
-                .is_some_and(|target_num| compare_f64_with_op(score_val, cond.op, target_num));
+        ContextProp::Confidence => {
+            let Some(target_num) = parse_condition_f64(cond.value.as_ref()) else {
+                return false;
+            };
+            match cond.op {
+                NodeConditionOp::ConfidenceGte | NodeConditionOp::Gte => {
+                    ctx_val.confidence >= target_num - 1e-6
+                }
+                NodeConditionOp::ConfidenceLt | NodeConditionOp::Lt => {
+                    ctx_val.confidence < target_num - 1e-6
+                }
+                _ => false,
+            }
         }
     }
-
-    // 4. コンテキスト内の先行ノード ID 直接参照 (例: `node_id.value`)
-    if let Some((node_id, prop)) = field.split_once('.')
-        && let Some(ctx_val) = context.get(node_id)
-    {
-        match prop {
-            "value" | "answer" => {
-                let num_str;
-                let target_str = match &cond.value {
-                    Some(serde_json::Value::String(s)) => s.as_str(),
-                    Some(serde_json::Value::Bool(true)) => "true",
-                    Some(serde_json::Value::Bool(false)) => "false",
-                    Some(serde_json::Value::Number(n)) => {
-                        num_str = n.to_string();
-                        num_str.as_str()
-                    }
-                    _ => "",
-                };
-                return match cond.op {
-                    NodeConditionOp::Eq => ctx_val.value == target_str,
-                    NodeConditionOp::Neq => ctx_val.value != target_str,
-                    _ => false,
-                };
-            }
-            "confidence" => {
-                let Some(target_num) = parse_condition_f64(cond.value.as_ref()) else {
-                    return false;
-                };
-                return match cond.op {
-                    NodeConditionOp::ConfidenceGte | NodeConditionOp::Gte => {
-                        ctx_val.confidence >= target_num - 1e-6
-                    }
-                    NodeConditionOp::ConfidenceLt | NodeConditionOp::Lt => {
-                        ctx_val.confidence < target_num - 1e-6
-                    }
-                    _ => false,
-                };
-            }
-            _ => {}
-        }
-    }
-
-    false
 }
 
 #[cfg(test)]
@@ -784,6 +839,96 @@ mod tests {
                 &context,
             ),
             Some("conf_pass".to_string())
+        );
+    }
+
+    #[test]
+    fn test_condition_field_parse_and_route_in_context_variants() {
+        assert_eq!(
+            ConditionField::parse("confidence"),
+            ConditionField::Confidence
+        );
+        assert_eq!(ConditionField::parse("route"), ConditionField::Route);
+        assert_eq!(ConditionField::parse("answer"), ConditionField::Answer);
+        assert_eq!(ConditionField::parse("value"), ConditionField::Answer);
+        assert_eq!(
+            ConditionField::parse("node_a.value"),
+            ConditionField::ContextProperty {
+                node_id: "node_a",
+                prop: ContextProp::Value,
+            }
+        );
+        assert_eq!(
+            ConditionField::parse("node_a.confidence"),
+            ConditionField::ContextProperty {
+                node_id: "node_a",
+                prop: ContextProp::Confidence,
+            }
+        );
+        assert_eq!(
+            ConditionField::parse("node_a.unknown_prop"),
+            ConditionField::Unknown
+        );
+        assert_eq!(
+            ConditionField::parse("unsupported"),
+            ConditionField::Unknown
+        );
+
+        // route / In / context.confidence / Unknown の各分岐評価
+        let mut context = IndexMap::new();
+        context.insert(
+            "prev_node".to_string(),
+            NodeContextValue::new("card_lost", 0.72),
+        );
+
+        let gating = sokuto_core::gating::GatingMetadata {
+            route: DecisionRoute::ConfirmOrEscalate,
+            confidence: 0.55,
+            entropy: None,
+            margin: None,
+            energy: None,
+            is_ood: false,
+            reason: "test".to_string(),
+            escalation: None,
+        };
+        let ans = Answer::choice("card_lost", IndexMap::new(), 0.55).with_gating(gating);
+
+        let conditions = vec![
+            NodeCondition {
+                field: "unknown_field".to_string(),
+                op: NodeConditionOp::Eq,
+                value: Some(serde_json::json!("anything")),
+                target_node: "never".to_string(),
+            },
+            NodeCondition {
+                field: "prev_node.confidence".to_string(),
+                op: NodeConditionOp::Gte,
+                value: Some(serde_json::json!(0.80)),
+                target_node: "high_prev_conf".to_string(),
+            },
+            NodeCondition {
+                field: "route".to_string(),
+                op: NodeConditionOp::Eq,
+                value: Some(serde_json::json!("confirm_or_escalate")),
+                target_node: "escalate_node".to_string(),
+            },
+            NodeCondition {
+                field: "answer".to_string(),
+                op: NodeConditionOp::In,
+                value: Some(serde_json::json!(["card_lost", "card_stolen"])),
+                target_node: "card_issue".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            evaluate_conditions(&conditions, Some(&ans), &context),
+            Some("escalate_node".to_string())
+        );
+
+        // route をスキップした後は Choice の In がマッチする
+        assert_eq!(
+            evaluate_conditions(&conditions[3..], Some(&ans), &context),
+            Some("card_issue".to_string())
         );
     }
 }

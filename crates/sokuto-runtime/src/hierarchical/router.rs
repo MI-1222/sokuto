@@ -6,13 +6,16 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use sokuto_core::contract::calibration::CalibrationConfig;
-use sokuto_core::gating::{DecisionRoute, GatingConfig, GatingMetadata};
+use sokuto_core::gating::{
+    CandidateProbability, DecisionRoute, EscalationContext, GatingConfig, GatingMetadata,
+};
 use sokuto_core::math::{normalized_entropy, top_margin};
 use sokuto_core::schema::{Answer, Criteria, Question, QuestionType};
 
 use crate::engine::InferenceEngine;
 use crate::engine::cache::{CachedStateFeatures, DualSessionEngine};
 use crate::engine::coarse::{HierarchicalCoarseScorer, ModelDrivenCoarseScorer};
+use crate::engine::escalation::build_rich_escalation_prompt;
 use crate::error::{Result, RuntimeError};
 use crate::hierarchical::calibration::{
     DEFAULT_COARSE_POWER_ALPHA, DEFAULT_ENTROPY_TEMP_GAMMA, DirichletCalibrator,
@@ -384,53 +387,16 @@ impl<'a> CoarseToFineRouter<'a> {
         if self.config.enable_early_exit
             && composite_confidence < self.config.escalate_confidence_threshold
         {
-            let trace = HierarchicalExecutionTrace {
-                top1_coarse: top1_coarse.clone(),
-                top1_coarse_prob: top1_prob,
-                top2_coarse: top2_coarse.clone(),
-                top2_coarse_prob: top2_prob,
+            return build_early_exit_result(
+                self.mapping,
+                state,
+                instructions,
+                &sorted_coarse,
                 coarse_margin,
-                coarse_normalized_entropy: norm_entropy,
-                coarse_composite_confidence: composite_confidence,
-                early_exit_triggered: true,
-                early_exit_reason: Some(format!(
-                    "複合確信度 ({:.4}) が閾値 ({:.4}) 未満のため Early-Exit しました。",
-                    composite_confidence, self.config.escalate_confidence_threshold
-                )),
-                soft_beam_triggered: false,
-                selected_coarse_clusters: vec![top1_coarse.clone()],
-                evaluated_fine_count: 0,
-                fine_temperature: 1.0,
-                catchall_bias_triggered: false,
-            };
-
-            // 全細分類候補を一様分布で埋めたフォールバック Answer を生成
-            let all_fine_keys = self.mapping.all_fine_keys();
-            let uniform_prob = 1.0 / (all_fine_keys.len() as f64);
-            let mut full_probs = IndexMap::with_capacity(all_fine_keys.len());
-            for k in all_fine_keys {
-                full_probs.insert(k.clone(), uniform_prob);
-            }
-
-            let fallback_gating = GatingMetadata {
-                route: DecisionRoute::ConfirmOrEscalate,
-                confidence: composite_confidence,
-                entropy: Some(1.0),
-                margin: Some(0.0),
-                energy: None,
-                is_ood: false,
-                reason: "Hierarchical Early-Exit: composite confidence below threshold".to_string(),
-                escalation: None,
-            };
-
-            let fallback_answer =
-                Answer::choice(all_fine_keys[0].clone(), full_probs, composite_confidence)
-                    .with_gating(fallback_gating);
-
-            return Ok(HierarchicalResult {
-                answer: fallback_answer,
-                trace,
-            });
+                norm_entropy,
+                composite_confidence,
+                self.config.escalate_confidence_threshold,
+            );
         }
 
         // --- Step 3: Soft-Beam 判定と細分類候補抽出 ---
@@ -629,5 +595,315 @@ impl<'a> CoarseToFineRouter<'a> {
         };
 
         Ok(HierarchicalResult { answer, trace })
+    }
+}
+
+/// 第 1 パスの複合確信度不足による Early-Exit 時のフォールバック結果を構築する。
+///
+/// 第 1 パスの Top-1 クラスタ配下にある先頭細分類を `Answer.choice` として選定し、
+/// `DecisionRoute::ConfirmOrEscalate` に対応する `EscalationContext`
+/// (上位候補リストおよび `build_rich_escalation_prompt` によるプロンプト案) を付与する。
+///
+/// # 引数
+/// - `mapping`: 階層マッピング定義。
+/// - `state`: 推論対象のコンテキストテキスト。
+/// - `instructions`: 質問の判定指示文。
+/// - `sorted_coarse`: 確率降順に並んだ第 1 パスの大分類スコア一覧。
+/// - `coarse_margin`: 第 1 パスの Top-1 と Top-2 の確率差。
+/// - `norm_entropy`: 第 1 パスの正規化エントロピー。
+/// - `composite_confidence`: 第 1 パスの複合確信度スコア。
+/// - `escalate_confidence_threshold`: Early-Exit 判定に用いた閾値。
+///
+/// # 戻り値
+/// Early-Exit 用の `HierarchicalResult`。
+#[allow(clippy::too_many_arguments)]
+fn build_early_exit_result(
+    mapping: &HierarchicalMapping,
+    state: &str,
+    instructions: &str,
+    sorted_coarse: &[(&str, f64)],
+    coarse_margin: f64,
+    norm_entropy: f64,
+    composite_confidence: f64,
+    escalate_confidence_threshold: f64,
+) -> Result<HierarchicalResult> {
+    let (top1_coarse, top1_prob) = sorted_coarse.first().copied().ok_or_else(|| {
+        RuntimeError::InvalidQuestion("第 1 パスの大分類確率分布が空です。".to_string())
+    })?;
+    let (top2_coarse, top2_prob): (Option<String>, Option<f64>) =
+        if let Some((c2, p2)) = sorted_coarse.get(1) {
+            (Some((*c2).to_string()), Some(*p2))
+        } else {
+            (None, None)
+        };
+
+    let all_fine_keys = mapping.all_fine_keys();
+    if all_fine_keys.is_empty() {
+        return Err(RuntimeError::InvalidQuestion(
+            "階層マッピングの細分類候補が空です。".to_string(),
+        ));
+    }
+
+    let selected_choice = mapping
+        .fine_keys_for_coarse(top1_coarse)
+        .and_then(|keys| keys.first())
+        .cloned()
+        .unwrap_or_else(|| all_fine_keys[0].clone());
+
+    let uniform_prob = 1.0 / (all_fine_keys.len() as f64);
+    let mut full_probs = IndexMap::with_capacity(all_fine_keys.len());
+    for k in all_fine_keys {
+        full_probs.insert(k.clone(), uniform_prob);
+    }
+
+    let mut top_candidates: Vec<CandidateProbability> = Vec::with_capacity(3);
+    let mut seen = std::collections::HashSet::with_capacity(3);
+
+    for (coarse_key, _) in sorted_coarse {
+        if top_candidates.len() >= 3 {
+            break;
+        }
+        if let Some(first_fine) = mapping
+            .fine_keys_for_coarse(coarse_key)
+            .and_then(|keys| keys.first())
+            && seen.insert(first_fine.as_str())
+        {
+            top_candidates.push(CandidateProbability {
+                candidate: first_fine.clone(),
+                probability: uniform_prob,
+            });
+        }
+    }
+
+    if top_candidates.len() < 3
+        && let Some(top1_fines) = mapping.fine_keys_for_coarse(top1_coarse)
+    {
+        for fk in top1_fines {
+            if top_candidates.len() >= 3 {
+                break;
+            }
+            if seen.insert(fk.as_str()) {
+                top_candidates.push(CandidateProbability {
+                    candidate: fk.clone(),
+                    probability: uniform_prob,
+                });
+            }
+        }
+    }
+
+    if top_candidates.len() < 3 {
+        for fk in all_fine_keys {
+            if top_candidates.len() >= 3 {
+                break;
+            }
+            if seen.insert(fk.as_str()) {
+                top_candidates.push(CandidateProbability {
+                    candidate: fk.clone(),
+                    probability: uniform_prob,
+                });
+            }
+        }
+    }
+
+    let reason = "Hierarchical Early-Exit: composite confidence below threshold".to_string();
+    let entropy_val = if all_fine_keys.len() > 1 { 1.0 } else { 0.0 };
+    let mut fallback_gating = GatingMetadata {
+        route: DecisionRoute::ConfirmOrEscalate,
+        confidence: composite_confidence,
+        entropy: Some(entropy_val),
+        margin: Some(0.0),
+        energy: None,
+        is_ood: false,
+        reason: reason.clone(),
+        escalation: None,
+    };
+
+    let escalation_question = Question {
+        question_type: QuestionType::Choice,
+        instructions: instructions.to_string(),
+        criteria: Some(Criteria::Map(mapping.fine_criteria.clone())),
+    };
+
+    let prompt_template = build_rich_escalation_prompt(
+        Some(state),
+        None,
+        Some(&escalation_question),
+        &fallback_gating,
+        &top_candidates,
+    );
+
+    fallback_gating.escalation = Some(EscalationContext {
+        top_candidates,
+        margin: fallback_gating.margin,
+        uncertainty_reason: reason,
+        prompt_template: Some(prompt_template),
+    });
+
+    let fallback_answer = Answer::choice(selected_choice, full_probs, composite_confidence)
+        .with_gating(fallback_gating);
+
+    let trace = HierarchicalExecutionTrace {
+        top1_coarse: top1_coarse.to_string(),
+        top1_coarse_prob: top1_prob,
+        top2_coarse,
+        top2_coarse_prob: top2_prob,
+        coarse_margin,
+        coarse_normalized_entropy: norm_entropy,
+        coarse_composite_confidence: composite_confidence,
+        early_exit_triggered: true,
+        early_exit_reason: Some(format!(
+            "複合確信度 ({:.4}) が閾値 ({:.4}) 未満のため Early-Exit しました。",
+            composite_confidence, escalate_confidence_threshold
+        )),
+        soft_beam_triggered: false,
+        selected_coarse_clusters: vec![top1_coarse.to_string()],
+        evaluated_fine_count: 0,
+        fine_temperature: 1.0,
+        catchall_bias_triggered: false,
+    };
+
+    Ok(HierarchicalResult {
+        answer: fallback_answer,
+        trace,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_early_exit_selects_top1_coarse_first_candidate_and_builds_escalation() {
+        let mapping = HierarchicalMapping::banking77();
+        let all_fine_keys = mapping.all_fine_keys();
+        // オントロジー全体の先頭は card_ops 配下であることを前提検証する。
+        assert_eq!(mapping.coarse_for_fine(&all_fine_keys[0]), Some("card_ops"));
+
+        // 第 1 パスの Top-1 が card_ops 以外 (transfers) のケースを模擬する。
+        let sorted_coarse = vec![
+            ("transfers", 0.22),
+            ("payments", 0.20),
+            ("card_ops", 0.18),
+            ("account_sec", 0.15),
+            ("fx_fees", 0.10),
+            ("top_up", 0.08),
+            ("general", 0.07),
+        ];
+
+        let state = "海外への銀行送金がまだ着金していません。手数料も確認したいです。";
+        let instructions = "お客様のお問い合わせ内容に最も適合するカテゴリを選択してください。";
+
+        let res = build_early_exit_result(
+            &mapping,
+            state,
+            instructions,
+            &sorted_coarse,
+            0.02,
+            0.96,
+            0.0088,
+            0.25,
+        )
+        .expect("Early-Exit 結果の構築に成功すること。");
+
+        let expected_top1_first = mapping
+            .fine_keys_for_coarse("transfers")
+            .and_then(|keys| keys.first())
+            .expect("transfers 配下に細分類が存在すること。");
+        let expected_top2_first = mapping
+            .fine_keys_for_coarse("payments")
+            .and_then(|keys| keys.first())
+            .expect("payments 配下に細分類が存在すること。");
+        let expected_top3_first = mapping
+            .fine_keys_for_coarse("card_ops")
+            .and_then(|keys| keys.first())
+            .expect("card_ops 配下に細分類が存在すること。");
+
+        // 1. choice がオントロジー先頭ではなく Top-1 クラスタ配下の先頭候補であること
+        assert_ne!(res.answer().as_choice(), Some(all_fine_keys[0].as_str()));
+        assert_eq!(res.answer().as_choice(), Some(expected_top1_first.as_str()));
+        assert_eq!(
+            mapping.coarse_for_fine(res.answer().as_choice().unwrap()),
+            Some("transfers")
+        );
+
+        // 2. 全 77 候補の一様分布が保持されていること
+        let probs = res
+            .answer()
+            .probabilities()
+            .expect("確率分布が存在すること。");
+        assert_eq!(probs.len(), 77);
+        let sum: f64 = probs.values().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+
+        // 3. Gating 契約 (ConfirmOrEscalate 時は escalation: Some(...)) を満たすこと
+        let gating = res
+            .answer()
+            .gating
+            .as_ref()
+            .expect("Gating が付与されていること。");
+        assert_eq!(gating.route, DecisionRoute::ConfirmOrEscalate);
+        let esc = gating
+            .escalation
+            .as_ref()
+            .expect("ConfirmOrEscalate 時は EscalationContext が必須であること。");
+
+        assert_eq!(esc.top_candidates.len(), 3);
+        assert_eq!(esc.top_candidates[0].candidate, *expected_top1_first);
+        assert_eq!(esc.top_candidates[1].candidate, *expected_top2_first);
+        assert_eq!(esc.top_candidates[2].candidate, *expected_top3_first);
+        assert_eq!(esc.margin, Some(0.0));
+        assert_eq!(esc.uncertainty_reason, gating.reason);
+
+        let prompt = esc
+            .prompt_template
+            .as_ref()
+            .expect("prompt_template が生成されていること。");
+        assert!(prompt.contains("<context>"));
+        assert!(prompt.contains("</context>"));
+        assert!(prompt.contains(state));
+        assert!(prompt.contains(instructions));
+        assert!(prompt.contains(expected_top1_first));
+
+        // 4. トレースの整合性確認
+        assert!(res.trace().early_exit_triggered);
+        assert_eq!(res.trace().top1_coarse, "transfers");
+        assert_eq!(res.trace().selected_coarse_clusters, vec!["transfers"]);
+        assert_eq!(res.trace().evaluated_fine_count, 0);
+    }
+
+    #[test]
+    fn test_early_exit_single_cluster_edge_case() {
+        let mut builder = HierarchicalMapping::builder("SingleCluster");
+        builder.add_category(
+            "only_cluster",
+            "唯一のクラスタ",
+            vec![("fine_a", "候補 A の説明"), ("fine_b", "候補 B の説明")],
+        );
+        let mapping = builder.build().expect("マッピング構築に成功すること。");
+
+        let sorted_coarse = vec![("only_cluster", 1.0)];
+        let res = build_early_exit_result(
+            &mapping,
+            "判断対象のテキスト",
+            "適切な候補を選択してください。",
+            &sorted_coarse,
+            1.0,
+            0.0,
+            0.1,
+            0.25,
+        )
+        .expect("単一クラスタでも Early-Exit 構築に成功すること。");
+
+        assert_eq!(res.answer().as_choice(), Some("fine_a"));
+        let esc = res
+            .answer()
+            .gating
+            .as_ref()
+            .and_then(|g| g.escalation.as_ref())
+            .expect("EscalationContext が付与されていること。");
+        assert_eq!(esc.top_candidates.len(), 2);
+        assert_eq!(esc.top_candidates[0].candidate, "fine_a");
+        assert_eq!(esc.top_candidates[1].candidate, "fine_b");
+        assert!(esc.prompt_template.is_some());
     }
 }

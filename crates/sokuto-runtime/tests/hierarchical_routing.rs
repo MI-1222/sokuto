@@ -177,6 +177,28 @@ fn test_hierarchical_routing_early_exit() {
 
     let answer = result.answer();
     assert_eq!(answer.route(), Some(DecisionRoute::ConfirmOrEscalate));
+
+    let expected_first = mapping
+        .fine_keys_for_coarse(&trace.top1_coarse)
+        .and_then(|keys| keys.first())
+        .expect("Top-1 クラスタ配下に細分類候補が存在すること。");
+    assert_eq!(answer.as_choice(), Some(expected_first.as_str()));
+
+    let gating = answer
+        .gating
+        .as_ref()
+        .expect("Gating が付与されていること。");
+    let escalation = gating
+        .escalation
+        .as_ref()
+        .expect("ConfirmOrEscalate 時は EscalationContext が必須であること。");
+    assert!(!escalation.top_candidates.is_empty());
+    assert_eq!(escalation.top_candidates[0].candidate, *expected_first);
+    let prompt = escalation
+        .prompt_template
+        .as_ref()
+        .expect("エスカレーション用プロンプト案が生成されていること。");
+    assert!(prompt.contains("<context>"));
 }
 
 #[test]

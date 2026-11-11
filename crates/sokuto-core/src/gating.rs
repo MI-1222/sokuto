@@ -160,6 +160,23 @@ impl Default for GatingThresholds {
     }
 }
 
+/// 単位区間 `[0.0, 1.0]` 内の有限実数であることを検証する。
+///
+/// # 引数
+/// - `label`: エラーメッセージに含めるパラメータ名。
+/// - `val`: 検証対象の実数値。
+///
+/// # 戻り値
+/// - 妥当な場合は `Ok(())`、範囲外または非有限値の場合は `CoreError::InvalidGatingConfig`。
+fn validate_unit_interval(label: &str, val: f64) -> Result<()> {
+    if !(0.0..=1.0).contains(&val) {
+        return Err(CoreError::InvalidGatingConfig {
+            message: format!("{label} ({val}) は 0.0〜1.0 の有限実数である必要があります。"),
+        });
+    }
+    Ok(())
+}
+
 impl GatingThresholds {
     /// ゲーティング判定設定構造体へ変換する。
     ///
@@ -183,22 +200,8 @@ impl GatingThresholds {
     /// - ハイブリッド OOD 閾値 (`loose_energy_threshold`, `ood_min_confidence`, `ood_min_margin`) は、
     ///   すべて指定またはすべて未指定のいずれかであることを検証する。
     pub fn validate(&self) -> Result<()> {
-        if !(0.0..=1.0).contains(&self.high_threshold) {
-            return Err(CoreError::InvalidGatingConfig {
-                message: format!(
-                    "high_threshold ({}) は 0.0〜1.0 の有限実数である必要があります。",
-                    self.high_threshold
-                ),
-            });
-        }
-        if !(0.0..=1.0).contains(&self.low_threshold) {
-            return Err(CoreError::InvalidGatingConfig {
-                message: format!(
-                    "low_threshold ({}) は 0.0〜1.0 の有限実数である必要があります。",
-                    self.low_threshold
-                ),
-            });
-        }
+        validate_unit_interval("high_threshold", self.high_threshold)?;
+        validate_unit_interval("low_threshold", self.low_threshold)?;
         if self.low_threshold > self.high_threshold {
             return Err(CoreError::InvalidGatingConfig {
                 message: format!(
@@ -207,14 +210,7 @@ impl GatingThresholds {
                 ),
             });
         }
-        if !(0.0..=1.0).contains(&self.top_margin_threshold) {
-            return Err(CoreError::InvalidGatingConfig {
-                message: format!(
-                    "top_margin_threshold ({}) は 0.0〜1.0 の有限実数である必要があります。",
-                    self.top_margin_threshold
-                ),
-            });
-        }
+        validate_unit_interval("top_margin_threshold", self.top_margin_threshold)?;
         if !self.energy_threshold.is_finite() {
             return Err(CoreError::InvalidGatingConfig {
                 message: format!(
@@ -250,25 +246,11 @@ impl GatingThresholds {
                 });
             }
         }
-        if let Some(c) = self.ood_min_confidence
-            && !(0.0..=1.0).contains(&c)
-        {
-            return Err(CoreError::InvalidGatingConfig {
-                message: format!(
-                    "ood_min_confidence ({}) は 0.0〜1.0 の範囲である必要があります。",
-                    c
-                ),
-            });
+        if let Some(c) = self.ood_min_confidence {
+            validate_unit_interval("ood_min_confidence", c)?;
         }
-        if let Some(m) = self.ood_min_margin
-            && !(0.0..=1.0).contains(&m)
-        {
-            return Err(CoreError::InvalidGatingConfig {
-                message: format!(
-                    "ood_min_margin ({}) は 0.0〜1.0 の範囲である必要があります。",
-                    m
-                ),
-            });
+        if let Some(m) = self.ood_min_margin {
+            validate_unit_interval("ood_min_margin", m)?;
         }
         let hybrid_set_count = usize::from(self.loose_energy_threshold.is_some())
             + usize::from(self.ood_min_confidence.is_some())
@@ -1600,6 +1582,34 @@ mod tests {
                     Err(CoreError::InvalidGatingConfig { .. })
                 ),
                 "top_margin_threshold={invalid_val} は拒否されるべき。"
+            );
+
+            let ood_conf_invalid = GatingThresholds {
+                loose_energy_threshold: Some(-2.5),
+                ood_min_confidence: Some(invalid_val),
+                ood_min_margin: Some(0.20),
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    ood_conf_invalid.validate(),
+                    Err(CoreError::InvalidGatingConfig { .. })
+                ),
+                "ood_min_confidence={invalid_val} は拒否されるべき。"
+            );
+
+            let ood_margin_invalid = GatingThresholds {
+                loose_energy_threshold: Some(-2.5),
+                ood_min_confidence: Some(0.65),
+                ood_min_margin: Some(invalid_val),
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    ood_margin_invalid.validate(),
+                    Err(CoreError::InvalidGatingConfig { .. })
+                ),
+                "ood_min_margin={invalid_val} は拒否されるべき。"
             );
         }
     }

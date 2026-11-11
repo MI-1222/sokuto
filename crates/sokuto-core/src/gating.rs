@@ -914,10 +914,21 @@ fn build_escalation_prompt(
 /// リクエストに含まれる全回答のゲーティング情報から集約サマリーを算出する。
 ///
 /// 最悪値ルール(Conservative Policy)を適用する:
-/// - 1 つでも `Fallback` が存在する場合 $\rightarrow$ 全体も `Fallback`
-/// - そうでなく 1 つでも `ConfirmOrEscalate` が存在する場合 $\rightarrow$ 全体も `ConfirmOrEscalate`
-/// - 全ての質問が `AutoExecute` である場合 $\rightarrow$ 全体も `AutoExecute`
+/// - `answers` が空(0 件)の場合は、未処理・判定不能として安全側の `Fallback` (`escalation_needed = true`) とする。
+/// - 1 つでも `Fallback` が存在する場合 $\rightarrow$ 全体も `Fallback`。
+/// - そうでなく 1 つでも `ConfirmOrEscalate` が存在する場合 $\rightarrow$ 全体も `ConfirmOrEscalate`。
+/// - 1 件以上存在し、かつ全ての質問が `AutoExecute` である場合 $\rightarrow$ 全体も `AutoExecute`。
 pub fn evaluate_response_routing(answers: &IndexMap<String, Answer>) -> SystemRoutingSummary {
+    if answers.is_empty() {
+        return SystemRoutingSummary {
+            aggregate_route: DecisionRoute::Fallback,
+            auto_execute_count: 0,
+            confirm_count: 0,
+            fallback_count: 0,
+            escalation_needed: true,
+        };
+    }
+
     let mut auto_execute_count = 0;
     let mut confirm_count = 0;
     let mut fallback_count = 0;
@@ -1187,6 +1198,15 @@ mod tests {
         assert_eq!(summary_fallback.aggregate_route, DecisionRoute::Fallback);
         assert_eq!(summary_fallback.fallback_count, 1);
         assert!(summary_fallback.escalation_needed);
+
+        // 空の回答マップの場合は安全弁として Fallback (escalation_needed = true) になること。
+        let empty_answers: IndexMap<String, Answer> = IndexMap::new();
+        let summary_empty = evaluate_response_routing(&empty_answers);
+        assert_eq!(summary_empty.aggregate_route, DecisionRoute::Fallback);
+        assert_eq!(summary_empty.auto_execute_count, 0);
+        assert_eq!(summary_empty.confirm_count, 0);
+        assert_eq!(summary_empty.fallback_count, 0);
+        assert!(summary_empty.escalation_needed);
     }
 
     #[test]

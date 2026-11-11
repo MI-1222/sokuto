@@ -173,7 +173,7 @@ impl Default for TemperatureMap {
 }
 
 /// 成果物引き渡し用 `calibration.json` のスキーマ構造体。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CalibrationConfig {
     /// キャリブレーションスキーマのバージョン(例: "1.0")。
     pub version: String,
@@ -188,15 +188,6 @@ pub struct CalibrationConfig {
     /// ゲーティング判定用閾値設定。
     #[serde(default)]
     pub gating_thresholds: GatingThresholds,
-}
-
-impl PartialEq for CalibrationConfig {
-    fn eq(&self, other: &Self) -> bool {
-        self.version == other.version
-            && (self.default_temperature - other.default_temperature).abs() < f64::EPSILON
-            && self.temperature_map == other.temperature_map
-            && self.gating_thresholds == other.gating_thresholds
-    }
 }
 
 fn default_temperature() -> f64 {

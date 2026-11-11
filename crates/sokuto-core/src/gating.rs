@@ -578,43 +578,13 @@ pub fn evaluate_answer_gating_opts(
             ),
         )
     } else if conf >= thresholds.high_threshold - EPSILON {
-        if is_choice {
-            if let Some(m) = margin {
-                if m < thresholds.top_margin_threshold - EPSILON {
-                    (
-                        DecisionRoute::ConfirmOrEscalate,
-                        format!(
-                            "実効確信度({:.3} >= {:.3})は高水準ですが、上位2候補の確率差({:.3} < {:.3})が僅差のため確認要求に降格しました。",
-                            conf, thresholds.high_threshold, m, thresholds.top_margin_threshold
-                        ),
-                    )
-                } else {
-                    (
-                        DecisionRoute::AutoExecute,
-                        format!(
-                            "実効確信度({:.3} >= {:.3})および上位候補マージン({:.3} >= {:.3})を満たすため自動実行が承認されました。",
-                            conf, thresholds.high_threshold, m, thresholds.top_margin_threshold
-                        ),
-                    )
-                }
-            } else {
-                (
-                    DecisionRoute::AutoExecute,
-                    format!(
-                        "実効確信度({:.3} >= {:.3})が高水準であるため自動実行が承認されました。",
-                        conf, thresholds.high_threshold
-                    ),
-                )
-            }
-        } else {
-            (
-                DecisionRoute::AutoExecute,
-                format!(
-                    "実効確信度({:.3} >= {:.3})が高水準であるため自動実行が承認されました。",
-                    conf, thresholds.high_threshold
-                ),
-            )
-        }
+        (
+            DecisionRoute::AutoExecute,
+            format!(
+                "実効確信度({:.3} >= {:.3})が高水準であるため自動実行が承認されました。",
+                conf, thresholds.high_threshold
+            ),
+        )
     } else if conf >= thresholds.low_threshold - EPSILON {
         (
             DecisionRoute::ConfirmOrEscalate,
@@ -890,12 +860,17 @@ mod tests {
 
     #[test]
     fn test_evaluate_answer_gating_margin_guard_demote_to_confirm() {
-        // 確信度は 0.75 と高水準だが、Top-1 と Top-2 が僅差 (0.48 vs 0.44 -> margin 0.04 < 0.15) のケース
+        // エントロピー確信度 (1 - H_norm >= 0.70) は高水準だが、Top-1 と Top-2 が僅差 (0.50 vs 0.48 -> margin 0.02 < 0.15) のケース。
+        // K=20 の分布において上位 2 候補へ確率が集中しつつ拮抗しているため、マージンガードにより ConfirmOrEscalate へ降格する。
         let mut probs = IndexMap::new();
-        probs.insert("opt_a".to_string(), 0.48);
-        probs.insert("opt_b".to_string(), 0.44);
-        probs.insert("opt_c".to_string(), 0.08);
-        let answer = Answer::choice("opt_a", probs, 0.75);
+        probs.insert("opt_a".to_string(), 0.50);
+        probs.insert("opt_b".to_string(), 0.48);
+        let rem_prob = 0.02 / 18.0;
+        for i in 2..20 {
+            probs.insert(format!("opt_{:02}", i), rem_prob);
+        }
+        let s_conf = crate::math::composite_confidence_iter(probs.values()).unwrap();
+        let answer = Answer::choice("opt_a", probs, s_conf);
 
         let config = GatingConfig::default();
         let meta = evaluate_answer_gating(&answer, Some("q1"), None, &config);

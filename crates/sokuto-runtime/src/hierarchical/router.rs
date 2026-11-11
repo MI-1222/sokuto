@@ -563,16 +563,17 @@ impl<'a> CoarseToFineRouter<'a> {
             DecisionRoute::ConfirmOrEscalate
         };
 
-        let gating = GatingMetadata {
-            route: final_route,
-            confidence: final_confidence,
-            entropy: Some(final_norm_entropy),
-            margin: Some(final_margin),
-            energy: fine_energy,
-            is_ood: false,
-            reason: format!("Hierarchical decision routing (route={})", final_route),
-            escalation: None,
-        };
+        let gating = build_final_gating_metadata(
+            self.mapping,
+            state,
+            instructions,
+            &sorted_full,
+            final_route,
+            final_confidence,
+            final_norm_entropy,
+            final_margin,
+            fine_energy,
+        );
 
         let answer =
             Answer::choice(final_winner, full_probabilities, final_confidence).with_gating(gating);
@@ -596,6 +597,86 @@ impl<'a> CoarseToFineRouter<'a> {
 
         Ok(HierarchicalResult { answer, trace })
     }
+}
+
+/// `AutoExecute` 以外のルーティング時に、`GatingMetadata` へ `EscalationContext` を付与する。
+///
+/// 全細分類定義 (`mapping.fine_criteria`) を含む `Question` を構築し、
+/// [`build_rich_escalation_prompt`] で System 2 への CoT 委託プロンプト案を生成して格納する。
+/// `gating.route == DecisionRoute::AutoExecute` の場合はアロケーションを行わず何もしない。
+fn attach_escalation_context(
+    mapping: &HierarchicalMapping,
+    state: &str,
+    instructions: &str,
+    gating: &mut GatingMetadata,
+    top_candidates: Vec<CandidateProbability>,
+) {
+    if gating.route == DecisionRoute::AutoExecute {
+        return;
+    }
+
+    let escalation_question = Question {
+        question_type: QuestionType::Choice,
+        instructions: instructions.to_string(),
+        criteria: Some(Criteria::Map(mapping.fine_criteria.clone())),
+    };
+
+    let prompt_template = build_rich_escalation_prompt(
+        Some(state),
+        None,
+        Some(&escalation_question),
+        gating,
+        &top_candidates,
+    );
+
+    gating.escalation = Some(EscalationContext {
+        top_candidates,
+        margin: gating.margin,
+        uncertainty_reason: gating.reason.clone(),
+        prompt_template: Some(prompt_template),
+    });
+}
+
+/// 通常ルーティング終了時 (Step 7) の `GatingMetadata` を構築する。
+///
+/// `final_route != DecisionRoute::AutoExecute` の場合は、全候補空間へ復元された確率分布の上位 3 候補を抽出し、
+/// `EscalationContext` および System 2 委託プロンプト案を付与する。
+#[allow(clippy::too_many_arguments)]
+fn build_final_gating_metadata(
+    mapping: &HierarchicalMapping,
+    state: &str,
+    instructions: &str,
+    sorted_full: &[(&str, f64)],
+    final_route: DecisionRoute,
+    final_confidence: f64,
+    final_norm_entropy: f64,
+    final_margin: f64,
+    fine_energy: Option<f64>,
+) -> GatingMetadata {
+    let mut gating = GatingMetadata {
+        route: final_route,
+        confidence: final_confidence,
+        entropy: Some(final_norm_entropy),
+        margin: Some(final_margin),
+        energy: fine_energy,
+        is_ood: false,
+        reason: format!("Hierarchical decision routing (route={})", final_route),
+        escalation: None,
+    };
+
+    if final_route != DecisionRoute::AutoExecute {
+        let top_candidates: Vec<CandidateProbability> = sorted_full
+            .iter()
+            .take(3)
+            .map(|(k, p)| CandidateProbability {
+                candidate: (*k).to_string(),
+                probability: *p,
+            })
+            .collect();
+        attach_escalation_context(mapping, state, instructions, &mut gating, top_candidates);
+    }
+
+    gating
 }
 
 /// 第 1 パスの複合確信度不足による Early-Exit 時のフォールバック結果を構築する。
@@ -714,30 +795,17 @@ fn build_early_exit_result(
         margin: Some(0.0),
         energy: None,
         is_ood: false,
-        reason: reason.clone(),
+        reason,
         escalation: None,
     };
 
-    let escalation_question = Question {
-        question_type: QuestionType::Choice,
-        instructions: instructions.to_string(),
-        criteria: Some(Criteria::Map(mapping.fine_criteria.clone())),
-    };
-
-    let prompt_template = build_rich_escalation_prompt(
-        Some(state),
-        None,
-        Some(&escalation_question),
-        &fallback_gating,
-        &top_candidates,
-    );
-
-    fallback_gating.escalation = Some(EscalationContext {
+    attach_escalation_context(
+        mapping,
+        state,
+        instructions,
+        &mut fallback_gating,
         top_candidates,
-        margin: fallback_gating.margin,
-        uncertainty_reason: reason,
-        prompt_template: Some(prompt_template),
-    });
+    );
 
     let fallback_answer = Answer::choice(selected_choice, full_probs, composite_confidence)
         .with_gating(fallback_gating);
@@ -905,5 +973,78 @@ mod tests {
         assert_eq!(esc.top_candidates[0].candidate, "fine_a");
         assert_eq!(esc.top_candidates[1].candidate, "fine_b");
         assert!(esc.prompt_template.is_some());
+    }
+
+    #[test]
+    fn test_final_gating_metadata_escalation_contract() {
+        let mapping = HierarchicalMapping::banking77();
+        let state = "カードの請求金額に身に覚えのない引き落としがあります。";
+        let instructions = "お客様のお問い合わせ内容に最も適合するカテゴリを選択してください。";
+        let sorted_full = vec![
+            ("card_payment_not_recognised", 0.42),
+            ("direct_debit_payment_not_recognised", 0.31),
+            ("compromised_card", 0.12),
+            ("lost_or_stolen_card", 0.05),
+        ];
+
+        // 1. AutoExecute 時はゼロアロケーション契約により escalation が None であること
+        let auto_meta = build_final_gating_metadata(
+            &mapping,
+            state,
+            instructions,
+            &sorted_full,
+            DecisionRoute::AutoExecute,
+            0.85,
+            0.12,
+            0.40,
+            Some(-2.5),
+        );
+        assert_eq!(auto_meta.route, DecisionRoute::AutoExecute);
+        assert!(auto_meta.escalation.is_none());
+
+        // 2. ConfirmOrEscalate / Fallback 時は上位 3 候補と委託プロンプトが付与されること
+        for route in [DecisionRoute::ConfirmOrEscalate, DecisionRoute::Fallback] {
+            let meta = build_final_gating_metadata(
+                &mapping,
+                state,
+                instructions,
+                &sorted_full,
+                route,
+                0.42,
+                0.55,
+                0.11,
+                Some(-1.2),
+            );
+            assert_eq!(meta.route, route);
+            assert_eq!(meta.margin, Some(0.11));
+            assert_eq!(meta.energy, Some(-1.2));
+
+            let esc = meta
+                .escalation
+                .as_ref()
+                .expect("非 AutoExecute 時は EscalationContext が必須であること。");
+            assert_eq!(esc.top_candidates.len(), 3);
+            assert_eq!(
+                esc.top_candidates[0].candidate,
+                "card_payment_not_recognised"
+            );
+            assert!((esc.top_candidates[0].probability - 0.42).abs() < 1e-9);
+            assert_eq!(
+                esc.top_candidates[1].candidate,
+                "direct_debit_payment_not_recognised"
+            );
+            assert_eq!(esc.top_candidates[2].candidate, "compromised_card");
+            assert_eq!(esc.margin, Some(0.11));
+            assert_eq!(esc.uncertainty_reason, meta.reason);
+
+            let prompt = esc
+                .prompt_template
+                .as_ref()
+                .expect("prompt_template が生成されていること。");
+            assert!(prompt.contains("<context>"));
+            assert!(prompt.contains(state));
+            assert!(prompt.contains(instructions));
+            assert!(prompt.contains("card_payment_not_recognised"));
+        }
     }
 }

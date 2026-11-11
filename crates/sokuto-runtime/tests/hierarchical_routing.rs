@@ -125,6 +125,29 @@ fn test_hierarchical_routing_with_real_model() {
         trace.top1_coarse
     );
 
+    // Gating 契約の検証 (非 AutoExecute 時は EscalationContext が必須)
+    let gating = answer
+        .gating
+        .as_ref()
+        .expect("Gating が付与されていること。");
+    match gating.route {
+        DecisionRoute::AutoExecute => {
+            assert!(gating.escalation.is_none());
+        }
+        DecisionRoute::ConfirmOrEscalate | DecisionRoute::Fallback => {
+            let esc = gating
+                .escalation
+                .as_ref()
+                .expect("非 AutoExecute 時は EscalationContext が必須であること。");
+            assert!(!esc.top_candidates.is_empty());
+            let prompt = esc
+                .prompt_template
+                .as_ref()
+                .expect("エスカレーション用プロンプト案が生成されていること。");
+            assert!(prompt.contains("<context>"));
+        }
+    }
+
     // Answer への消費変換が可能なこと
     let converted_answer = result.into_answer();
     assert!(converted_answer.is_choice());

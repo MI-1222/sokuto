@@ -44,12 +44,14 @@ const WEIGHT_SUM_EPSILON: f64 = 1e-12;
 pub fn softmax_into(logits: &[f64], out: &mut [f64], temperature: f64) -> Result<()> {
     if logits.is_empty() {
         return Err(CoreError::MathError {
+            question_id: None,
             message: "ロジット配列が空です。".to_string(),
         });
     }
 
     if logits.len() != out.len() {
         return Err(CoreError::MathError {
+            question_id: None,
             message: format!(
                 "出力バッファ長({out_len})がロジット長({logits_len})と一致しません。",
                 out_len = out.len(),
@@ -60,6 +62,7 @@ pub fn softmax_into(logits: &[f64], out: &mut [f64], temperature: f64) -> Result
 
     if !temperature.is_finite() || temperature <= 0.0 {
         return Err(CoreError::MathError {
+            question_id: None,
             message: format!("温度パラメータは正の有限実数である必要があります: {temperature}。"),
         });
     }
@@ -68,6 +71,7 @@ pub fn softmax_into(logits: &[f64], out: &mut [f64], temperature: f64) -> Result
     if logits.len() == 1 {
         if !logits[0].is_finite() {
             return Err(CoreError::MathError {
+                question_id: None,
                 message: "ロジットに非有限値(NaNまたは無限大)が含まれています。".to_string(),
             });
         }
@@ -84,6 +88,7 @@ pub fn softmax_into(logits: &[f64], out: &mut [f64], temperature: f64) -> Result
     for &logit in logits {
         if !logit.is_finite() {
             return Err(CoreError::MathError {
+                question_id: None,
                 message: "ロジットに非有限値(NaNまたは無限大)が含まれています。".to_string(),
             });
         }
@@ -105,6 +110,7 @@ pub fn softmax_into(logits: &[f64], out: &mut [f64], temperature: f64) -> Result
 
     if sum_exp <= 0.0 || !sum_exp.is_finite() {
         return Err(CoreError::MathError {
+            question_id: None,
             message: "ソフトマックスの分母が不正な値になりました。".to_string(),
         });
     }
@@ -164,11 +170,13 @@ where
         let p = *item.borrow();
         if !p.is_finite() {
             return Err(CoreError::MathError {
+                question_id: None,
                 message: "確率値に非有限値(NaNまたは無限大)が含まれています。".to_string(),
             });
         }
         if p < 0.0 {
             return Err(CoreError::MathError {
+                question_id: None,
                 message: format!("負の確率値が含まれています: {p}。"),
             });
         }
@@ -181,6 +189,7 @@ where
 
     match count {
         0 => Err(CoreError::MathError {
+            question_id: None,
             message: "確率分布配列が空です。".to_string(),
         }),
         1 => Ok(0.0),
@@ -245,11 +254,13 @@ where
         let p = *item.borrow();
         if !p.is_finite() {
             return Err(CoreError::MathError {
+                question_id: None,
                 message: "確率値に非有限値(NaNまたは無限大)が含まれています。".to_string(),
             });
         }
         if p < 0.0 {
             return Err(CoreError::MathError {
+                question_id: None,
                 message: format!("負の確率値が含まれています: {p}。"),
             });
         }
@@ -265,6 +276,7 @@ where
 
     match count {
         0 => Err(CoreError::MathError {
+            question_id: None,
             message: "確率分布配列が空です。".to_string(),
         }),
         1 => Ok(1.0),
@@ -328,11 +340,13 @@ where
         let p = *item.borrow();
         if !p.is_finite() {
             return Err(CoreError::MathError {
+                question_id: None,
                 message: "確率値に非有限値(NaNまたは無限大)が含まれています。".to_string(),
             });
         }
         if p < 0.0 {
             return Err(CoreError::MathError {
+                question_id: None,
                 message: format!("負の確率値が含まれています: {p}。"),
             });
         }
@@ -352,6 +366,7 @@ where
 
     match count {
         0 => Err(CoreError::MathError {
+            question_id: None,
             message: "確率分布配列が空です。".to_string(),
         }),
         1 => Ok(1.0),
@@ -418,6 +433,7 @@ pub fn normalized_entropy_confidence(probabilities: &[f64]) -> Result<f64> {
 pub fn argmax(values: &[f64]) -> Result<usize> {
     if values.is_empty() {
         return Err(CoreError::MathError {
+            question_id: None,
             message: "探索対象のスライスが空です。".to_string(),
         });
     }
@@ -428,6 +444,7 @@ pub fn argmax(values: &[f64]) -> Result<usize> {
     for (i, &val) in values.iter().enumerate() {
         if !val.is_finite() {
             return Err(CoreError::MathError {
+                question_id: None,
                 message: "スライス内に非有限値(NaNまたは無限大)が含まれています。".to_string(),
             });
         }
@@ -501,11 +518,13 @@ where
         let p = *item.borrow();
         if !p.is_finite() {
             return Err(CoreError::MathError {
+                question_id: None,
                 message: "確率値に非有限値(NaNまたは無限大)が含まれています。".to_string(),
             });
         }
         if p < 0.0 {
             return Err(CoreError::MathError {
+                question_id: None,
                 message: format!("負の確率値が含まれています: {p}。"),
             });
         }
@@ -522,12 +541,14 @@ where
 
     if count < 2 {
         return Err(CoreError::MathError {
+            question_id: None,
             message: "Score の確率分布は 2 段階以上必要です。".to_string(),
         });
     }
 
     if !weight_sum.is_finite() || weight_sum <= WEIGHT_SUM_EPSILON {
         return Err(CoreError::MathError {
+            question_id: None,
             message: format!("確率値の総和が正数ではありません: {weight_sum}。"),
         });
     }
@@ -709,11 +730,13 @@ where
         let p = *item.borrow();
         if !p.is_finite() {
             return Err(CoreError::MathError {
+                question_id: None,
                 message: "確率値に非有限値(NaNまたは無限大)が含まれています。".to_string(),
             });
         }
         if p < 0.0 {
             return Err(CoreError::MathError {
+                question_id: None,
                 message: format!("負の確率値が含まれています: {p}。"),
             });
         }
@@ -743,6 +766,7 @@ where
 
     if count < 2 {
         return Err(CoreError::MathError {
+            question_id: None,
             message: "双峰性係数の計算には 2 段階以上の確率分布が必要です。".to_string(),
         });
     }
@@ -823,12 +847,14 @@ pub fn bimodality_coefficient(probabilities: &[f64]) -> Result<f64> {
 pub fn noul_probability(logit_true: f64, logit_false: f64, temperature: f64) -> Result<f64> {
     if !temperature.is_finite() || temperature <= 0.0 {
         return Err(CoreError::MathError {
+            question_id: None,
             message: format!("温度パラメータは正の実数である必要があります: {temperature}。"),
         });
     }
 
     if !logit_true.is_finite() || !logit_false.is_finite() {
         return Err(CoreError::MathError {
+            question_id: None,
             message: "ロジットに非有限値(NaNまたは無限大)が含まれています。".to_string(),
         });
     }
@@ -855,6 +881,7 @@ pub fn noul_probability(logit_true: f64, logit_false: f64, temperature: f64) -> 
 pub fn noul_confidence(probability: f64) -> Result<f64> {
     if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
         return Err(CoreError::MathError {
+            question_id: None,
             message: format!("確率は [0.0, 1.0] の有限実数である必要があります: {probability}。"),
         });
     }
@@ -871,6 +898,7 @@ where
 {
     if !temperature.is_finite() || temperature <= 0.0 {
         return Err(CoreError::MathError {
+            question_id: None,
             message: format!("温度パラメータは正の有限実数である必要があります: {temperature}。"),
         });
     }
@@ -884,6 +912,7 @@ where
         let z = *item.borrow();
         if !z.is_finite() {
             return Err(CoreError::MathError {
+                question_id: None,
                 message: "ロジットに非有限値(NaNまたは無限大)が含まれています。".to_string(),
             });
         }
@@ -904,6 +933,7 @@ where
 
     if count == 0 {
         return Err(CoreError::MathError {
+            question_id: None,
             message: "ロジット配列が空です。".to_string(),
         });
     }

@@ -77,8 +77,13 @@ pub enum CoreError {
     EmptyQuestions,
 
     /// 確率分布の計算やエントロピー算出における数値計算エラー。
-    #[error("数値計算エラーが発生しました: {message}。")]
+    #[error(
+        "{prefix}数値計算エラーが発生しました: {message}。",
+        prefix = question_prefix(question_id)
+    )]
     MathError {
+        /// 対象の質問識別子(任意)。
+        question_id: Option<String>,
         /// エラー詳細メッセージ。
         message: String,
     },
@@ -165,18 +170,46 @@ impl CoreError {
             Self::InvalidChoiceCount { question_id, .. }
             | Self::InvalidScoreLevelCount { question_id, .. }
             | Self::InvalidCriteriaType { question_id, .. }
-            | Self::MissingCriteria { question_id, .. } => {
+            | Self::MissingCriteria { question_id, .. }
+            | Self::MathError { question_id, .. } => {
                 *question_id = qid_str;
-            }
-            Self::MathError { message } => {
-                let id = qid_str.as_ref().unwrap();
-                let prefix = format!("質問 '{id}': ");
-                if !message.starts_with(&prefix) {
-                    *message = format!("{prefix}{message}");
-                }
             }
             _ => {}
         }
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_math_error_structured_question_id_and_no_duplicate_prefix() {
+        let err = CoreError::MathError {
+            question_id: Some("category".to_string()),
+            message: "ロジット長が不正です。".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "質問 'category': 数値計算エラーが発生しました: ロジット長が不正です。。"
+        );
+
+        // with_question_id を複数回適用してもプレフィックスが重複せず、question_id のみが更新されること。
+        let updated = err.with_question_id("category").with_question_id("urgency");
+        match &updated {
+            CoreError::MathError {
+                question_id,
+                message,
+            } => {
+                assert_eq!(question_id.as_deref(), Some("urgency"));
+                assert_eq!(message, "ロジット長が不正です。");
+            }
+            other => panic!("MathError が返る必要があります: {other:?}"),
+        }
+        assert_eq!(
+            updated.to_string(),
+            "質問 'urgency': 数値計算エラーが発生しました: ロジット長が不正です。。"
+        );
     }
 }

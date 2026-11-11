@@ -13,6 +13,14 @@ use crate::math::{
 };
 use crate::schema::{Answer, Criteria, Question, QuestionType};
 
+/// 失敗結果に対して質問識別子 (`question_id`) が指定されている場合にエラーコンテキストを付与する。
+fn attach_question_id<T>(res: Result<T>, question_id: Option<&str>) -> Result<T> {
+    match (res, question_id) {
+        (Err(err), Some(qid)) => Err(err.with_question_id(qid)),
+        (other, _) => other,
+    }
+}
+
 /// 作業用バッファを活用し、Choice プリミティブの生ロジットから採択候補、確率分布、および複合確信度を算出する。
 ///
 /// # 概要
@@ -51,24 +59,20 @@ pub fn evaluate_choice_with_buf(
     }
 
     if logits.len() != k {
-        let prefix = question_id
-            .map(|qid| format!("質問 '{qid}': "))
-            .unwrap_or_default();
         return Err(CoreError::MathError {
+            question_id: question_id.map(str::to_string),
             message: format!(
-                "{prefix}ロジットの要素数({logits_len})が候補数({k})と一致しません。",
+                "ロジットの要素数({logits_len})が候補数({k})と一致しません。",
                 logits_len = logits.len()
             ),
         });
     }
 
     if probs_buf.len() != logits.len() {
-        let prefix = question_id
-            .map(|qid| format!("質問 '{qid}': "))
-            .unwrap_or_default();
         return Err(CoreError::MathError {
+            question_id: question_id.map(str::to_string),
             message: format!(
-                "{prefix}出力バッファ長({out_len})がロジット長({logits_len})と一致しません。",
+                "出力バッファ長({out_len})がロジット長({logits_len})と一致しません。",
                 out_len = probs_buf.len(),
                 logits_len = logits.len()
             ),
@@ -79,6 +83,7 @@ pub fn evaluate_choice_with_buf(
     if k == 1 {
         if !temperature.is_finite() || temperature <= 0.0 {
             return Err(CoreError::MathError {
+                question_id: question_id.map(str::to_string),
                 message: format!(
                     "温度パラメータは正の有限実数である必要があります: {temperature}。"
                 ),
@@ -86,6 +91,7 @@ pub fn evaluate_choice_with_buf(
         }
         if !logits[0].is_finite() {
             return Err(CoreError::MathError {
+                question_id: question_id.map(str::to_string),
                 message: "ロジットに非有限値(NaNまたは無限大)が含まれています。".to_string(),
             });
         }
@@ -99,16 +105,16 @@ pub fn evaluate_choice_with_buf(
     }
 
     // ゼロアロケーション版ソフトマックスの実行。
-    softmax_into(logits, probs_buf, temperature)?;
+    attach_question_id(softmax_into(logits, probs_buf, temperature), question_id)?;
 
     // 決定論的タイブレーク付き最大値インデックスの取得。
-    let best_idx = argmax(probs_buf)?;
+    let best_idx = attach_question_id(argmax(probs_buf), question_id)?;
     let (selected_key, _) = map
         .get_index(best_idx)
         .expect("best_idx は 0..k の範囲内であることが保証されている。");
 
     // 候補数非依存の複合確信度スコア S_confidence = (1 - H_norm) * M(p) の算出。
-    let confidence = composite_confidence(probs_buf)?;
+    let confidence = attach_question_id(composite_confidence(probs_buf), question_id)?;
 
     // 候補識別子と確率値のマッピング構築。
     let mut probabilities = IndexMap::with_capacity(k);
@@ -172,24 +178,20 @@ pub fn evaluate_score_with_buf(
     }
 
     if logits.len() != m {
-        let prefix = question_id
-            .map(|qid| format!("質問 '{qid}': "))
-            .unwrap_or_default();
         return Err(CoreError::MathError {
+            question_id: question_id.map(str::to_string),
             message: format!(
-                "{prefix}ロジットの要素数({logits_len})が段階数({m})と一致しません。",
+                "ロジットの要素数({logits_len})が段階数({m})と一致しません。",
                 logits_len = logits.len()
             ),
         });
     }
 
     if probs_buf.len() != logits.len() {
-        let prefix = question_id
-            .map(|qid| format!("質問 '{qid}': "))
-            .unwrap_or_default();
         return Err(CoreError::MathError {
+            question_id: question_id.map(str::to_string),
             message: format!(
-                "{prefix}出力バッファ長({out_len})がロジット長({logits_len})と一致しません。",
+                "出力バッファ長({out_len})がロジット長({logits_len})と一致しません。",
                 out_len = probs_buf.len(),
                 logits_len = logits.len()
             ),
@@ -197,10 +199,11 @@ pub fn evaluate_score_with_buf(
     }
 
     // ゼロアロケーション版ソフトマックス確率分布の算出。
-    softmax_into(logits, probs_buf, temperature)?;
+    attach_question_id(softmax_into(logits, probs_buf, temperature), question_id)?;
 
     // 単一パス走査による加重平均期待値(スコア)および事後分散の算出。
-    let (m_observed, score_val, var) = score_moments_iter(probs_buf.iter())?;
+    let (m_observed, score_val, var) =
+        attach_question_id(score_moments_iter(probs_buf.iter()), question_id)?;
 
     // 順序尺度分散確信度の算出。
     let confidence = normalized_variance_confidence_from_variance(m_observed, var);
@@ -250,6 +253,7 @@ pub fn evaluate_score(logits: &[f64], criteria: &Criteria, temperature: f64) -> 
 pub fn evaluate_noul(logits: &[f64], temperature: f64) -> Result<Answer> {
     if logits.len() < 2 {
         return Err(CoreError::MathError {
+            question_id: None,
             message: format!(
                 "Noul 判定には真・偽に対応する 2 要素以上のロジットが必要です(指定数: {})。",
                 logits.len()
@@ -312,13 +316,7 @@ pub fn evaluate_question_with_buf(
         }
     };
 
-    res.map_err(|err| {
-        if let Some(qid) = question_id {
-            err.with_question_id(qid)
-        } else {
-            err
-        }
-    })
+    attach_question_id(res, question_id)
 }
 
 /// 単一の質問定義、生ロジット、および較正設定から型安全に判定結果 (`Answer`) を導出する。
@@ -636,16 +634,23 @@ mod tests {
             Some("category"),
         )
         .unwrap_err();
+        match &err_logits_mismatch {
+            CoreError::MathError {
+                question_id,
+                message,
+            } => {
+                assert_eq!(question_id.as_deref(), Some("category"));
+                assert!(message.contains("ロジットの要素数(3)が候補数(2)と一致しません"));
+                assert!(!message.starts_with("質問 '"));
+            }
+            other => panic!("MathError が返る必要があります: {other:?}"),
+        }
+        let err_logits_msg = err_logits_mismatch.to_string();
         assert!(
-            err_logits_mismatch
-                .to_string()
-                .contains("質問 'category': ")
+            err_logits_msg.starts_with("質問 'category': 数値計算エラーが発生しました: "),
+            "エラーメッセージの先頭に質問識別子と定型句が並ぶこと: {err_logits_msg}"
         );
-        assert!(
-            err_logits_mismatch
-                .to_string()
-                .contains("ロジットの要素数(3)が候補数(2)と一致しません")
-        );
+        assert_eq!(err_logits_msg.matches("質問 'category': ").count(), 1);
 
         // 5. Score 型の段階数不一致時にも question_id が伝播すること
         let invalid_score_q = Question::new_score("評価せよ。", vec!["単一".to_string()]);

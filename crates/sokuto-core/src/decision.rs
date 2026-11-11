@@ -40,18 +40,7 @@ fn evaluate_choice_map_with_buf(
         });
     }
 
-    if probs_buf.len() != logits.len() {
-        return Err(CoreError::MathError {
-            question_id: question_id.map(str::to_string),
-            message: format!(
-                "出力バッファ長({out_len})がロジット長({logits_len})と一致しません。",
-                out_len = probs_buf.len(),
-                logits_len = logits.len()
-            ),
-        });
-    }
-
-    // ゼロアロケーション版ソフトマックスの実行。
+    // ゼロアロケーション版ソフトマックスの実行(出力バッファ長検証を含む)。
     attach_question_id(softmax_into(logits, probs_buf, temperature), question_id)?;
 
     // 決定論的タイブレーク付き最大値インデックスおよび複合確信度スコアの単一パス算出。
@@ -133,18 +122,7 @@ fn evaluate_score_list_with_buf(
         });
     }
 
-    if probs_buf.len() != logits.len() {
-        return Err(CoreError::MathError {
-            question_id: question_id.map(str::to_string),
-            message: format!(
-                "出力バッファ長({out_len})がロジット長({logits_len})と一致しません。",
-                out_len = probs_buf.len(),
-                logits_len = logits.len()
-            ),
-        });
-    }
-
-    // ゼロアロケーション版ソフトマックス確率分布の算出。
+    // ゼロアロケーション版ソフトマックス確率分布の算出(出力バッファ長検証を含む)。
     attach_question_id(softmax_into(logits, probs_buf, temperature), question_id)?;
 
     // 単一パス走査による加重平均期待値(スコア)および事後分散の算出。

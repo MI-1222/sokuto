@@ -152,6 +152,30 @@ fn default_noul_temperature() -> f64 {
     1.0
 }
 
+/// 温度パラメータが正の有限実数 (`> 0.0 && is_finite()`) であることを検証する。
+fn validate_temperature(label: &str, temperature: f64) -> Result<()> {
+    if !temperature.is_finite() || temperature <= 0.0 {
+        return Err(CoreError::InvalidCalibrationConfig {
+            message: format!("{label} ({temperature}) は正の有限実数である必要があります。"),
+        });
+    }
+    Ok(())
+}
+
+impl TemperatureMap {
+    /// 各プリミティブの温度テーブル内のすべての温度値が正の有限実数であることを検証する。
+    pub fn validate(&self) -> Result<()> {
+        for (spec, &temp) in &self.choice {
+            validate_temperature(&format!("temperature_map.choice[\"{spec}\"]"), temp)?;
+        }
+        for (spec, &temp) in &self.score {
+            validate_temperature(&format!("temperature_map.score[\"{spec}\"]"), temp)?;
+        }
+        validate_temperature("temperature_map.noul", self.noul)?;
+        Ok(())
+    }
+}
+
 impl Default for TemperatureMap {
     fn default() -> Self {
         let mut choice = IndexMap::new();
@@ -239,11 +263,26 @@ impl CalibrationConfig {
         self.gating_thresholds.to_gating_config(true)
     }
 
-    /// JSON 文字列からデシリアライズする。
+    /// JSON 文字列からデシリアライズし、温度設定およびゲーティング閾値の妥当性を検証する。
     pub fn from_json_str(json_str: &str) -> Result<Self> {
-        serde_json::from_str(json_str).map_err(|e| CoreError::SerializationError {
-            message: format!("calibration.json の解析に失敗しました: {e}。"),
-        })
+        let config: Self =
+            serde_json::from_str(json_str).map_err(|e| CoreError::SerializationError {
+                message: format!("calibration.json の解析に失敗しました: {e}。"),
+            })?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// キャリブレーション設定全体の数学的妥当性を検証する。
+    ///
+    /// - `default_temperature` が正の有限実数であることを検証する。
+    /// - `temperature_map` (`choice`, `score`, `noul`) 内の全温度値が正の有限実数であることを検証する。
+    /// - `gating_thresholds` の妥当性 ([`GatingThresholds::validate`]) を検証する。
+    pub fn validate(&self) -> Result<()> {
+        validate_temperature("default_temperature", self.default_temperature)?;
+        self.temperature_map.validate()?;
+        self.gating_thresholds.validate()?;
+        Ok(())
     }
 
     /// JSON 文字列へシリアライズする。
@@ -448,5 +487,79 @@ mod tests {
 
         assert!(BucketSpec::from_str("invalid").is_err());
         assert!(BucketSpec::from_str("5-3").is_err());
+    }
+
+    #[test]
+    fn test_calibration_config_validation() {
+        // 1. デフォルト設定および全項目が正の有限実数の場合は検証成功。
+        let default_cfg = CalibrationConfig::default();
+        assert!(default_cfg.validate().is_ok());
+
+        // 2. default_temperature が 0 以下または非有限値の場合は拒否。
+        for bad_temp in [0.0, -0.5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let cfg = CalibrationConfig::default().with_default_temperature(bad_temp);
+            assert!(matches!(
+                cfg.validate(),
+                Err(CoreError::InvalidCalibrationConfig { .. })
+            ));
+        }
+
+        // 3. temperature_map.choice バケット内に不正な温度がある場合は拒否。
+        for bad_temp in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut map = TemperatureMap::default();
+            map.choice.insert(BucketSpec::Exact(2), bad_temp);
+            let cfg = CalibrationConfig::default().with_temperature_map(map);
+            assert!(matches!(
+                cfg.validate(),
+                Err(CoreError::InvalidCalibrationConfig { .. })
+            ));
+        }
+
+        // 4. temperature_map.score バケット内に不正な温度がある場合は拒否。
+        for bad_temp in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut map = TemperatureMap::default();
+            map.score.insert(BucketSpec::Range(2, 5), bad_temp);
+            let cfg = CalibrationConfig::default().with_temperature_map(map);
+            assert!(matches!(
+                cfg.validate(),
+                Err(CoreError::InvalidCalibrationConfig { .. })
+            ));
+        }
+
+        // 5. temperature_map.noul が不正な温度の場合は拒否。
+        for bad_temp in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let map = TemperatureMap {
+                noul: bad_temp,
+                ..TemperatureMap::default()
+            };
+            let cfg = CalibrationConfig::default().with_temperature_map(map);
+            assert!(matches!(
+                cfg.validate(),
+                Err(CoreError::InvalidCalibrationConfig { .. })
+            ));
+        }
+
+        // 6. 内包する gating_thresholds が不正な場合も委譲して拒否。
+        let bad_gating = GatingThresholds {
+            high_threshold: 0.3,
+            low_threshold: 0.7,
+            ..GatingThresholds::default()
+        };
+        let cfg_bad_gating = CalibrationConfig::default().with_gating_thresholds(bad_gating);
+        assert!(matches!(
+            cfg_bad_gating.validate(),
+            Err(CoreError::InvalidGatingConfig { .. })
+        ));
+
+        // 7. from_json_str でのロード時にも不正な温度が即座に拒否されること。
+        let invalid_json_cases = [
+            r#"{"version":"1.0","default_temperature":0.0,"temperature_map":{"choice":{},"score":{},"noul":1.0}}"#,
+            r#"{"version":"1.0","default_temperature":1.0,"temperature_map":{"choice":{"2":-0.5},"score":{},"noul":1.0}}"#,
+            r#"{"version":"1.0","default_temperature":1.0,"temperature_map":{"choice":{},"score":{},"noul":0.0}}"#,
+        ];
+        for json_str in invalid_json_cases {
+            let err = CalibrationConfig::from_json_str(json_str).unwrap_err();
+            assert!(matches!(err, CoreError::InvalidCalibrationConfig { .. }));
+        }
     }
 }

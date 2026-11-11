@@ -109,6 +109,13 @@ pub enum CoreError {
         message: String,
     },
 
+    /// キャリブレーション設定のバリデーションエラー。
+    #[error("キャリブレーション設定が不正です: {message}。")]
+    InvalidCalibrationConfig {
+        /// エラー詳細メッセージ。
+        message: String,
+    },
+
     /// バッチサイズが 0 または仕様制約外である場合のエラー。
     #[error("バッチサイズは 1 以上である必要がありますが、{batch_size} が指定されました。")]
     InvalidBatchSize {

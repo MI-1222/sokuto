@@ -67,7 +67,7 @@ impl BucketSpec {
     pub fn matches(&self, count: usize) -> bool {
         match *self {
             Self::Exact(exact) => count == exact,
-            Self::Range(start, end) => count >= start && count <= end,
+            Self::Range(start, end) => (start..=end).contains(&count),
             Self::AtLeast(lower) => count >= lower,
         }
     }

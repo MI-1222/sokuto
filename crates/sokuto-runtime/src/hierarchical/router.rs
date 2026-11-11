@@ -10,6 +10,7 @@ use sokuto_core::gating::{
     CandidateProbability, DecisionRoute, EscalationContext, GatingConfig, GatingMetadata,
     evaluate_answer_gating_opts,
 };
+use sokuto_core::math::composite_confidence_iter;
 use sokuto_core::schema::{Answer, Criteria, Question, QuestionType};
 
 use crate::engine::InferenceEngine;
@@ -453,7 +454,7 @@ impl<'a> CoarseToFineRouter<'a> {
         let all_fine_keys = self.mapping.all_fine_keys();
         let sorted_full = sort_probabilities_descending(all_fine_keys, &full_probabilities);
 
-        let (final_winner, final_confidence, _final_margin, catchall_bias_triggered) =
+        let (final_winner, _winner_prob, final_margin, catchall_bias_triggered) =
             resolve_winner_with_catchall_bias(
                 self.mapping,
                 &sorted_full,
@@ -461,7 +462,7 @@ impl<'a> CoarseToFineRouter<'a> {
                 self.config.catchall_threshold,
             )?;
 
-        // --- Step 7: 全候補空間基準での Gating 判定 (OOD 安全弁含む) ---
+        // --- Step 7: 全候補空間基準での複合確信度算出・Gating 判定 (OOD 安全弁含む) ---
         let fine_energy = calculate_choice_energy_with_config(
             &fine_question,
             &raw_logits,
@@ -469,6 +470,11 @@ impl<'a> CoarseToFineRouter<'a> {
             gating_config,
         );
         let resolved_gating_config = resolve_gating_config(gating_config, self.calib_config);
+        let final_confidence = compute_final_answer_confidence(
+            &full_probabilities,
+            catchall_bias_triggered,
+            final_margin,
+        )?;
 
         let mut answer = Answer::choice(final_winner, full_probabilities, final_confidence);
         let gating = build_final_gating_metadata(
@@ -590,6 +596,24 @@ fn resolve_winner_with_catchall_bias(
         final_margin,
         catchall_bias_triggered,
     ))
+}
+
+/// 全細分類候補空間の確率分布から、`Answer::choice` に設定する複合確信度スコアを算出する。
+///
+/// # 数理仕様
+/// - 通常時は [`composite_confidence_iter`] により全候補空間の正規化エントロピーと Top-Margin を統合した
+///   $S_{\text{confidence}} = (1.0 - H_{\text{norm}}(p)) \times M(p)$ を算出する。
+/// - `catchall_bias` によって 2 位以下のネガティブ候補が勝者に昇格された場合 (`final_margin == 0.0`) は、
+///   分布全体の最大確率候補に対する確信度で昇格先候補を過信自動実行することを防ぐため `0.0` を返す。
+fn compute_final_answer_confidence(
+    full_probabilities: &IndexMap<String, f64>,
+    catchall_bias_triggered: bool,
+    final_margin: f64,
+) -> Result<f64> {
+    if catchall_bias_triggered && final_margin <= 0.0 {
+        return Ok(0.0);
+    }
+    Ok(composite_confidence_iter(full_probabilities.values())?)
 }
 
 /// 全細分類定義を含む `Question` を構築し、System 2 への CoT 委託プロンプト案を生成する。
@@ -1257,5 +1281,75 @@ mod tests {
         assert_eq!(ordered_keys, vec!["k1", "k0", "k2", "k3", "k4_missing"]);
         assert!((sorted[0].1 - 0.50).abs() < 1e-12);
         assert!((sorted[4].1 - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_compute_final_answer_confidence_uses_composite_confidence() {
+        let mapping = HierarchicalMapping::banking77();
+        let all_keys = mapping.all_fine_keys();
+
+        // 1. 最大確率は 0.72 (>= high_threshold 0.70) かつ 2 位が 0.27 (margin 0.45 >= 0.15) でも、
+        //    全 77 候補空間での複合確信度 (1 - H_norm) * M は 0.70 未満となるため、
+        //    生確率の直接代入による誤った AutoExecute を防ぎ ConfirmOrEscalate となること。
+        let mut probs = IndexMap::new();
+        probs.insert(all_keys[0].clone(), 0.72);
+        probs.insert(all_keys[1].clone(), 0.27);
+        let tail_prob = 0.01 / ((all_keys.len() - 2) as f64);
+        for key in all_keys.iter().skip(2) {
+            probs.insert(key.clone(), tail_prob);
+        }
+
+        let probs_vec: Vec<f64> = probs.values().copied().collect();
+        let expected_composite = sokuto_core::math::composite_confidence(&probs_vec).unwrap();
+        assert!(expected_composite < 0.70);
+
+        let actual = compute_final_answer_confidence(&probs, false, 0.72 - 0.27)
+            .expect("複合確信度の算出に成功すること。");
+        assert!((actual - expected_composite).abs() < 1e-12);
+
+        let answer = Answer::choice(all_keys[0].clone(), probs, actual);
+        let gating = build_final_gating_metadata(
+            &mapping,
+            "カードの件について相談です。",
+            "カテゴリを選択してください。",
+            &answer,
+            &GatingConfig::default(),
+            Some(-2.5),
+        );
+        assert_eq!(gating.route, DecisionRoute::ConfirmOrEscalate);
+
+        // 2. 単一候補に極端に集中した分布では複合確信度が high_threshold を超え AutoExecute となること
+        let mut peaked_probs = IndexMap::new();
+        peaked_probs.insert(all_keys[0].clone(), 0.96);
+        peaked_probs.insert(all_keys[1].clone(), 0.04);
+        for key in all_keys.iter().skip(2) {
+            peaked_probs.insert(key.clone(), 0.0);
+        }
+        let peaked_vec: Vec<f64> = peaked_probs.values().copied().collect();
+        let expected_peaked = sokuto_core::math::composite_confidence(&peaked_vec).unwrap();
+        assert!(expected_peaked >= 0.70);
+
+        let actual_peaked = compute_final_answer_confidence(&peaked_probs, false, 0.92)
+            .expect("複合確信度の算出に成功すること。");
+        assert!((actual_peaked - expected_peaked).abs() < 1e-12);
+
+        let peaked_answer = Answer::choice(all_keys[0].clone(), peaked_probs, actual_peaked);
+        let peaked_gating = build_final_gating_metadata(
+            &mapping,
+            "カードを紛失しました。",
+            "カテゴリを選択してください。",
+            &peaked_answer,
+            &GatingConfig::default(),
+            Some(-2.5),
+        );
+        assert_eq!(peaked_gating.route, DecisionRoute::AutoExecute);
+
+        // 3. catchall_bias により 2 位以下のネガティブ候補へ切り替わった場合 (final_margin == 0.0) は 0.0 となること
+        let mut override_probs = IndexMap::new();
+        override_probs.insert("card_lost".to_string(), 0.85);
+        override_probs.insert("none".to_string(), 0.15);
+        let override_conf = compute_final_answer_confidence(&override_probs, true, 0.0)
+            .expect("昇格時確信度の算出に成功すること。");
+        assert!((override_conf - 0.0).abs() < 1e-12);
     }
 }

@@ -644,6 +644,36 @@ fn matches_choice_value(cond: &NodeCondition, choice_val: &str) -> bool {
     }
 }
 
+/// `Display` 出力が対象文字列と完全一致するかをヒープ割り当てなしで判定する。
+fn eq_display(target: &str, value: &impl std::fmt::Display) -> bool {
+    struct EqBytesWriter<'a> {
+        remaining: &'a [u8],
+        matched: bool,
+    }
+
+    impl std::fmt::Write for EqBytesWriter<'_> {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            if !self.matched {
+                return Ok(());
+            }
+            if let Some(rest) = self.remaining.strip_prefix(s.as_bytes()) {
+                self.remaining = rest;
+            } else {
+                self.matched = false;
+            }
+            Ok(())
+        }
+    }
+
+    let mut writer = EqBytesWriter {
+        remaining: target.as_bytes(),
+        matched: true,
+    };
+    std::fmt::write(&mut writer, format_args!("{value}")).is_ok()
+        && writer.matched
+        && writer.remaining.is_empty()
+}
+
 /// 先行ノードのコンテキストプロパティ (`value` / `confidence`) を評価する。
 fn matches_context_property(
     cond: &NodeCondition,
@@ -652,20 +682,16 @@ fn matches_context_property(
 ) -> bool {
     match prop {
         ContextProp::Value => {
-            let num_str;
-            let target_str = match &cond.value {
-                Some(serde_json::Value::String(s)) => s.as_str(),
-                Some(serde_json::Value::Bool(true)) => "true",
-                Some(serde_json::Value::Bool(false)) => "false",
-                Some(serde_json::Value::Number(n)) => {
-                    num_str = n.to_string();
-                    num_str.as_str()
-                }
-                _ => "",
+            let is_eq = match &cond.value {
+                Some(serde_json::Value::String(s)) => ctx_val.value == s.as_str(),
+                Some(serde_json::Value::Bool(true)) => ctx_val.value == "true",
+                Some(serde_json::Value::Bool(false)) => ctx_val.value == "false",
+                Some(serde_json::Value::Number(n)) => eq_display(&ctx_val.value, n),
+                _ => ctx_val.value.is_empty(),
             };
             match cond.op {
-                NodeConditionOp::Eq => ctx_val.value == target_str,
-                NodeConditionOp::Neq => ctx_val.value != target_str,
+                NodeConditionOp::Eq => is_eq,
+                NodeConditionOp::Neq => !is_eq,
                 _ => false,
             }
         }
@@ -764,6 +790,90 @@ mod tests {
 
         let target = evaluate_conditions(&conditions, None, &context);
         assert_eq!(target, Some("escalate_fraud".to_string()));
+    }
+
+    #[test]
+    fn test_matches_context_property_number_variants() {
+        let mut context = IndexMap::new();
+        context.insert("risk_score".to_string(), NodeContextValue::new("3", 0.85));
+        context.insert("delta".to_string(), NodeContextValue::new("-12.5", 0.90));
+        context.insert(
+            "big_id".to_string(),
+            NodeContextValue::new("18446744073709551615", 0.99),
+        );
+        context.insert("label".to_string(), NodeContextValue::new("transfer", 0.95));
+
+        assert_eq!(
+            evaluate_conditions(
+                &[NodeCondition {
+                    field: "risk_score.value".to_string(),
+                    op: NodeConditionOp::Eq,
+                    value: Some(serde_json::json!(3)),
+                    target_node: "hit_int".to_string(),
+                }],
+                None,
+                &context,
+            ),
+            Some("hit_int".to_string())
+        );
+
+        assert_eq!(
+            evaluate_conditions(
+                &[NodeCondition {
+                    field: "delta.value".to_string(),
+                    op: NodeConditionOp::Eq,
+                    value: Some(serde_json::json!(-12.5)),
+                    target_node: "hit_float".to_string(),
+                }],
+                None,
+                &context,
+            ),
+            Some("hit_float".to_string())
+        );
+
+        assert_eq!(
+            evaluate_conditions(
+                &[NodeCondition {
+                    field: "big_id.value".to_string(),
+                    op: NodeConditionOp::Eq,
+                    value: Some(serde_json::json!(u64::MAX)),
+                    target_node: "hit_u64".to_string(),
+                }],
+                None,
+                &context,
+            ),
+            Some("hit_u64".to_string())
+        );
+
+        // 文字列長が一部一致する場合 (prefix 一致のみ等) に誤って Eq にならないこと
+        assert_eq!(
+            evaluate_conditions(
+                &[NodeCondition {
+                    field: "risk_score.value".to_string(),
+                    op: NodeConditionOp::Eq,
+                    value: Some(serde_json::json!(30)),
+                    target_node: "miss_prefix".to_string(),
+                }],
+                None,
+                &context,
+            ),
+            None
+        );
+
+        // 非数値コンテキスト値に対する Neq が従来どおり true となること
+        assert_eq!(
+            evaluate_conditions(
+                &[NodeCondition {
+                    field: "label.value".to_string(),
+                    op: NodeConditionOp::Neq,
+                    value: Some(serde_json::json!(3)),
+                    target_node: "not_three".to_string(),
+                }],
+                None,
+                &context,
+            ),
+            Some("not_three".to_string())
+        );
     }
 
     #[test]

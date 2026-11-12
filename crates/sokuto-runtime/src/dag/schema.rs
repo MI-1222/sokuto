@@ -43,29 +43,123 @@ pub enum DagNodeType {
 }
 
 /// DAG を構成する個々のノード定義。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DagNode {
-    /// ノードの種別。
-    pub node_type: DagNodeType,
-    /// 推論ノード (`Inference`) で実行する質問仕様。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub question: Option<Question>,
-    /// ノード完了後の条件付き遷移規則リスト。先頭から順に評価される。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub conditions: Vec<NodeCondition>,
-    /// 並行実行対象となるノード ID 一覧 (`Parallel` ノード用)。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub parallel_nodes: Vec<String>,
-    /// 並行実行完了後の合流先ノード ID (`Parallel` ノード用)。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub join_node: Option<String>,
-    /// エスカレーションまたは分岐の理由説明文。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+///
+/// 代数的データ型 (タグ付き enum) として表現され、ノード種別ごとに必要なフィールドのみを保持する。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "node_type", rename_all = "snake_case")]
+pub enum DagNode {
+    /// 単一質問のモデル推論を実行するノード。
+    Inference {
+        /// 推論で実行する質問仕様。
+        question: Question,
+        /// ノード完了後の条件付き遷移規則リスト。先頭から順に評価される。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        conditions: Vec<NodeCondition>,
+        /// 分岐または推論の理由説明文。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// 先行ノードの判定値・確信度のみに基づいて遷移先を決定する純粋な条件分岐ノード。
+    Branch {
+        /// ノード完了後の条件付き遷移規則リスト。先頭から順に評価される。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        conditions: Vec<NodeCondition>,
+        /// 分岐の理由説明文。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// 独立した複数の質問を並行実行し合流するノード。
+    Parallel {
+        /// 並行実行対象となるノード ID 一覧。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        parallel_nodes: Vec<String>,
+        /// 並行実行完了後の合流先ノード ID。
+        join_node: String,
+        /// 並行実行の理由説明文。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// 確信度不足や例外検知時に上位 LLM または人手へ委ねるエスカレーションノード。
+    Escalate {
+        /// エスカレーションの理由説明文。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+}
+
+impl DagNode {
+    /// ノードの種別を返す。
+    pub fn node_type(&self) -> DagNodeType {
+        match self {
+            Self::Inference { .. } => DagNodeType::Inference,
+            Self::Branch { .. } => DagNodeType::Branch,
+            Self::Parallel { .. } => DagNodeType::Parallel,
+            Self::Escalate { .. } => DagNodeType::Escalate,
+        }
+    }
+
+    /// 理由説明文を返す。
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Inference { reason, .. }
+            | Self::Branch { reason, .. }
+            | Self::Parallel { reason, .. }
+            | Self::Escalate { reason, .. } => reason.as_deref(),
+        }
+    }
+
+    /// 条件付き遷移規則リストへの参照を返す (Inference または Branch の場合)。
+    pub fn conditions(&self) -> &[NodeCondition] {
+        match self {
+            Self::Inference { conditions, .. } | Self::Branch { conditions, .. } => conditions,
+            Self::Parallel { .. } | Self::Escalate { .. } => &[],
+        }
+    }
+
+    /// 推論ノードの質問定義への参照を返す (Inference の場合)。
+    pub fn question(&self) -> Option<&Question> {
+        match self {
+            Self::Inference { question, .. } => Some(question),
+            _ => None,
+        }
+    }
+
+    /// 推論ノード (`Inference`) を構築するヘルパー。
+    pub fn inference(question: Question, conditions: Vec<NodeCondition>) -> Self {
+        Self::Inference {
+            question,
+            conditions,
+            reason: None,
+        }
+    }
+
+    /// 条件分岐ノード (`Branch`) を構築するヘルパー。
+    pub fn branch(conditions: Vec<NodeCondition>) -> Self {
+        Self::Branch {
+            conditions,
+            reason: None,
+        }
+    }
+
+    /// 並行実行ノード (`Parallel`) を構築するヘルパー。
+    pub fn parallel(parallel_nodes: Vec<String>, join_node: impl Into<String>) -> Self {
+        Self::Parallel {
+            parallel_nodes,
+            join_node: join_node.into(),
+            reason: None,
+        }
+    }
+
+    /// エスカレーションノード (`Escalate`) を構築するヘルパー。
+    pub fn escalate(reason: Option<impl Into<String>>) -> Self {
+        Self::Escalate {
+            reason: reason.map(Into::into),
+        }
+    }
 }
 
 /// 条件付き遷移規則。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeCondition {
     /// 評価対象フィールド (`"answer"`, `"confidence"`, `"route"` など)。
     pub field: String,
@@ -233,8 +327,25 @@ mod tests {
         assert_eq!(dag.timeout_ms, 50);
         assert_eq!(dag.entry_node, "step1");
         assert_eq!(dag.nodes.len(), 3);
-        assert_eq!(dag.nodes["step1"].node_type, DagNodeType::Inference);
-        assert_eq!(dag.nodes["escalate"].node_type, DagNodeType::Escalate);
+        assert_eq!(dag.nodes["step1"].node_type(), DagNodeType::Inference);
+        assert_eq!(dag.nodes["escalate"].node_type(), DagNodeType::Escalate);
+    }
+
+    #[test]
+    fn test_dag_node_deserialize_invalid_spec_fails_at_serde() {
+        // inference なのに question が欠落している JSON
+        let invalid_inference = r#"{
+            "node_type": "inference",
+            "conditions": []
+        }"#;
+        assert!(serde_json::from_str::<DagNode>(invalid_inference).is_err());
+
+        // parallel なのに join_node が欠落している JSON
+        let invalid_parallel = r#"{
+            "node_type": "parallel",
+            "parallel_nodes": ["task1"]
+        }"#;
+        assert!(serde_json::from_str::<DagNode>(invalid_parallel).is_err());
     }
 
     #[test]

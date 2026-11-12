@@ -13,7 +13,7 @@ use sokuto_core::schema::{Answer, AnswerPayload, Question};
 use crate::dag::interpolate::{NodeContextValue, interpolate_prompt, interpolate_question};
 use crate::dag::pool::PoolError;
 use crate::dag::schema::{
-    DagDefinition, DagExecutionResult, DagNodeType, NodeCondition, NodeConditionOp,
+    DagDefinition, DagExecutionResult, DagNode, DagNodeType, NodeCondition, NodeConditionOp,
     StepExecutionResult,
 };
 use crate::dag::validator::{DagValidationError, validate_dag};
@@ -156,16 +156,15 @@ impl InProcessDagExecutor {
             execution_path.push(curr_node_id.clone());
             let step_start = Instant::now();
 
-            match node.node_type {
-                DagNodeType::Inference => {
-                    let raw_question = node
-                        .question
-                        .as_ref()
-                        .ok_or_else(|| DagError::NodeNotFound(curr_node_id.clone()))?;
-
+            match node {
+                DagNode::Inference {
+                    question,
+                    conditions,
+                    reason,
+                } => {
                     let handle = self.spawn_inference_task(
                         initial_state,
-                        raw_question,
+                        question,
                         &context,
                         &mut scratch_state,
                     );
@@ -177,7 +176,7 @@ impl InProcessDagExecutor {
                     final_answer = Some(answer.clone());
 
                     // 条件評価
-                    let next_node = evaluate_conditions(&node.conditions, Some(&answer), &context);
+                    let next_node = evaluate_conditions(conditions, Some(&answer), &context);
                     let duration_ms = step_start.elapsed().as_secs_f64() * 1000.0;
 
                     steps.insert(
@@ -188,7 +187,7 @@ impl InProcessDagExecutor {
                             answer: Some(answer),
                             duration_ms,
                             next_node: next_node.clone(),
-                            reason: node.reason.clone(),
+                            reason: reason.clone(),
                         },
                     );
 
@@ -197,9 +196,9 @@ impl InProcessDagExecutor {
                         None => break,
                     }
                 }
-                DagNodeType::Branch => {
+                DagNode::Branch { conditions, reason } => {
                     let next_node =
-                        evaluate_conditions(&node.conditions, final_answer.as_ref(), &context);
+                        evaluate_conditions(conditions, final_answer.as_ref(), &context);
                     let duration_ms = step_start.elapsed().as_secs_f64() * 1000.0;
 
                     steps.insert(
@@ -210,7 +209,7 @@ impl InProcessDagExecutor {
                             answer: None,
                             duration_ms,
                             next_node: next_node.clone(),
-                            reason: node.reason.clone(),
+                            reason: reason.clone(),
                         },
                     );
 
@@ -219,16 +218,20 @@ impl InProcessDagExecutor {
                         None => break,
                     }
                 }
-                DagNodeType::Parallel => {
-                    let mut tasks = Vec::with_capacity(node.parallel_nodes.len());
+                DagNode::Parallel {
+                    parallel_nodes,
+                    join_node,
+                    reason,
+                } => {
+                    let mut tasks = Vec::with_capacity(parallel_nodes.len());
 
-                    for p_node_id in &node.parallel_nodes {
+                    for p_node_id in parallel_nodes {
                         let p_node = dag
                             .nodes
                             .get(p_node_id)
                             .ok_or_else(|| DagError::NodeNotFound(p_node_id.clone()))?;
 
-                        let raw_question = p_node.question.as_ref().ok_or_else(|| {
+                        let raw_question = p_node.question().ok_or_else(|| {
                             DagError::ExecutionFailed(format!(
                                 "並行ノード '{p_node_id}' に question が存在しません。"
                             ))
@@ -256,7 +259,7 @@ impl InProcessDagExecutor {
                     }
 
                     let duration_ms = step_start.elapsed().as_secs_f64() * 1000.0;
-                    let next_node = node.join_node.clone();
+                    let next_node = Some(join_node.clone());
                     record_parallel_results(
                         parallel_answers,
                         next_node.as_deref(),
@@ -274,7 +277,7 @@ impl InProcessDagExecutor {
                             answer: None,
                             duration_ms,
                             next_node: next_node.clone(),
-                            reason: node.reason.clone(),
+                            reason: reason.clone(),
                         },
                     );
 
@@ -283,10 +286,10 @@ impl InProcessDagExecutor {
                         None => break,
                     }
                 }
-                DagNodeType::Escalate => {
+                DagNode::Escalate { reason } => {
                     let duration_ms = step_start.elapsed().as_secs_f64() * 1000.0;
                     escalated = true;
-                    escalation_reason = node.reason.clone();
+                    escalation_reason = reason.clone();
 
                     // エスカレーションをトリガーした直前ノードの特定
                     let trigger_node_id = execution_path.iter().rev().nth(1).cloned();
@@ -303,7 +306,7 @@ impl InProcessDagExecutor {
                         escalation_prompt = Some(tmpl.clone());
                     } else if let Some(ref trig_id) = trigger_node_id
                         && let Some(trig_node) = dag.nodes.get(trig_id)
-                        && let Some(ref q) = trig_node.question
+                        && let Some(q) = trig_node.question()
                         && let Some(ref ans) = final_answer
                         && let Some(ref g) = escalation_gating
                     {
@@ -332,7 +335,7 @@ impl InProcessDagExecutor {
                             &candidates,
                         ));
                     } else {
-                        escalation_prompt = node.reason.clone();
+                        escalation_prompt = reason.clone();
                     }
 
                     steps.insert(
@@ -343,7 +346,7 @@ impl InProcessDagExecutor {
                             answer: None,
                             duration_ms,
                             next_node: None,
-                            reason: node.reason.clone(),
+                            reason: reason.clone(),
                         },
                     );
                     break;
@@ -1266,49 +1269,33 @@ mod tests {
             let is_last = i + 1 == num_steps;
             let node_id = format!("step_{i}");
             let node = if is_last && terminate_with_escalate {
-                DagNode {
-                    node_type: DagNodeType::Escalate,
-                    question: None,
-                    conditions: Vec::new(),
-                    parallel_nodes: Vec::new(),
-                    join_node: None,
+                DagNode::Escalate {
                     reason: Some("テスト終端エスカレーション。".to_string()),
                 }
             } else if is_last {
-                DagNode {
-                    node_type: DagNodeType::Branch,
-                    question: None,
+                DagNode::Branch {
                     conditions: Vec::new(),
-                    parallel_nodes: Vec::new(),
-                    join_node: None,
                     reason: None,
                 }
             } else if i == 0 {
-                DagNode {
-                    node_type: DagNodeType::Inference,
-                    question: Some(Question::new_noul("テストステップ判定".to_string())),
+                DagNode::Inference {
+                    question: Question::new_noul("テストステップ判定".to_string()),
                     conditions: vec![NodeCondition {
                         field: "confidence".to_string(),
                         op: NodeConditionOp::ConfidenceGte,
                         value: Some(serde_json::json!(0.0)),
                         target_node: format!("step_{}", i + 1),
                     }],
-                    parallel_nodes: Vec::new(),
-                    join_node: None,
                     reason: None,
                 }
             } else {
-                DagNode {
-                    node_type: DagNodeType::Branch,
-                    question: None,
+                DagNode::Branch {
                     conditions: vec![NodeCondition {
                         field: "confidence".to_string(),
                         op: NodeConditionOp::ConfidenceGte,
                         value: Some(serde_json::json!(0.0)),
                         target_node: format!("step_{}", i + 1),
                     }],
-                    parallel_nodes: Vec::new(),
-                    join_node: None,
                     reason: None,
                 }
             };

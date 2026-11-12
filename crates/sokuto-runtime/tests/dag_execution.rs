@@ -12,8 +12,8 @@ use indexmap::IndexMap;
 use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_core::schema::{Answer, Question};
 use sokuto_runtime::dag::{
-    DagDefinition, DagNode, DagNodeType, InProcessDagExecutor, LowLatencyResourcePool,
-    NodeCondition, NodeConditionOp, evaluate_conditions, interpolate_prompt, validate_dag,
+    DagDefinition, DagNode, InProcessDagExecutor, LowLatencyResourcePool, NodeCondition,
+    NodeConditionOp, evaluate_conditions, interpolate_prompt, validate_dag,
 };
 use sokuto_runtime::engine::{InferenceEngine, SessionConfig};
 use sokuto_runtime::tokenizer::JevTokenizer;
@@ -39,10 +39,9 @@ fn test_dag_validation_clean_dag() {
     // Node 1: セール品判定 (Noul)
     nodes.insert(
         "is_sale_item".to_string(),
-        DagNode {
-            node_type: DagNodeType::Inference,
-            question: Some(Question::new_noul("対象商品はセール品ですか？".to_string())),
-            conditions: vec![
+        DagNode::inference(
+            Question::new_noul("対象商品はセール品ですか？".to_string()),
+            vec![
                 NodeCondition {
                     field: "answer".to_string(),
                     op: NodeConditionOp::Eq,
@@ -56,19 +55,15 @@ fn test_dag_validation_clean_dag() {
                     target_node: "check_within_30days".to_string(),
                 },
             ],
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        ),
     );
 
     // Node 2: 30日以内判定 (Noul)
     nodes.insert(
         "check_within_30days".to_string(),
-        DagNode {
-            node_type: DagNodeType::Inference,
-            question: Some(Question::new_noul("商品到着後30日以内ですか？".to_string())),
-            conditions: vec![
+        DagNode::inference(
+            Question::new_noul("商品到着後30日以内ですか？".to_string()),
+            vec![
                 NodeCondition {
                     field: "answer".to_string(),
                     op: NodeConditionOp::Eq,
@@ -82,10 +77,7 @@ fn test_dag_validation_clean_dag() {
                     target_node: "check_package_status".to_string(),
                 },
             ],
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        ),
     );
 
     // Node 3: 開封状態判定 (Choice)
@@ -94,13 +86,12 @@ fn test_dag_validation_clean_dag() {
     package_criteria.insert("opened".to_string(), "開封済み".to_string());
     nodes.insert(
         "check_package_status".to_string(),
-        DagNode {
-            node_type: DagNodeType::Inference,
-            question: Some(Question::new_choice(
+        DagNode::inference(
+            Question::new_choice(
                 "商品の状態を選択してください。".to_string(),
                 package_criteria,
-            )),
-            conditions: vec![
+            ),
+            vec![
                 NodeCondition {
                     field: "answer".to_string(),
                     op: NodeConditionOp::Eq,
@@ -114,21 +105,15 @@ fn test_dag_validation_clean_dag() {
                     target_node: "check_initial_defect".to_string(),
                 },
             ],
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        ),
     );
 
     // Node 4: 初期不良判定 (Noul)
     nodes.insert(
         "check_initial_defect".to_string(),
-        DagNode {
-            node_type: DagNodeType::Inference,
-            question: Some(Question::new_noul(
-                "初期不良の申告がありますか？".to_string(),
-            )),
-            conditions: vec![
+        DagNode::inference(
+            Question::new_noul("初期不良の申告がありますか？".to_string()),
+            vec![
                 NodeCondition {
                     field: "answer".to_string(),
                     op: NodeConditionOp::Eq,
@@ -142,35 +127,21 @@ fn test_dag_validation_clean_dag() {
                     target_node: "escalate_reject".to_string(),
                 },
             ],
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        ),
     );
 
     // 終端ノード
     nodes.insert(
         "approve_return".to_string(),
-        DagNode {
-            node_type: DagNodeType::Branch,
-            question: None,
+        DagNode::Branch {
             conditions: Vec::new(),
-            parallel_nodes: Vec::new(),
-            join_node: None,
             reason: Some("返品条件を満たしているため承認。".to_string()),
         },
     );
 
     nodes.insert(
         "escalate_reject".to_string(),
-        DagNode {
-            node_type: DagNodeType::Escalate,
-            question: None,
-            conditions: Vec::new(),
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: Some("規約により返品不可のため却下または上位判断。".to_string()),
-        },
+        DagNode::escalate(Some("規約により返品不可のため却下または上位判断。")),
     );
 
     let dag = DagDefinition {
@@ -190,53 +161,41 @@ fn test_dag_validation_cycle_rejection() {
 
     nodes.insert(
         "step_a".to_string(),
-        DagNode {
-            node_type: DagNodeType::Inference,
-            question: Some(Question::new_noul("質問A".to_string())),
-            conditions: vec![NodeCondition {
+        DagNode::inference(
+            Question::new_noul("質問A".to_string()),
+            vec![NodeCondition {
                 field: "answer".to_string(),
                 op: NodeConditionOp::Eq,
                 value: Some(serde_json::json!(true)),
                 target_node: "step_b".to_string(),
             }],
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        ),
     );
 
     nodes.insert(
         "step_b".to_string(),
-        DagNode {
-            node_type: DagNodeType::Inference,
-            question: Some(Question::new_noul("質問B".to_string())),
-            conditions: vec![NodeCondition {
+        DagNode::inference(
+            Question::new_noul("質問B".to_string()),
+            vec![NodeCondition {
                 field: "answer".to_string(),
                 op: NodeConditionOp::Eq,
                 value: Some(serde_json::json!(true)),
                 target_node: "step_c".to_string(),
             }],
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        ),
     );
 
     nodes.insert(
         "step_c".to_string(),
-        DagNode {
-            node_type: DagNodeType::Inference,
-            question: Some(Question::new_noul("質問C".to_string())),
-            conditions: vec![NodeCondition {
+        DagNode::inference(
+            Question::new_noul("質問C".to_string()),
+            vec![NodeCondition {
                 field: "answer".to_string(),
                 op: NodeConditionOp::Eq,
                 value: Some(serde_json::json!(true)),
                 target_node: "step_a".to_string(), // 循環
             }],
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        ),
     );
 
     let dag = DagDefinition {
@@ -377,13 +336,12 @@ async fn test_end_to_end_dag_with_onnx_model() {
     let mut nodes = IndexMap::new();
     nodes.insert(
         "triage".to_string(),
-        DagNode {
-            node_type: DagNodeType::Inference,
-            question: Some(Question::new_choice(
+        DagNode::inference(
+            Question::new_choice(
                 "問い合わせ内容の大分類を選択してください。".to_string(),
                 step1_criteria,
-            )),
-            conditions: vec![
+            ),
+            vec![
                 NodeCondition {
                     field: "answer".to_string(),
                     op: NodeConditionOp::Eq,
@@ -397,10 +355,7 @@ async fn test_end_to_end_dag_with_onnx_model() {
                     target_node: "transfer_detail".to_string(),
                 },
             ],
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        ),
     );
 
     let mut step2_criteria = IndexMap::new();
@@ -408,29 +363,18 @@ async fn test_end_to_end_dag_with_onnx_model() {
     step2_criteria.insert("cancel".to_string(), "送金を取り消したい".to_string());
     nodes.insert(
         "transfer_detail".to_string(),
-        DagNode {
-            node_type: DagNodeType::Inference,
-            question: Some(Question::new_choice(
+        DagNode::inference(
+            Question::new_choice(
                 "送金トラブルの具体的内容を選択してください。".to_string(),
                 step2_criteria,
-            )),
-            conditions: vec![],
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+            ),
+            vec![],
+        ),
     );
 
     nodes.insert(
         "escalate_card".to_string(),
-        DagNode {
-            node_type: DagNodeType::Escalate,
-            question: None,
-            conditions: vec![],
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: Some("カード関連の専任担当者へエスカレーション。".to_string()),
-        },
+        DagNode::escalate(Some("カード関連の専任担当者へエスカレーション。")),
     );
 
     let dag = DagDefinition {
@@ -478,14 +422,7 @@ async fn test_dag_timeout_enforcement() {
     let mut nodes = IndexMap::new();
     nodes.insert(
         "q1".to_string(),
-        DagNode {
-            node_type: DagNodeType::Inference,
-            question: Some(Question::new_noul("質問内容".to_string())),
-            conditions: vec![],
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        DagNode::inference(Question::new_noul("質問内容".to_string()), vec![]),
     );
 
     // 0ms (即時タイムアウト) を指定
@@ -510,56 +447,37 @@ fn test_parallel_nodes_pure_task_validation() {
     // conditions を持った並行タスクノード (不正仕様)
     nodes.insert(
         "p_task_with_conditions".to_string(),
-        DagNode {
-            node_type: DagNodeType::Inference,
-            question: Some(Question::new_noul("並行質問1".to_string())),
-            conditions: vec![NodeCondition {
+        DagNode::inference(
+            Question::new_noul("並行質問1".to_string()),
+            vec![NodeCondition {
                 field: "answer".to_string(),
                 op: NodeConditionOp::Eq,
                 value: Some(serde_json::json!(true)),
                 target_node: "join".to_string(),
             }],
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        ),
     );
 
     nodes.insert(
         "p_task_clean".to_string(),
-        DagNode {
-            node_type: DagNodeType::Inference,
-            question: Some(Question::new_noul("並行質問2".to_string())),
-            conditions: vec![],
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        DagNode::inference(Question::new_noul("並行質問2".to_string()), vec![]),
     );
 
     nodes.insert(
         "parallel_parent".to_string(),
-        DagNode {
-            node_type: DagNodeType::Parallel,
-            question: None,
-            conditions: vec![],
-            parallel_nodes: vec![
+        DagNode::parallel(
+            vec![
                 "p_task_with_conditions".to_string(),
                 "p_task_clean".to_string(),
             ],
-            join_node: Some("join".to_string()),
-            reason: None,
-        },
+            "join",
+        ),
     );
 
     nodes.insert(
         "join".to_string(),
-        DagNode {
-            node_type: DagNodeType::Branch,
-            question: None,
+        DagNode::Branch {
             conditions: vec![],
-            parallel_nodes: Vec::new(),
-            join_node: None,
             reason: Some("合流完了".to_string()),
         },
     );
@@ -602,12 +520,9 @@ async fn test_escalation_diagnostics_aggregation() {
     let mut nodes = IndexMap::new();
     nodes.insert(
         "fraud_check".to_string(),
-        DagNode {
-            node_type: DagNodeType::Inference,
-            question: Some(Question::new_noul(
-                "不正送金の疑いがありますか？".to_string(),
-            )),
-            conditions: vec![
+        DagNode::inference(
+            Question::new_noul("不正送金の疑いがありますか？".to_string()),
+            vec![
                 // 無条件に escalate へ誘導
                 NodeCondition {
                     field: "confidence".to_string(),
@@ -616,22 +531,12 @@ async fn test_escalation_diagnostics_aggregation() {
                     target_node: "escalate_security".to_string(),
                 },
             ],
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        ),
     );
 
     nodes.insert(
         "escalate_security".to_string(),
-        DagNode {
-            node_type: DagNodeType::Escalate,
-            question: None,
-            conditions: vec![],
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: Some("セキュリティ疑いによる即時エスカレーション。".to_string()),
-        },
+        DagNode::escalate(Some("セキュリティ疑いによる即時エスカレーション。")),
     );
 
     let dag = DagDefinition {
@@ -666,30 +571,19 @@ fn test_validate_dag_condition_rejections() {
     let mut nodes_unknown = IndexMap::new();
     nodes_unknown.insert(
         "q1".to_string(),
-        DagNode {
-            node_type: DagNodeType::Inference,
-            question: Some(Question::new_noul("質問".to_string())),
-            conditions: vec![NodeCondition {
+        DagNode::inference(
+            Question::new_noul("質問".to_string()),
+            vec![NodeCondition {
                 field: "non_existent".to_string(),
                 op: NodeConditionOp::Eq,
                 value: Some(serde_json::json!(true)),
                 target_node: "term".to_string(),
             }],
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        ),
     );
     nodes_unknown.insert(
         "term".to_string(),
-        DagNode {
-            node_type: DagNodeType::Escalate,
-            question: None,
-            conditions: Vec::new(),
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        DagNode::escalate(Option::<String>::None),
     );
     let dag_unknown = DagDefinition {
         dag_id: "unknown_field_test".to_string(),
@@ -711,30 +605,19 @@ fn test_validate_dag_condition_rejections() {
     let mut nodes_ghost = IndexMap::new();
     nodes_ghost.insert(
         "q1".to_string(),
-        DagNode {
-            node_type: DagNodeType::Inference,
-            question: Some(Question::new_noul("質問".to_string())),
-            conditions: vec![NodeCondition {
+        DagNode::inference(
+            Question::new_noul("質問".to_string()),
+            vec![NodeCondition {
                 field: "ghost.value".to_string(),
                 op: NodeConditionOp::Eq,
                 value: Some(serde_json::json!("true")),
                 target_node: "term".to_string(),
             }],
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        ),
     );
     nodes_ghost.insert(
         "term".to_string(),
-        DagNode {
-            node_type: DagNodeType::Escalate,
-            question: None,
-            conditions: Vec::new(),
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        DagNode::escalate(Option::<String>::None),
     );
     let dag_ghost = DagDefinition {
         dag_id: "ghost_ref_test".to_string(),
@@ -756,33 +639,22 @@ fn test_validate_dag_condition_rejections() {
     let mut nodes_type = IndexMap::new();
     nodes_type.insert(
         "q1".to_string(),
-        DagNode {
-            node_type: DagNodeType::Inference,
-            question: Some(Question::new_score(
+        DagNode::inference(
+            Question::new_score(
                 "スコア評価".to_string(),
                 vec!["1".to_string(), "2".to_string(), "3".to_string()],
-            )),
-            conditions: vec![NodeCondition {
+            ),
+            vec![NodeCondition {
                 field: "answer".to_string(),
                 op: NodeConditionOp::In,
                 value: Some(serde_json::json!([1, 2])),
                 target_node: "term".to_string(),
             }],
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        ),
     );
     nodes_type.insert(
         "term".to_string(),
-        DagNode {
-            node_type: DagNodeType::Escalate,
-            question: None,
-            conditions: Vec::new(),
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        DagNode::escalate(Option::<String>::None),
     );
     let dag_type = DagDefinition {
         dag_id: "type_mismatch_test".to_string(),
@@ -809,32 +681,19 @@ fn test_validate_dag_interpolation_rejections() {
     let mut nodes_ghost = IndexMap::new();
     nodes_ghost.insert(
         "q1".to_string(),
-        DagNode {
-            node_type: DagNodeType::Inference,
-            question: Some(Question::new_noul(
-                "前段結果 {ghost.value} に基づき判定せよ。".to_string(),
-            )),
-            conditions: vec![NodeCondition {
+        DagNode::inference(
+            Question::new_noul("前段結果 {ghost.value} に基づき判定せよ。".to_string()),
+            vec![NodeCondition {
                 field: "answer".to_string(),
                 op: NodeConditionOp::Eq,
                 value: Some(serde_json::json!(true)),
                 target_node: "term".to_string(),
             }],
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        ),
     );
     nodes_ghost.insert(
         "term".to_string(),
-        DagNode {
-            node_type: DagNodeType::Escalate,
-            question: None,
-            conditions: Vec::new(),
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        DagNode::escalate(Option::<String>::None),
     );
     let dag_ghost = DagDefinition {
         dag_id: "interpolate_ghost_test".to_string(),
@@ -856,32 +715,19 @@ fn test_validate_dag_interpolation_rejections() {
     let mut nodes_self = IndexMap::new();
     nodes_self.insert(
         "q1".to_string(),
-        DagNode {
-            node_type: DagNodeType::Inference,
-            question: Some(Question::new_noul(
-                "自己値 {q1.value} に基づき判定せよ。".to_string(),
-            )),
-            conditions: vec![NodeCondition {
+        DagNode::inference(
+            Question::new_noul("自己値 {q1.value} に基づき判定せよ。".to_string()),
+            vec![NodeCondition {
                 field: "answer".to_string(),
                 op: NodeConditionOp::Eq,
                 value: Some(serde_json::json!(true)),
                 target_node: "term".to_string(),
             }],
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        ),
     );
     nodes_self.insert(
         "term".to_string(),
-        DagNode {
-            node_type: DagNodeType::Escalate,
-            question: None,
-            conditions: Vec::new(),
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        DagNode::escalate(Option::<String>::None),
     );
     let dag_self = DagDefinition {
         dag_id: "interpolate_self_test".to_string(),
@@ -903,48 +749,31 @@ fn test_validate_dag_interpolation_rejections() {
     let mut nodes_forward = IndexMap::new();
     nodes_forward.insert(
         "q1".to_string(),
-        DagNode {
-            node_type: DagNodeType::Inference,
-            question: Some(Question::new_noul(
-                "後段結果 {q2.value} を参照。".to_string(),
-            )),
-            conditions: vec![NodeCondition {
+        DagNode::inference(
+            Question::new_noul("後段結果 {q2.value} を参照。".to_string()),
+            vec![NodeCondition {
                 field: "answer".to_string(),
                 op: NodeConditionOp::Eq,
                 value: Some(serde_json::json!(true)),
                 target_node: "q2".to_string(),
             }],
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        ),
     );
     nodes_forward.insert(
         "q2".to_string(),
-        DagNode {
-            node_type: DagNodeType::Inference,
-            question: Some(Question::new_noul("後段質問。".to_string())),
-            conditions: vec![NodeCondition {
+        DagNode::inference(
+            Question::new_noul("後段質問。".to_string()),
+            vec![NodeCondition {
                 field: "answer".to_string(),
                 op: NodeConditionOp::Eq,
                 value: Some(serde_json::json!(true)),
                 target_node: "term".to_string(),
             }],
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        ),
     );
     nodes_forward.insert(
         "term".to_string(),
-        DagNode {
-            node_type: DagNodeType::Escalate,
-            question: None,
-            conditions: Vec::new(),
-            parallel_nodes: Vec::new(),
-            join_node: None,
-            reason: None,
-        },
+        DagNode::escalate(Option::<String>::None),
     );
     let dag_forward = DagDefinition {
         dag_id: "interpolate_forward_test".to_string(),

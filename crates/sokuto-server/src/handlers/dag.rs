@@ -56,7 +56,14 @@ pub async fn dag_handler(
     };
 
     // 2. DagDefinition DTO からランタイム型への変換 (ハードタイムアウト上限クランプ適用)
-    let mut dag_def: DagDefinition = req.dag.into();
+    let mut dag_def: DagDefinition = match req.dag.try_into() {
+        Ok(def) => def,
+        Err(err) => {
+            record_http_request("/v1/systemone/dag", 400);
+            record_http_duration("/v1/systemone/dag", start_time.elapsed().as_secs_f64());
+            return Err(ServerError::Dag(DagError::Validation(err)));
+        }
+    };
     let requested_timeout = req.timeout_ms.unwrap_or(dag_def.timeout_ms);
     dag_def.timeout_ms = requested_timeout.min(MAX_DAG_TIMEOUT_MS);
 

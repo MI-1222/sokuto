@@ -7,6 +7,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use sokuto_core::gating::GatingMetadata;
 use sokuto_core::schema::{Answer, Question};
+use sokuto_runtime::dag::DagValidationError;
 use sokuto_runtime::dag::schema::{
     DagDefinition, DagExecutionResult, DagNode, DagNodeType, NodeCondition, NodeConditionOp,
     StepExecutionResult,
@@ -301,44 +302,132 @@ impl From<NodeCondition> for NodeConditionDto {
     }
 }
 
-impl From<DagNodeDto> for DagNode {
-    fn from(dto: DagNodeDto) -> Self {
-        Self {
-            node_type: dto.node_type.into(),
-            question: dto.question,
-            conditions: dto.conditions.into_iter().map(Into::into).collect(),
-            parallel_nodes: dto.parallel_nodes,
-            join_node: dto.join_node,
-            reason: dto.reason,
+fn convert_node_dto(node_id: &str, dto: DagNodeDto) -> Result<DagNode, DagValidationError> {
+    let node_type: DagNodeType = dto.node_type.into();
+    match node_type {
+        DagNodeType::Inference => {
+            let question = dto
+                .question
+                .ok_or_else(|| DagValidationError::InvalidNodeSpec {
+                    node_id: node_id.to_string(),
+                    node_type,
+                    reason: "Inference ノードには question の定義が必須です。".to_string(),
+                })?;
+            Ok(DagNode::Inference {
+                question,
+                conditions: dto.conditions.into_iter().map(Into::into).collect(),
+                reason: dto.reason,
+            })
         }
+        DagNodeType::Branch => Ok(DagNode::Branch {
+            conditions: dto.conditions.into_iter().map(Into::into).collect(),
+            reason: dto.reason,
+        }),
+        DagNodeType::Parallel => {
+            if !dto.conditions.is_empty() {
+                return Err(DagValidationError::InvalidNodeSpec {
+                    node_id: node_id.to_string(),
+                    node_type,
+                    reason: "Parallel ノードは独自の conditions を持てません。".to_string(),
+                });
+            }
+            let join_node = dto
+                .join_node
+                .ok_or_else(|| DagValidationError::InvalidNodeSpec {
+                    node_id: node_id.to_string(),
+                    node_type,
+                    reason: "Parallel ノードには join_node の定義が必須です。".to_string(),
+                })?;
+            Ok(DagNode::Parallel {
+                parallel_nodes: dto.parallel_nodes,
+                join_node,
+                reason: dto.reason,
+            })
+        }
+        DagNodeType::Escalate => {
+            if !dto.conditions.is_empty() {
+                return Err(DagValidationError::InvalidNodeSpec {
+                    node_id: node_id.to_string(),
+                    node_type,
+                    reason: "Escalate ノードは終端ノードであり、conditions を持てません。"
+                        .to_string(),
+                });
+            }
+            Ok(DagNode::Escalate { reason: dto.reason })
+        }
+    }
+}
+
+impl TryFrom<DagNodeDto> for DagNode {
+    type Error = DagValidationError;
+
+    fn try_from(dto: DagNodeDto) -> Result<Self, Self::Error> {
+        convert_node_dto("", dto)
     }
 }
 
 impl From<DagNode> for DagNodeDto {
     fn from(node: DagNode) -> Self {
-        Self {
-            node_type: node.node_type.into(),
-            question: node.question,
-            conditions: node.conditions.into_iter().map(Into::into).collect(),
-            parallel_nodes: node.parallel_nodes,
-            join_node: node.join_node,
-            reason: node.reason,
+        match node {
+            DagNode::Inference {
+                question,
+                conditions,
+                reason,
+            } => Self {
+                node_type: DagNodeTypeDto::Inference,
+                question: Some(question),
+                conditions: conditions.into_iter().map(Into::into).collect(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason,
+            },
+            DagNode::Branch { conditions, reason } => Self {
+                node_type: DagNodeTypeDto::Branch,
+                question: None,
+                conditions: conditions.into_iter().map(Into::into).collect(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason,
+            },
+            DagNode::Parallel {
+                parallel_nodes,
+                join_node,
+                reason,
+            } => Self {
+                node_type: DagNodeTypeDto::Parallel,
+                question: None,
+                conditions: Vec::new(),
+                parallel_nodes,
+                join_node: Some(join_node),
+                reason,
+            },
+            DagNode::Escalate { reason } => Self {
+                node_type: DagNodeTypeDto::Escalate,
+                question: None,
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason,
+            },
         }
     }
 }
 
-impl From<DagDefinitionDto> for DagDefinition {
-    fn from(dto: DagDefinitionDto) -> Self {
+impl TryFrom<DagDefinitionDto> for DagDefinition {
+    type Error = DagValidationError;
+
+    fn try_from(dto: DagDefinitionDto) -> Result<Self, Self::Error> {
         let mut nodes = IndexMap::with_capacity(dto.nodes.len());
         for (k, v) in dto.nodes {
-            nodes.insert(k, v.into());
+            let node = convert_node_dto(&k, v)?;
+            nodes.insert(k, node);
         }
-        Self {
+        Ok(Self {
             dag_id: dto.dag_id,
             timeout_ms: dto.timeout_ms,
             entry_node: dto.entry_node,
             nodes,
-        }
+        })
     }
 }
 
@@ -411,5 +500,88 @@ impl From<DagExecutionResult> for DagResponse {
                 completion_tokens: 0,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_convert_node_dto_inference_missing_question_fails() {
+        let dto = DagNodeDto {
+            node_type: DagNodeTypeDto::Inference,
+            question: None,
+            conditions: vec![],
+            parallel_nodes: vec![],
+            join_node: None,
+            reason: None,
+        };
+        let res = DagNode::try_from(dto);
+        assert!(matches!(
+            res,
+            Err(DagValidationError::InvalidNodeSpec { .. })
+        ));
+    }
+
+    #[test]
+    fn test_convert_node_dto_parallel_missing_join_node_fails() {
+        let dto = DagNodeDto {
+            node_type: DagNodeTypeDto::Parallel,
+            question: None,
+            conditions: vec![],
+            parallel_nodes: vec!["task1".to_string()],
+            join_node: None,
+            reason: None,
+        };
+        let res = DagNode::try_from(dto);
+        assert!(matches!(
+            res,
+            Err(DagValidationError::InvalidNodeSpec { .. })
+        ));
+    }
+
+    #[test]
+    fn test_convert_node_dto_parallel_with_conditions_fails() {
+        let dto = DagNodeDto {
+            node_type: DagNodeTypeDto::Parallel,
+            question: None,
+            conditions: vec![NodeConditionDto {
+                field: "confidence".to_string(),
+                op: NodeConditionOpDto::ConfidenceGte,
+                value: Some(serde_json::json!(0.5)),
+                target_node: "join".to_string(),
+            }],
+            parallel_nodes: vec!["task1".to_string()],
+            join_node: Some("join".to_string()),
+            reason: None,
+        };
+        let res = DagNode::try_from(dto);
+        assert!(matches!(
+            res,
+            Err(DagValidationError::InvalidNodeSpec { .. })
+        ));
+    }
+
+    #[test]
+    fn test_convert_node_dto_escalate_with_conditions_fails() {
+        let dto = DagNodeDto {
+            node_type: DagNodeTypeDto::Escalate,
+            question: None,
+            conditions: vec![NodeConditionDto {
+                field: "confidence".to_string(),
+                op: NodeConditionOpDto::ConfidenceGte,
+                value: Some(serde_json::json!(0.5)),
+                target_node: "root".to_string(),
+            }],
+            parallel_nodes: vec![],
+            join_node: None,
+            reason: Some("終端".to_string()),
+        };
+        let res = DagNode::try_from(dto);
+        assert!(matches!(
+            res,
+            Err(DagValidationError::InvalidNodeSpec { .. })
+        ));
     }
 }

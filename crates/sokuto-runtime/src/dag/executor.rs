@@ -468,19 +468,6 @@ fn parse_condition_f64(value: Option<&serde_json::Value>) -> Option<f64> {
         .filter(|n| n.is_finite())
 }
 
-/// 2 つの有限浮動小数点数を許容誤差 `1e-6` 付きで比較する。
-fn compare_f64_with_op(lhs: f64, op: NodeConditionOp, rhs: f64) -> bool {
-    match op {
-        NodeConditionOp::Eq => (lhs - rhs).abs() < 1e-6,
-        NodeConditionOp::Neq => (lhs - rhs).abs() >= 1e-6,
-        NodeConditionOp::Gt => lhs > rhs + 1e-6,
-        NodeConditionOp::Gte => lhs >= rhs - 1e-6,
-        NodeConditionOp::Lt => lhs < rhs - 1e-6,
-        NodeConditionOp::Lte => lhs <= rhs + 1e-6,
-        _ => false,
-    }
-}
-
 /// コンテキストノード参照 (`node_id.prop`) で参照可能なプロパティ種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextProp {
@@ -555,7 +542,7 @@ fn matches_confidence(cond: &NodeCondition, answer: Option<&Answer>) -> bool {
         NodeConditionOp::ConfidenceLt => NodeConditionOp::Lt,
         other => other,
     };
-    compare_f64_with_op(conf, normalized_op, target_val)
+    normalized_op.eval_f64(conf, target_val)
 }
 
 /// `route` (ゲーティングルート) フィールドの一致比較を評価する。
@@ -592,7 +579,7 @@ fn matches_answer_value(cond: &NodeCondition, ans: &Answer) -> bool {
     }
     if let Some(score_val) = ans.as_score() {
         return parse_condition_f64(cond.value.as_ref())
-            .is_some_and(|target_num| compare_f64_with_op(score_val, cond.op, target_num));
+            .is_some_and(|target_num| cond.op.eval_f64(score_val, target_num));
     }
     false
 }
@@ -618,7 +605,7 @@ fn matches_noul_value(cond: &NodeCondition, noul_val: f64) -> bool {
     }
 
     parse_condition_f64(cond.value.as_ref())
-        .is_some_and(|target_num| compare_f64_with_op(noul_val, cond.op, target_num))
+        .is_some_and(|target_num| cond.op.eval_f64(noul_val, target_num))
 }
 
 /// Choice 判定の選択キーに対する文字列比較および集合包含 (`In`) 比較を評価する。
@@ -699,15 +686,12 @@ fn matches_context_property(
             let Some(target_num) = parse_condition_f64(cond.value.as_ref()) else {
                 return false;
             };
-            match cond.op {
-                NodeConditionOp::ConfidenceGte | NodeConditionOp::Gte => {
-                    ctx_val.confidence >= target_num - 1e-6
-                }
-                NodeConditionOp::ConfidenceLt | NodeConditionOp::Lt => {
-                    ctx_val.confidence < target_num - 1e-6
-                }
-                _ => false,
-            }
+            let normalized_op = match cond.op {
+                NodeConditionOp::ConfidenceGte | NodeConditionOp::Gte => NodeConditionOp::Gte,
+                NodeConditionOp::ConfidenceLt | NodeConditionOp::Lt => NodeConditionOp::Lt,
+                _ => return false,
+            };
+            normalized_op.eval_f64(ctx_val.confidence, target_num)
         }
     }
 }

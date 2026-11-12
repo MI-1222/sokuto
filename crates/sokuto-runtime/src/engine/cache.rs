@@ -530,10 +530,15 @@ impl CachedStateFeatures {
 
     /// 指定されたバッチサイズに合わせてバインド可能な `Arc<Value>` を取得する。
     ///
-    /// `target_batch == 1` かつ自身のバッチサイズが 1 の場合はゼロコピー返却する。
+    /// 単一サンプル (`[1, seq_len, hidden_size]`) のキャッシュエントリを前提とし、
+    /// `target_batch == 1` の場合はゼロコピー返却(圧縮時は 1 サンプル分を展開)を行う。
     /// `target_batch > 1` の場合は、単一サンプルの特徴量データを `target_batch` 回リピートした
     /// テンソル (`[target_batch, seq_len, hidden_size]`) を ONNX Runtime アロケータメモリへ直接構築して返却する。
     /// 中間ベクタのヒープ確保と再アロケーションを回避し、64バイトアライメントを維持する。
+    ///
+    /// # エラー
+    /// - `target_batch == 0`、サイズ計算オーバーフロー、次元長 0、またはペイロード長不整合の場合は [`RuntimeError::InvalidTensorData`] を返す。
+    /// - キャッシュテンソルが 3 次元でない場合や `self.batch_size() != 1` の場合は [`RuntimeError::ModelContractViolation`] を返す。
     pub fn as_ort_value_for_batch(&self, target_batch: usize) -> Result<Arc<Value>> {
         if target_batch == 0 {
             return Err(RuntimeError::InvalidTensorData(
@@ -541,13 +546,44 @@ impl CachedStateFeatures {
             ));
         }
 
-        if target_batch == 1 && self.batch_size() == 1 {
-            return self.as_ort_value();
+        if self.shape.len() != 3 {
+            return Err(RuntimeError::ModelContractViolation(format!(
+                "State特徴量は3次元テンソルである必要があります: {:?}。",
+                self.shape
+            )));
+        }
+
+        let batch_size = self.batch_size();
+        if batch_size != 1 {
+            return Err(RuntimeError::ModelContractViolation(format!(
+                "バッチ展開元のキャッシュエントリは batch_size == 1 である必要があります: batch_size={batch_size}。"
+            )));
         }
 
         let seq_len = self.seq_len();
         let hidden_size = self.hidden_size();
-        let single_len = seq_len * hidden_size;
+        let single_len = seq_len.checked_mul(hidden_size).ok_or_else(|| {
+            RuntimeError::InvalidTensorData(
+                "テンソル要素数の計算がオーバーフローしました。".to_string(),
+            )
+        })?;
+        if single_len == 0 {
+            return Err(RuntimeError::InvalidTensorData(format!(
+                "State特徴量の系列長および隠れ層次元数は 1 以上である必要があります: {:?}。",
+                self.shape
+            )));
+        }
+
+        if target_batch == 1 {
+            return self.as_ort_value();
+        }
+
+        target_batch.checked_mul(single_len).ok_or_else(|| {
+            RuntimeError::InvalidTensorData(
+                "バッチ展開後のテンソル要素数がオーバーフローしました。".to_string(),
+            )
+        })?;
+
         let target_shape = vec![target_batch, seq_len, hidden_size];
 
         let allocator = Allocator::default();
@@ -560,11 +596,23 @@ impl CachedStateFeatures {
             CachedTensorPayload::Raw(val) => {
                 let (_, single_slice) =
                     val.try_extract_tensor::<f32>().map_err(RuntimeError::Ort)?;
+                if single_slice.len() != single_len {
+                    return Err(RuntimeError::InvalidTensorData(format!(
+                        "Raw キャッシュデータの要素数 ({}) が期待値 ({single_len}) と一致しません。",
+                        single_slice.len()
+                    )));
+                }
                 for chunk in dst.chunks_exact_mut(single_len) {
                     chunk.copy_from_slice(single_slice);
                 }
             }
             CachedTensorPayload::Fp16(compressed) => {
+                if compressed.len() != single_len {
+                    return Err(RuntimeError::InvalidTensorData(format!(
+                        "FP16 キャッシュデータの要素数 ({}) が期待値 ({single_len}) と一致しません。",
+                        compressed.len()
+                    )));
+                }
                 let (first_chunk, rest) = dst.split_at_mut(single_len);
                 decompress_fp16_to_f32(compressed, first_chunk);
                 for chunk in rest.chunks_exact_mut(single_len) {
@@ -572,6 +620,13 @@ impl CachedStateFeatures {
                 }
             }
             CachedTensorPayload::Int8Symmetric { quantized, scales } => {
+                if quantized.len() != single_len || scales.len() != seq_len {
+                    return Err(RuntimeError::InvalidTensorData(format!(
+                        "INT8 キャッシュデータの要素数 (quantized={}, scales={}) が期待値 ({single_len}, {seq_len}) と一致しません。",
+                        quantized.len(),
+                        scales.len()
+                    )));
+                }
                 let (first_chunk, rest) = dst.split_at_mut(single_len);
                 decompress_int8_symmetric_to_f32(quantized, scales, hidden_size, first_chunk);
                 for chunk in rest.chunks_exact_mut(single_len) {
@@ -1641,5 +1696,103 @@ mod tests {
 
         // バッチサイズ 0 の不正指定時にエラーとなるゼロガードを検証。
         assert!(features.as_ort_value_for_batch(0).is_err());
+    }
+
+    #[test]
+    fn test_as_ort_value_for_batch_rejects_multi_batch_and_invalid_shapes_without_panic() {
+        let key = StateCacheManager::compute_key("multi-batch-guard-test");
+        let seq_len = 4;
+        let hidden_size = 8;
+        let batch_size = 2;
+        let shape = vec![batch_size, seq_len, hidden_size];
+        let raw_data: Vec<f32> = (0..batch_size * seq_len * hidden_size)
+            .map(|i| i as f32)
+            .collect();
+        let mask = vec![1i64; batch_size * seq_len];
+
+        for mode in [
+            CacheCompressionMode::None,
+            CacheCompressionMode::Fp16,
+            CacheCompressionMode::Int8Symmetric,
+        ] {
+            let features = CachedStateFeatures::new_compressed(
+                key,
+                shape.clone(),
+                &raw_data,
+                mode,
+                mask.clone(),
+            )
+            .expect("マルチバッチエントリの構築自体は成功すること。");
+
+            for target_batch in [1usize, 2, 3] {
+                let err = features
+                    .as_ort_value_for_batch(target_batch)
+                    .expect_err("batch_size != 1 のキャッシュエントリはエラーになること。");
+                assert!(
+                    matches!(err, RuntimeError::ModelContractViolation(_)),
+                    "ModelContractViolation が返る必要があります: mode={mode:?}, target_batch={target_batch}, err={err:?}"
+                );
+            }
+        }
+
+        // batch_size == 0 も ModelContractViolation を返すこと。
+        let zero_batch_val =
+            Value::from_array((vec![0usize, seq_len, hidden_size], Vec::<f32>::new()))
+                .expect("空バッチ Value の作成に成功すること。");
+        let zero_batch_features = CachedStateFeatures::new_raw(
+            key,
+            vec![0, seq_len, hidden_size],
+            zero_batch_val.into(),
+            0,
+            vec![],
+        );
+        assert!(matches!(
+            zero_batch_features.as_ort_value_for_batch(2),
+            Err(RuntimeError::ModelContractViolation(_))
+        ));
+
+        // 3次元以外の形状 (空形状・2次元) も ModelContractViolation を返すこと。
+        let empty_shape_val = Value::from_array((
+            vec![1usize, seq_len, hidden_size],
+            vec![0.0f32; seq_len * hidden_size],
+        ))
+        .expect("Value の作成に成功すること。");
+        let empty_shape_features =
+            CachedStateFeatures::new_raw(key, vec![], empty_shape_val.into(), 0, vec![]);
+        assert!(matches!(
+            empty_shape_features.as_ort_value_for_batch(1),
+            Err(RuntimeError::ModelContractViolation(_))
+        ));
+
+        // 次元長 0 (seq_len == 0 / hidden_size == 0) は chunks_exact_mut(0) でパニックせず InvalidTensorData を返すこと。
+        let zero_seq_val = Value::from_array((vec![1usize, 0, hidden_size], Vec::<f32>::new()))
+            .expect("Value の作成に成功すること。");
+        let zero_seq_features = CachedStateFeatures::new_raw(
+            key,
+            vec![1, 0, hidden_size],
+            zero_seq_val.into(),
+            0,
+            vec![],
+        );
+        assert!(matches!(
+            zero_seq_features.as_ort_value_for_batch(2),
+            Err(RuntimeError::InvalidTensorData(_))
+        ));
+
+        // shape と実ペイロード長が不一致の場合も copy_from_slice でパニックせず InvalidTensorData を返すこと。
+        let mismatched_val =
+            Value::from_array((vec![1usize, 2, hidden_size], vec![1.0f32; 2 * hidden_size]))
+                .expect("Value の作成に成功すること。");
+        let mismatched_features = CachedStateFeatures::new_raw(
+            key,
+            vec![1, seq_len, hidden_size],
+            mismatched_val.into(),
+            2 * hidden_size * std::mem::size_of::<f32>(),
+            vec![1; seq_len],
+        );
+        assert!(matches!(
+            mismatched_features.as_ort_value_for_batch(2),
+            Err(RuntimeError::InvalidTensorData(_))
+        ));
     }
 }

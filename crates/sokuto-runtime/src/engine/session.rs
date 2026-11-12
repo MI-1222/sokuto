@@ -4,8 +4,8 @@
 //! ゼロコピーテンソルバインド、およびセッションプールによる高並列フォワードパスを提供する。
 
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_core::contract::model_spec::{
@@ -312,26 +312,7 @@ impl InferenceEngine {
             .map_err(RuntimeError::Ort)?;
 
         // 4. セッションプールから空きセッションを獲得 (非ブロッキング探索 -> ラウンドロビン待機)
-        let pool_len = self.sessions.len();
-        let mut acquired_guard = None;
-
-        // まずロックされていない空きセッションを優先探索
-        let start_idx = self.next_session_idx.fetch_add(1, Ordering::Relaxed) % pool_len;
-        for offset in 0..pool_len {
-            let idx = (start_idx + offset) % pool_len;
-            if let Ok(guard) = self.sessions[idx].try_lock() {
-                acquired_guard = Some(guard);
-                break;
-            }
-        }
-
-        // 全セッションがビジーの場合は指定セッションをブロック待機
-        let mut session = match acquired_guard {
-            Some(g) => g,
-            None => self.sessions[start_idx].lock().map_err(|e| {
-                RuntimeError::ModelContractViolation(format!("セッションロック獲得失敗: {e}。"))
-            })?,
-        };
+        let mut session = acquire_pooled_session(&self.sessions, &self.next_session_idx, "")?;
 
         // 5. 推論実行
         let outputs = session
@@ -743,6 +724,46 @@ pub(crate) fn create_session_builder(
     Ok((builder, provider))
 }
 
+/// セッションプールから利用可能なスロットを借り受ける内部共通ヘルパー関数。
+///
+/// `counter` によるラウンドロビン開始位置から非ブロッキング (`try_lock`) で空きスロットを優先探索し、
+/// 全スロットが使用中の場合は開始位置のスロットをブロック待機 (`lock`) で獲得する。
+///
+/// # 引数
+/// - `sessions`: プール内のミューテックス保護セッション配列。
+/// - `counter`: ラウンドロビン開始インデックスを供給するアトミックカウンター。
+/// - `name`: エラーメッセージに付与するセッション種別名 (空文字列の場合は接頭辞なし)。
+pub(crate) fn acquire_pooled_session<'a, T>(
+    sessions: &'a [Mutex<T>],
+    counter: &AtomicUsize,
+    name: &str,
+) -> Result<MutexGuard<'a, T>> {
+    let build_err = |msg: String| {
+        if name.is_empty() {
+            RuntimeError::ModelContractViolation(msg)
+        } else {
+            RuntimeError::ModelContractViolation(format!("{name} {msg}"))
+        }
+    };
+
+    let pool_len = sessions.len();
+    if pool_len == 0 {
+        return Err(build_err("セッションプールが空です。".to_string()));
+    }
+
+    let start_idx = counter.fetch_add(1, Ordering::Relaxed) % pool_len;
+    for offset in 0..pool_len {
+        let idx = (start_idx + offset) % pool_len;
+        if let Ok(guard) = sessions[idx].try_lock() {
+            return Ok(guard);
+        }
+    }
+
+    sessions[start_idx]
+        .lock()
+        .map_err(|e| build_err(format!("セッションロック獲得失敗: {e}。")))
+}
+
 /// 候補インデックス列 (`op_indices`) の範囲外アクセスを検証する共通関数。
 ///
 /// パディング値 (`OP_INDEX_PADDING = -1`) は許容し、それ以外のインデックスが系列長 `0..seq_len` の範囲内にあることを確認する。
@@ -776,5 +797,37 @@ mod tests {
         // 系列長以上のインデックスは不正
         let invalid_oob = vec![0, 5, 32];
         assert!(validate_op_indices(&invalid_oob, seq_len).is_err());
+    }
+
+    #[test]
+    fn test_acquire_pooled_session_round_robin_and_busy_skip() {
+        let pool = vec![
+            Mutex::new(10usize),
+            Mutex::new(20usize),
+            Mutex::new(30usize),
+        ];
+        let counter = AtomicUsize::new(0);
+
+        // 0 番目がロック中の場合でも次の空きスロット 1 番目を非ブロッキング取得できること
+        let held_zero = pool[0].lock().unwrap();
+        let guard1 = acquire_pooled_session(&pool, &counter, "Query").unwrap();
+        assert_eq!(*guard1, 20);
+        drop(guard1);
+
+        // カウンタ進行に従いスロット 1 -> 2 とラウンドロビン取得でき、
+        // 先頭 0 番目は依然ロック中なのでスキップしてスロット 2 -> 1 と選ばれること
+        let guard2 = acquire_pooled_session(&pool, &counter, "Query").unwrap();
+        assert_eq!(*guard2, 20);
+        let guard3 = acquire_pooled_session(&pool, &counter, "Query").unwrap();
+        assert_eq!(*guard3, 30);
+
+        drop(guard3);
+        drop(guard2);
+        drop(held_zero);
+
+        // 全解放後に空プールエラーハンドリングも確認
+        let empty: Vec<Mutex<usize>> = Vec::new();
+        let err = acquire_pooled_session(&empty, &counter, "State").unwrap_err();
+        assert!(err.to_string().contains("State セッションプールが空です。"));
     }
 }

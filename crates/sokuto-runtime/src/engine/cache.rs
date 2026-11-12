@@ -11,7 +11,7 @@ use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,7 +33,7 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::engine::config::{ExecutionProvider, SessionConfig};
 use crate::engine::gating::{apply_gating_to_answer_with_energy, calculate_choice_energy};
-use crate::engine::session::create_session_builder;
+use crate::engine::session::{acquire_pooled_session, create_session_builder};
 use crate::error::{Result, RuntimeError};
 use crate::tokenizer::{JevTokenizer, TokenizedQuestion};
 
@@ -855,34 +855,14 @@ impl DualSessionEngine {
     ///
     /// ロックされていない空きセッションを優先探索し、全セッションが使用中の場合はブロック待機する。
     fn acquire_query_session(&self) -> Result<std::sync::MutexGuard<'_, Session>> {
-        let pool_len = self.query_sessions.len();
-        let start_idx = self.next_query_idx.fetch_add(1, Ordering::Relaxed) % pool_len;
-        for offset in 0..pool_len {
-            let idx = (start_idx + offset) % pool_len;
-            if let Ok(guard) = self.query_sessions[idx].try_lock() {
-                return Ok(guard);
-            }
-        }
-        self.query_sessions[start_idx].lock().map_err(|e| {
-            RuntimeError::ModelContractViolation(format!("Query セッションロック獲得失敗: {e}。"))
-        })
+        acquire_pooled_session(&self.query_sessions, &self.next_query_idx, "Query")
     }
 
     /// セッションプールから利用可能な `State` セッションを取得する。
     ///
     /// ロックされていない空きセッションを優先探索し、全セッションが使用中の場合はブロック待機する。
     fn acquire_state_session(&self) -> Result<std::sync::MutexGuard<'_, Session>> {
-        let pool_len = self.state_sessions.len();
-        let start_idx = self.next_state_idx.fetch_add(1, Ordering::Relaxed) % pool_len;
-        for offset in 0..pool_len {
-            let idx = (start_idx + offset) % pool_len;
-            if let Ok(guard) = self.state_sessions[idx].try_lock() {
-                return Ok(guard);
-            }
-        }
-        self.state_sessions[start_idx].lock().map_err(|e| {
-            RuntimeError::ModelContractViolation(format!("State セッションロック獲得失敗: {e}。"))
-        })
+        acquire_pooled_session(&self.state_sessions, &self.next_state_idx, "State")
     }
 
     /// 保持しているキャッシュマネージャーへの参照を取得する。

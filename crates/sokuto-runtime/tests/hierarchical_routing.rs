@@ -402,7 +402,7 @@ fn test_evaluate_batch_questions_hierarchical() {
             &invalid_questions,
             &mapping,
             &calib_config,
-            config,
+            config.clone(),
             None,
         )
         .expect_err("Score 型の質問は拒否されること。");
@@ -410,6 +410,60 @@ fn test_evaluate_batch_questions_hierarchical() {
         err_batch,
         sokuto_runtime::error::RuntimeError::InvalidQuestion(_)
     ));
+
+    // エスカレーション発生時に question_id (q_key) がプロンプト案に正しく伝播されること。
+    let mut escalate_questions = indexmap::IndexMap::new();
+    escalate_questions.insert(
+        "q_escalate_target".to_string(),
+        sokuto_core::schema::Question {
+            question_type: sokuto_core::schema::QuestionType::Choice,
+            instructions: "カードの不正利用について確認してください。".to_string(),
+            criteria: None,
+        },
+    );
+    let strict_gating = sokuto_core::gating::GatingConfig {
+        enabled: true,
+        thresholds: sokuto_core::gating::GatingThresholds {
+            high_threshold: 0.999,
+            low_threshold: 0.990,
+            top_margin_threshold: 0.990,
+            ood_enabled: false,
+            ..Default::default()
+        },
+    };
+    let escalate_results = engine
+        .evaluate_batch_questions_hierarchical(
+            &tokenizer,
+            state,
+            &escalate_questions,
+            &mapping,
+            &calib_config,
+            config,
+            Some(&strict_gating),
+        )
+        .expect("エスカレーション設定付きバッチ階層推論に成功する。");
+
+    let esc_ans = escalate_results.get("q_escalate_target").unwrap().answer();
+    let gating = esc_ans
+        .gating
+        .as_ref()
+        .expect("Gating 情報が付与されていること。");
+    assert_ne!(
+        gating.route,
+        sokuto_core::gating::DecisionRoute::AutoExecute
+    );
+    let esc_ctx = gating
+        .escalation
+        .as_ref()
+        .expect("EscalationContext が存在すること。");
+    let prompt = esc_ctx
+        .prompt_template
+        .as_ref()
+        .expect("プロンプト案が生成されていること。");
+    assert!(
+        prompt.contains("q_escalate_target"),
+        "エスカレーションプロンプトに question_id が含まれていること。"
+    );
 }
 
 #[test]

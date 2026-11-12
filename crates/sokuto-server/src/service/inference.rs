@@ -282,8 +282,9 @@ impl InferenceService {
                             if is_hierarchical {
                                 let allowed_criteria =
                                     question.criteria.as_ref().and_then(|c| c.as_map());
-                                let res = router.route_with_allowed_candidates(
+                                let res = router.route_with_allowed_candidates_and_id(
                                     effective_state,
+                                    Some(qid.as_str()),
                                     &question.instructions,
                                     allowed_criteria,
                                     Some(&gating_config),
@@ -341,9 +342,11 @@ impl InferenceService {
                     let mapping = hierarchical_mapping
                         .as_ref()
                         .expect("マッピングが存在すること。");
-                    let router = CoarseToFineRouter::new(
+                    let state_ids = tokenizer.encode_state(&state_text)?;
+                    let router = CoarseToFineRouter::new_with_pretokenized_state(
                         &engine,
                         &tokenizer,
+                        &state_ids,
                         mapping.as_ref(),
                         &calib_config,
                         hierarchical_config,
@@ -369,8 +372,9 @@ impl InferenceService {
                         if is_hierarchical {
                             let allowed_criteria =
                                 question.criteria.as_ref().and_then(|c| c.as_map());
-                            let res = router.route_with_allowed_candidates(
+                            let res = router.route_with_allowed_candidates_and_id(
                                 &state_text,
+                                Some(qid.as_str()),
                                 &question.instructions,
                                 allowed_criteria,
                                 Some(&gating_config),

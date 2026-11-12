@@ -265,6 +265,17 @@ impl HierarchicalPredictor for (&InferenceEngine, &JevTokenizer) {
     }
 }
 
+impl HierarchicalPredictor for (&InferenceEngine, &JevTokenizer, &[u32]) {
+    fn forward_fine_raw(&self, _state: &str, question: &Question) -> Result<Vec<f64>> {
+        let tokenized = self.1.encode_with_pretokenized_state(
+            self.2,
+            question,
+            self.1.max_sequence_length(),
+        )?;
+        self.0.forward_question(&tokenized)
+    }
+}
+
 impl HierarchicalPredictor for (&DualSessionEngine, &CachedStateFeatures, &JevTokenizer) {
     fn forward_fine_raw(&self, _state: &str, question: &Question) -> Result<Vec<f64>> {
         self.0.forward_question_raw(self.2, self.1, question)
@@ -306,6 +317,23 @@ impl<'a> CoarseToFineRouter<'a, (&'a InferenceEngine, &'a JevTokenizer)> {
         config: HierarchicalRouterConfig,
     ) -> Result<Self> {
         Self::with_predictor((engine, tokenizer), mapping, calib_config, config)
+    }
+
+    /// 事前エンコードされた State トークン列を保持する単一推論エンジンからルーターインスタンスを生成する。
+    pub fn new_with_pretokenized_state(
+        engine: &'a InferenceEngine,
+        tokenizer: &'a JevTokenizer,
+        state_ids: &'a [u32],
+        mapping: &'a HierarchicalMapping,
+        calib_config: &'a CalibrationConfig,
+        config: HierarchicalRouterConfig,
+    ) -> Result<CoarseToFineRouter<'a, (&'a InferenceEngine, &'a JevTokenizer, &'a [u32])>> {
+        CoarseToFineRouter::with_predictor(
+            (engine, tokenizer, state_ids),
+            mapping,
+            calib_config,
+            config,
+        )
     }
 }
 
@@ -411,6 +439,26 @@ impl<'a, P: HierarchicalPredictor> CoarseToFineRouter<'a, P> {
     pub fn route_with_allowed_candidates(
         &self,
         state: &str,
+        instructions: &str,
+        allowed_criteria: Option<&IndexMap<String, String>>,
+        gating_config: Option<&GatingConfig>,
+    ) -> Result<HierarchicalResult> {
+        self.route_with_allowed_candidates_and_id(
+            state,
+            None,
+            instructions,
+            allowed_criteria,
+            gating_config,
+        )
+    }
+
+    /// 質問識別子 (`question_id`) および許可された細分類候補を指定して階層ルーティング推論を実行する。
+    ///
+    /// エスカレーション判定発生時、指定された `question_id` がエスカレーションプロンプトに反映される。
+    pub fn route_with_allowed_candidates_and_id(
+        &self,
+        state: &str,
+        question_id: Option<&str>,
         instructions: &str,
         allowed_criteria: Option<&IndexMap<String, String>>,
         gating_config: Option<&GatingConfig>,
@@ -533,6 +581,7 @@ impl<'a, P: HierarchicalPredictor> CoarseToFineRouter<'a, P> {
             return build_early_exit_result(
                 self.mapping,
                 state,
+                question_id,
                 instructions,
                 &sorted_coarse,
                 &allowed_fine_keys,
@@ -649,6 +698,7 @@ impl<'a, P: HierarchicalPredictor> CoarseToFineRouter<'a, P> {
         let gating = build_final_gating_metadata(
             self.mapping,
             state,
+            question_id,
             instructions,
             &answer,
             &resolved_gating_config,
@@ -789,6 +839,7 @@ fn compute_final_answer_confidence(
 fn build_hierarchical_escalation_prompt(
     mapping: &HierarchicalMapping,
     state: &str,
+    question_id: Option<&str>,
     instructions: &str,
     gating: &GatingMetadata,
     top_candidates: &[CandidateProbability],
@@ -801,7 +852,7 @@ fn build_hierarchical_escalation_prompt(
 
     build_rich_escalation_prompt(
         Some(state),
-        None,
+        question_id,
         Some(&escalation_question),
         gating,
         top_candidates,
@@ -816,6 +867,7 @@ fn build_hierarchical_escalation_prompt(
 fn attach_escalation_context(
     mapping: &HierarchicalMapping,
     state: &str,
+    question_id: Option<&str>,
     instructions: &str,
     gating: &mut GatingMetadata,
     top_candidates: Vec<CandidateProbability>,
@@ -824,8 +876,14 @@ fn attach_escalation_context(
         return;
     }
 
-    let prompt_template =
-        build_hierarchical_escalation_prompt(mapping, state, instructions, gating, &top_candidates);
+    let prompt_template = build_hierarchical_escalation_prompt(
+        mapping,
+        state,
+        question_id,
+        instructions,
+        gating,
+        &top_candidates,
+    );
 
     gating.escalation = Some(EscalationContext {
         top_candidates,
@@ -844,6 +902,7 @@ fn attach_escalation_context(
 fn build_final_gating_metadata(
     mapping: &HierarchicalMapping,
     state: &str,
+    question_id: Option<&str>,
     instructions: &str,
     answer: &Answer,
     gating_config: &GatingConfig,
@@ -857,6 +916,7 @@ fn build_final_gating_metadata(
             build_hierarchical_escalation_prompt(
                 mapping,
                 state,
+                question_id,
                 instructions,
                 &gating,
                 &esc.top_candidates,
@@ -879,6 +939,7 @@ fn build_final_gating_metadata(
 /// # 引数
 /// - `mapping`: 階層マッピング定義。
 /// - `state`: 推論対象のコンテキストテキスト。
+/// - `question_id`: 質問識別子 (任意)。
 /// - `instructions`: 質問の判定指示文。
 /// - `sorted_coarse`: 確率降順に並んだ第 1 パスの大分類スコア一覧。
 /// - `allowed_fine_keys`: 評価対象として許可された細分類候補キー配列。
@@ -893,6 +954,7 @@ fn build_final_gating_metadata(
 fn build_early_exit_result(
     mapping: &HierarchicalMapping,
     state: &str,
+    question_id: Option<&str>,
     instructions: &str,
     sorted_coarse: &[(&str, f64)],
     allowed_fine_keys: &[String],
@@ -998,6 +1060,7 @@ fn build_early_exit_result(
     attach_escalation_context(
         mapping,
         state,
+        question_id,
         instructions,
         &mut fallback_gating,
         top_candidates,
@@ -1060,6 +1123,7 @@ mod tests {
         let res = build_early_exit_result(
             &mapping,
             state,
+            Some("q_early_exit"),
             instructions,
             &sorted_coarse,
             mapping.all_fine_keys(),
@@ -1128,6 +1192,7 @@ mod tests {
         assert!(prompt.contains(state));
         assert!(prompt.contains(instructions));
         assert!(prompt.contains(expected_top1_first));
+        assert!(prompt.contains("q_early_exit"));
 
         // 4. トレースの整合性確認
         assert!(res.trace().early_exit_triggered);
@@ -1150,6 +1215,7 @@ mod tests {
         let res = build_early_exit_result(
             &mapping,
             "判断対象のテキスト",
+            None,
             "適切な候補を選択してください。",
             &sorted_coarse,
             mapping.all_fine_keys(),
@@ -1191,6 +1257,7 @@ mod tests {
         let auto_meta = build_final_gating_metadata(
             &mapping,
             state,
+            Some("q_auto"),
             instructions,
             &auto_answer,
             &gating_config,
@@ -1217,6 +1284,7 @@ mod tests {
             let meta = build_final_gating_metadata(
                 &mapping,
                 state,
+                Some("q_esc"),
                 instructions,
                 &answer,
                 &gating_config,
@@ -1253,6 +1321,7 @@ mod tests {
             assert!(prompt.contains(state));
             assert!(prompt.contains(instructions));
             assert!(prompt.contains("card_payment_not_recognised"));
+            assert!(prompt.contains("q_esc"));
         }
     }
 
@@ -1275,6 +1344,7 @@ mod tests {
         let ood_meta = build_final_gating_metadata(
             &mapping,
             state,
+            None,
             instructions,
             &high_conf_answer,
             &default_gc,
@@ -1305,6 +1375,7 @@ mod tests {
         let non_ood_meta = build_final_gating_metadata(
             &mapping,
             state,
+            None,
             instructions,
             &high_conf_answer,
             &disabled_ood_gc,
@@ -1335,6 +1406,7 @@ mod tests {
         let hybrid_meta = build_final_gating_metadata(
             &mapping,
             state,
+            None,
             instructions,
             &close_answer,
             &hybrid_gc,
@@ -1366,6 +1438,7 @@ mod tests {
         let meta = build_final_gating_metadata(
             &mapping,
             state,
+            None,
             instructions,
             &answer,
             &gating_config,
@@ -1487,6 +1560,7 @@ mod tests {
         let gating = build_final_gating_metadata(
             &mapping,
             "カードの件について相談です。",
+            None,
             "カテゴリを選択してください。",
             &answer,
             &GatingConfig::default(),
@@ -1513,6 +1587,7 @@ mod tests {
         let peaked_gating = build_final_gating_metadata(
             &mapping,
             "カードを紛失しました。",
+            None,
             "カテゴリを選択してください。",
             &peaked_answer,
             &GatingConfig::default(),

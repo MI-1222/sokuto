@@ -797,13 +797,22 @@ impl InferenceEngine {
 
         validate_hierarchical_questions(questions, mapping)?;
 
-        let router = CoarseToFineRouter::new(self, tokenizer, mapping, calib_config, config)?;
+        let state_ids = tokenizer.encode_state(state)?;
+        let router = CoarseToFineRouter::new_with_pretokenized_state(
+            self,
+            tokenizer,
+            &state_ids,
+            mapping,
+            calib_config,
+            config,
+        )?;
         let mut results = IndexMap::with_capacity(questions.len());
 
         for (q_key, question) in questions {
             let allowed_criteria = question.criteria.as_ref().and_then(|c| c.as_map());
-            let res = router.route_with_allowed_candidates(
+            let res = router.route_with_allowed_candidates_and_id(
                 state,
+                Some(q_key.as_str()),
                 &question.instructions,
                 allowed_criteria,
                 gating_config,

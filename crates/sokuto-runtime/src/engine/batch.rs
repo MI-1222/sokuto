@@ -1220,16 +1220,12 @@ mod tests {
         struct MockBatchScorer;
 
         impl CoarseScorer for MockBatchScorer {
-            fn score_candidates(
+            fn score_candidates_iter(
                 &self,
                 _query: &str,
-                candidates: &IndexMap<String, String>,
+                candidates: &mut dyn ExactSizeIterator<Item = (&str, &str)>,
             ) -> Result<Vec<f32>> {
-                Ok(candidates
-                    .keys()
-                    .enumerate()
-                    .map(|(idx, _)| idx as f32)
-                    .collect())
+                Ok((0..candidates.len()).map(|idx| idx as f32).collect())
             }
         }
 
@@ -1510,10 +1506,10 @@ mod tests {
         let mut scratchpad = BatchScratchpad::with_capacity(16, 4);
         struct DummyScorer;
         impl CoarseScorer for DummyScorer {
-            fn score_candidates(
+            fn score_candidates_iter(
                 &self,
                 _query: &str,
-                candidates: &IndexMap<String, String>,
+                candidates: &mut dyn ExactSizeIterator<Item = (&str, &str)>,
             ) -> Result<Vec<f32>> {
                 Ok(vec![0.0; candidates.len()])
             }

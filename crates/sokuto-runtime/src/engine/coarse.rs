@@ -240,19 +240,48 @@ impl CandidateEmbeddingCache {
 
 /// 粗選考段階におけるスコアリングインターフェース。
 pub trait CoarseScorer {
-    /// クエリ文字列 (State + Instructions) と候補群を受け取り、各候補の類似度スコア列を算出する。
+    /// クエリ文字列 (State + Instructions) と候補群イテレータを受け取り、各候補の類似度スコア列を算出する。
     ///
     /// # 引数
     /// - `query`: 照会クエリテキスト。
-    /// - `candidates`: 評価対象の候補識別子と説明文の順序付きマップ。
+    /// - `candidates`: 評価対象の候補識別子と説明文のイテレータ (`(&str, &str)`)。
     ///
     /// # 戻り値
     /// `candidates` の出現順に対応する類似度スコア列 (`Vec<f32>`)。
-    fn score_candidates(
+    fn score_candidates_iter(
         &self,
         query: &str,
-        candidates: &IndexMap<String, String>,
+        candidates: &mut dyn ExactSizeIterator<Item = (&str, &str)>,
     ) -> Result<Vec<f32>>;
+
+    /// スライスを受け取り、各候補の類似度スコア列を算出する。
+    ///
+    /// 既定の実装では、スライスのイテレータを生成して [`score_candidates_iter`](Self::score_candidates_iter) を呼び出す。
+    ///
+    /// # 引数
+    /// - `query`: 照会クエリテキスト。
+    /// - `candidates`: 評価対象の候補識別子と説明文のスライス (`[(&str, &str)]`)。
+    ///
+    /// # 戻り値
+    /// `candidates` の出現順に対応する類似度スコア列 (`Vec<f32>`)。
+    fn score_candidates(&self, query: &str, candidates: &[(&str, &str)]) -> Result<Vec<f32>> {
+        let mut iter = candidates.iter().copied();
+        self.score_candidates_iter(query, &mut iter)
+    }
+}
+
+impl<T: CoarseScorer + ?Sized> CoarseScorer for &T {
+    fn score_candidates_iter(
+        &self,
+        query: &str,
+        candidates: &mut dyn ExactSizeIterator<Item = (&str, &str)>,
+    ) -> Result<Vec<f32>> {
+        (**self).score_candidates_iter(query, candidates)
+    }
+
+    fn score_candidates(&self, query: &str, candidates: &[(&str, &str)]) -> Result<Vec<f32>> {
+        (**self).score_candidates(query, candidates)
+    }
 }
 
 /// トークナイザーのサブワード語彙を活用した外部モデル不要の語彙スコアラー。
@@ -273,11 +302,16 @@ impl<'a> LexicalCoarseScorer<'a> {
 }
 
 impl CoarseScorer for LexicalCoarseScorer<'_> {
-    fn score_candidates(
+    fn score_candidates_iter(
         &self,
         query: &str,
-        candidates: &IndexMap<String, String>,
+        candidates: &mut dyn ExactSizeIterator<Item = (&str, &str)>,
     ) -> Result<Vec<f32>> {
+        let count = candidates.len();
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
         // クエリトークンの頻度マップを構築
         let query_encoding = self
             .tokenizer
@@ -291,7 +325,7 @@ impl CoarseScorer for LexicalCoarseScorer<'_> {
             *query_counts.entry(id).or_insert(0usize) += 1;
         }
 
-        let mut scores = Vec::with_capacity(candidates.len());
+        let mut scores = Vec::with_capacity(count);
 
         for (key, desc) in candidates {
             // キー名と説明文を合わせてテキスト化
@@ -358,14 +392,14 @@ impl<'a> EmbeddingCoarseScorer<'a> {
 }
 
 impl CoarseScorer for EmbeddingCoarseScorer<'_> {
-    fn score_candidates(
+    fn score_candidates_iter(
         &self,
         _query: &str,
-        candidates: &IndexMap<String, String>,
+        candidates: &mut dyn ExactSizeIterator<Item = (&str, &str)>,
     ) -> Result<Vec<f32>> {
         let mut scores = Vec::with_capacity(candidates.len());
 
-        for key in candidates.keys() {
+        for (key, _) in candidates {
             if let Some(cand_vec) = self.cache.get(key) {
                 let sim = CandidateEmbeddingCache::cosine_similarity(self.query_vector, cand_vec);
                 scores.push(sim);
@@ -447,13 +481,11 @@ pub fn filter_top_candidates(
     let mut selected_indices = pinned_indices;
 
     if remaining_quota > 0 && !candidate_entries.is_empty() {
-        let mut unpinned_map = IndexMap::with_capacity(candidate_entries.len());
+        let mut unpinned_iter = candidate_entries
+            .iter()
+            .map(|&(_, key, desc)| (key.as_str(), desc.as_str()));
 
-        for &(_, key, desc) in &candidate_entries {
-            unpinned_map.insert(key.clone(), desc.clone());
-        }
-
-        let scores = scorer.score_candidates(query, &unpinned_map)?;
+        let scores = scorer.score_candidates_iter(query, &mut unpinned_iter)?;
         if scores.len() != candidate_entries.len() {
             return Err(RuntimeError::InvalidTensorData(format!(
                 "CoarseScorer の返却スコア数不一致: 期待値={}, 実際={}",
@@ -609,14 +641,42 @@ mod tests {
     }
 
     impl CoarseScorer for MockScorer {
-        fn score_candidates(
+        fn score_candidates_iter(
             &self,
             _query: &str,
-            candidates: &IndexMap<String, String>,
+            candidates: &mut dyn ExactSizeIterator<Item = (&str, &str)>,
         ) -> Result<Vec<f32>> {
             assert_eq!(self.scores.len(), candidates.len());
             Ok(self.scores.clone())
         }
+    }
+
+    #[test]
+    fn test_coarse_scorer_slice_and_iter_invocation() {
+        let scorer = MockScorer {
+            scores: vec![0.3, 0.7],
+        };
+
+        // 1. スライスベースの呼び出し検証
+        let slice = [("key1", "desc1"), ("key2", "desc2")];
+        let slice_scores = scorer
+            .score_candidates("query", &slice)
+            .expect("スライス経由のスコアリングに成功。");
+        assert_eq!(slice_scores, vec![0.3, 0.7]);
+
+        // 2. トレイトオブジェクト (&dyn CoarseScorer) 経由でのスライス呼び出し検証
+        let dyn_scorer: &dyn CoarseScorer = &scorer;
+        let dyn_scores = dyn_scorer
+            .score_candidates("query", &slice)
+            .expect("dyn 経由のスライススコアリングに成功。");
+        assert_eq!(dyn_scores, vec![0.3, 0.7]);
+
+        // 3. イテレータベースの直接呼び出し検証
+        let mut iter = slice.iter().copied();
+        let iter_scores = scorer
+            .score_candidates_iter("query", &mut iter)
+            .expect("イテレータ経由のスコアリングに成功。");
+        assert_eq!(iter_scores, vec![0.3, 0.7]);
     }
 
     #[test]
@@ -881,10 +941,10 @@ mod tests {
         }
 
         impl CoarseScorer for MismatchScorer {
-            fn score_candidates(
+            fn score_candidates_iter(
                 &self,
                 _query: &str,
-                _candidates: &IndexMap<String, String>,
+                _candidates: &mut dyn ExactSizeIterator<Item = (&str, &str)>,
             ) -> Result<Vec<f32>> {
                 Ok(self.scores.clone())
             }

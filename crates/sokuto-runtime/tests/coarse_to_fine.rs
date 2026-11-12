@@ -260,8 +260,12 @@ fn test_lexical_coarse_scorer_keyword_relevance() {
     );
 
     let scorer = LexicalCoarseScorer::new(&tokenizer);
+    let cand_pairs: Vec<(&str, &str)> = candidates
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
     let scores = scorer
-        .score_candidates("プログラミングのコードを書く", &candidates)
+        .score_candidates("プログラミングのコードを書く", &cand_pairs)
         .unwrap();
 
     // computer が最高スコアであること
@@ -285,7 +289,10 @@ fn test_candidate_embedding_cache_and_scorer() {
     candidates.insert("tech".to_string(), "IT技術".to_string());
     candidates.insert("health".to_string(), "健康医療".to_string());
 
-    let scores = scorer.score_candidates("クエリ", &candidates).unwrap();
+    let mut cand_iter = candidates.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+    let scores = scorer
+        .score_candidates_iter("クエリ", &mut cand_iter)
+        .unwrap();
     assert!(scores[1] > scores[0]);
     assert!(scores[1] > scores[2]);
 }

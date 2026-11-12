@@ -405,6 +405,7 @@ impl CachedStateFeatures {
     /// - `state_mask`: `State` 有効トークンマスク列。空の場合は全トークン有効 (`1`) として補完される。
     ///
     /// # エラー
+    /// - `shape` が 3 次元でない場合、または `shape[0] != 1` の場合は [`RuntimeError::ModelContractViolation`] を返す。
     /// - `state_mask` が非空かつ要素数が `shape[0] * shape[1]` と一致しない場合は [`RuntimeError::InvalidTensorData`] を返す。
     pub fn new_raw(
         hash_key: u64,
@@ -419,6 +420,7 @@ impl CachedStateFeatures {
     /// 非圧縮の生 `Value` と State 原文テキストからキャッシュエントリを生成する。
     ///
     /// # エラー
+    /// - `shape` が 3 次元でない場合、または `shape[0] != 1` の場合は [`RuntimeError::ModelContractViolation`] を返す。
     /// - `state_mask` が非空かつ要素数が `shape[0] * shape[1]` と一致しない場合は [`RuntimeError::InvalidTensorData`] を返す。
     pub fn new_raw_with_text(
         hash_key: u64,
@@ -428,6 +430,18 @@ impl CachedStateFeatures {
         state_mask: Vec<i64>,
         state_text: Option<String>,
     ) -> Result<Self> {
+        if shape.len() != 3 {
+            return Err(RuntimeError::ModelContractViolation(format!(
+                "State特徴量は3次元テンソルである必要があります: {shape:?}。"
+            )));
+        }
+
+        if shape[0] != 1 {
+            return Err(RuntimeError::ModelContractViolation(format!(
+                "バッチ展開元のキャッシュエントリは batch_size == 1 である必要があります: shape={shape:?}。"
+            )));
+        }
+
         let state_mask = validate_and_normalize_state_mask(&shape, state_mask)?;
 
         Ok(Self {
@@ -458,7 +472,7 @@ impl CachedStateFeatures {
     /// - `state_mask`: `State` 有効トークンマスク列。空の場合は全トークン有効 (`1`) として補完される。
     ///
     /// # エラー
-    /// - `shape` が 3 次元でない場合は [`RuntimeError::ModelContractViolation`] を返す。
+    /// - `shape` が 3 次元でない場合、または `shape[0] != 1` の場合は [`RuntimeError::ModelContractViolation`] を返す。
     /// - `raw_slice` の要素数が `shape` の総要素数と一致しない場合、または要素数計算がオーバーフローした場合は [`RuntimeError::InvalidTensorData`] を返す。
     /// - `state_mask` が非空かつ要素数が `shape[0] * shape[1]` と一致しない場合は [`RuntimeError::InvalidTensorData`] を返す。
     pub fn new_compressed(
@@ -474,7 +488,7 @@ impl CachedStateFeatures {
     /// `f32` スライスと State 原文テキストを指定された圧縮モードで変換してキャッシュエントリを生成する。
     ///
     /// # エラー
-    /// - `shape` が 3 次元でない場合は [`RuntimeError::ModelContractViolation`] を返す。
+    /// - `shape` が 3 次元でない場合、または `shape[0] != 1` の場合は [`RuntimeError::ModelContractViolation`] を返す。
     /// - `raw_slice` の要素数が `shape` の総要素数と一致しない場合、または要素数計算がオーバーフローした場合は [`RuntimeError::InvalidTensorData`] を返す。
     /// - `state_mask` が非空かつ要素数が `shape[0] * shape[1]` と一致しない場合は [`RuntimeError::InvalidTensorData`] を返す。
     pub fn new_compressed_with_text(
@@ -488,6 +502,12 @@ impl CachedStateFeatures {
         if shape.len() != 3 {
             return Err(RuntimeError::ModelContractViolation(format!(
                 "State特徴量は3次元テンソルである必要があります: {shape:?}。"
+            )));
+        }
+
+        if shape[0] != 1 {
+            return Err(RuntimeError::ModelContractViolation(format!(
+                "バッチ展開元のキャッシュエントリは batch_size == 1 である必要があります: shape={shape:?}。"
             )));
         }
 
@@ -1025,6 +1045,10 @@ impl DualSessionEngine {
     /// - `input_ids`: トークンID列 (`[batch_size, seq_len]`)。
     /// - `attention_mask`: アテンションマスク列 (`[batch_size, seq_len]`)。
     /// - `dims`: `[batch_size, seq_len]` の次元配列。
+    ///
+    /// # エラー
+    /// - `dims[0] != 1` またはモデル出力のバッチサイズが 1 でない場合は [`RuntimeError::ModelContractViolation`] を返す。
+    /// - `input_ids` や `attention_mask` の長さが `dims` と一致しない場合は [`RuntimeError::InvalidTensorData`] を返す。
     pub fn encode_and_cache_state(
         &self,
         state_text: &str,
@@ -1038,6 +1062,12 @@ impl DualSessionEngine {
         }
 
         let [batch_size, seq_len] = dims;
+        if batch_size != 1 {
+            return Err(RuntimeError::ModelContractViolation(format!(
+                "Stateエンコードのバッチサイズは 1 である必要があります: batch_size={batch_size}。"
+            )));
+        }
+
         if input_ids.len() != batch_size * seq_len {
             return Err(RuntimeError::InvalidTensorData(format!(
                 "input_ids 長さ ({}) が期待値 ({batch_size} * {seq_len} = {}) と一致しません。",
@@ -1084,6 +1114,16 @@ impl DualSessionEngine {
             .try_extract_tensor::<f32>()
             .map_err(RuntimeError::Ort)?;
         let shape_vec: Vec<usize> = shape.iter().map(|&x| x as usize).collect();
+        if shape_vec.len() != 3 {
+            return Err(RuntimeError::ModelContractViolation(format!(
+                "State特徴量は3次元テンソルである必要があります: {shape_vec:?}。"
+            )));
+        }
+        if shape_vec[0] != 1 {
+            return Err(RuntimeError::ModelContractViolation(format!(
+                "Stateモデルの出力テンソルは batch_size == 1 である必要があります: shape={shape_vec:?}。"
+            )));
+        }
 
         let compression = self.cache_manager.compression_mode();
         let state_text_owned = Some(state_text.to_string());
@@ -1803,46 +1843,41 @@ mod tests {
             .collect();
         let mask = vec![1i64; batch_size * seq_len];
 
+        // 1. コンストラクタ時点で batch_size != 1 の不正エントリが ModelContractViolation で拒絶されることの検証。
         for mode in [
             CacheCompressionMode::None,
             CacheCompressionMode::Fp16,
             CacheCompressionMode::Int8Symmetric,
         ] {
-            let features = CachedStateFeatures::new_compressed(
+            let err = CachedStateFeatures::new_compressed(
                 key,
                 shape.clone(),
                 &raw_data,
                 mode,
                 mask.clone(),
             )
-            .expect("マルチバッチエントリの構築自体は成功すること。");
-
-            for target_batch in [1usize, 2, 3] {
-                let err = features
-                    .as_ort_value_for_batch(target_batch)
-                    .expect_err("batch_size != 1 のキャッシュエントリはエラーになること。");
-                assert!(
-                    matches!(err, RuntimeError::ModelContractViolation(_)),
-                    "ModelContractViolation が返る必要があります: mode={mode:?}, target_batch={target_batch}, err={err:?}"
-                );
-            }
+            .expect_err("batch_size != 1 のエントリ構築は拒絶される必要があります。");
+            assert!(
+                matches!(err, RuntimeError::ModelContractViolation(_)),
+                "ModelContractViolation が返る必要があります: mode={mode:?}, err={err:?}"
+            );
         }
 
         // batch_size == 0 も ModelContractViolation を返すこと。
         let zero_batch_val =
             Value::from_array((vec![0usize, seq_len, hidden_size], Vec::<f32>::new()))
                 .expect("空バッチ Value の作成に成功すること。");
-        let zero_batch_features = CachedStateFeatures::new_raw(
+        let zero_batch_err = CachedStateFeatures::new_raw(
             key,
             vec![0, seq_len, hidden_size],
             zero_batch_val.into(),
             0,
             vec![],
         )
-        .expect("空バッチキャッシュエントリの作成に成功すること。");
+        .expect_err("batch_size == 0 のキャッシュエントリ作成は拒絶される必要があります。");
         assert!(matches!(
-            zero_batch_features.as_ort_value_for_batch(2),
-            Err(RuntimeError::ModelContractViolation(_))
+            zero_batch_err,
+            RuntimeError::ModelContractViolation(_)
         ));
 
         // 3次元以外の形状 (空形状・2次元) も ModelContractViolation を返すこと。
@@ -1851,11 +1886,30 @@ mod tests {
             vec![0.0f32; seq_len * hidden_size],
         ))
         .expect("Value の作成に成功すること。");
-        let empty_shape_features =
+        let empty_shape_err =
             CachedStateFeatures::new_raw(key, vec![], empty_shape_val.into(), 0, vec![])
-                .expect("空形状キャッシュエントリの作成に成功すること。");
+                .expect_err("空形状キャッシュエントリの作成は拒絶される必要があります。");
         assert!(matches!(
-            empty_shape_features.as_ort_value_for_batch(1),
+            empty_shape_err,
+            RuntimeError::ModelContractViolation(_)
+        ));
+
+        // 2. 万一の不正内部状態に対する as_ort_value_for_batch の多層防御ガードの検証。
+        let dummy_val = Value::from_array((
+            vec![2usize, seq_len, hidden_size],
+            vec![0.0f32; 2 * seq_len * hidden_size],
+        ))
+        .expect("Value の作成に成功すること。");
+        let corrupt_features = CachedStateFeatures {
+            hash_key: key,
+            shape: vec![2, seq_len, hidden_size],
+            payload: CachedTensorPayload::Raw(Arc::new(dummy_val.into())),
+            byte_size: 2 * seq_len * hidden_size * std::mem::size_of::<f32>(),
+            state_mask: vec![1i64; 2 * seq_len],
+            state_text: None,
+        };
+        assert!(matches!(
+            corrupt_features.as_ort_value_for_batch(1),
             Err(RuntimeError::ModelContractViolation(_))
         ));
 

@@ -14,9 +14,9 @@ use sokuto_runtime::engine::{
 #[test]
 fn test_cached_state_features_dimensions() {
     let key = 0xABCD_1234;
-    let shape = vec![2, 32, 128];
-    let data = vec![0.0f32; 2 * 32 * 128];
-    let mask = vec![1i64; 2 * 32];
+    let shape = vec![1, 32, 128];
+    let data = vec![0.0f32; 32 * 128];
+    let mask = vec![1i64; 32];
     let entry = CachedStateFeatures::new_compressed(
         key,
         shape,
@@ -26,11 +26,28 @@ fn test_cached_state_features_dimensions() {
     )
     .expect("キャッシュエントリ作成に失敗しました。");
 
-    assert_eq!(entry.batch_size(), 2);
+    assert_eq!(entry.batch_size(), 1);
     assert_eq!(entry.seq_len(), 32);
     assert_eq!(entry.hidden_size(), 128);
     assert_eq!(entry.compression_mode(), CacheCompressionMode::None);
     assert_eq!(entry.state_mask, mask);
+
+    // batch_size != 1 の場合は ModelContractViolation で拒絶されることの検証。
+    let invalid_shape = vec![2, 32, 128];
+    let invalid_data = vec![0.0f32; 2 * 32 * 128];
+    let invalid_mask = vec![1i64; 2 * 32];
+    let err = CachedStateFeatures::new_compressed(
+        key,
+        invalid_shape,
+        &invalid_data,
+        CacheCompressionMode::None,
+        invalid_mask,
+    )
+    .expect_err("batch_size != 1 のエントリ構築は拒絶される必要があります。");
+    assert!(matches!(
+        err,
+        sokuto_runtime::error::RuntimeError::ModelContractViolation(_)
+    ));
 }
 
 #[test]

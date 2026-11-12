@@ -3,7 +3,7 @@
 //! 実行前の DAG 定義に対し、循環参照 (閉路)、未定義ノード参照、
 //! 型契約違反、到達不能ノードを Fast-Fail で静的検証する。
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 
 use indexmap::IndexMap;
 use sokuto_core::schema::{Criteria, Question, QuestionType};
@@ -183,13 +183,16 @@ pub fn compile_dag(dag: &DagDefinition) -> Result<CompiledDag, DagValidationErro
     }
 
     // 2. 有向隣接リストの構築
-    let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
-    for (id, node) in &dag.nodes {
+    let n = dag.nodes.len();
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (idx, (_, node)) in dag.nodes.iter().enumerate() {
         let mut neighbors = Vec::new();
         match node {
             DagNode::Inference { conditions, .. } | DagNode::Branch { conditions, .. } => {
                 for cond in conditions {
-                    neighbors.push(cond.target_node.as_str());
+                    if let Some(target_idx) = dag.nodes.get_index_of(&cond.target_node) {
+                        neighbors.push(target_idx);
+                    }
                 }
             }
             DagNode::Parallel {
@@ -198,69 +201,79 @@ pub fn compile_dag(dag: &DagDefinition) -> Result<CompiledDag, DagValidationErro
                 ..
             } => {
                 for p in parallel_nodes {
-                    neighbors.push(p.as_str());
+                    if let Some(p_idx) = dag.nodes.get_index_of(p) {
+                        neighbors.push(p_idx);
+                    }
                 }
-                for p in parallel_nodes {
-                    // 並行ノード群から合流ノードへのエッジも考慮
-                    adj.entry(p.as_str()).or_default().push(join_node.as_str());
+                if let Some(join_idx) = dag.nodes.get_index_of(join_node) {
+                    for p in parallel_nodes {
+                        if let Some(p_idx) = dag.nodes.get_index_of(p) {
+                            adj[p_idx].push(join_idx);
+                        }
+                    }
                 }
             }
             DagNode::Escalate { .. } => {}
         }
-        adj.entry(id.as_str()).or_default().extend(neighbors);
+        adj[idx].extend(neighbors);
     }
 
     // 3. DFS によるサイクル検出 (0: 未訪問, 1: 訪問中, 2: 完了)
-    let mut state: HashMap<&str, u8> = HashMap::new();
-    let mut path_stack = Vec::new();
+    let mut state = vec![0u8; n];
+    let mut path_stack = Vec::with_capacity(n);
 
-    fn dfs<'a>(
-        u: &'a str,
-        adj: &HashMap<&str, Vec<&'a str>>,
-        state: &mut HashMap<&'a str, u8>,
-        path_stack: &mut Vec<&'a str>,
+    fn dfs(
+        u: usize,
+        adj: &[Vec<usize>],
+        state: &mut [u8],
+        path_stack: &mut Vec<usize>,
+        dag: &DagDefinition,
     ) -> Result<(), DagValidationError> {
-        state.insert(u, 1);
+        state[u] = 1;
         path_stack.push(u);
 
-        if let Some(neighbors) = adj.get(u) {
-            for &v in neighbors {
-                let v_state = state.get(v).copied().unwrap_or(0);
-                if v_state == 1 {
-                    // 訪問中ノードへの遷移 = サイクル検出
-                    let cycle_start = path_stack.iter().position(|&x| x == v).unwrap_or(0);
-                    let mut cycle_path = path_stack[cycle_start..].to_vec();
-                    cycle_path.push(v);
-                    return Err(DagValidationError::CycleDetected(cycle_path.join(" -> ")));
-                } else if v_state == 0 {
-                    dfs(v, adj, state, path_stack)?;
+        for &v in &adj[u] {
+            let v_state = state[v];
+            if v_state == 1 {
+                // 訪問中ノードへの遷移 = サイクル検出
+                let cycle_start = path_stack.iter().position(|&x| x == v).unwrap_or(0);
+                let mut cycle_path = Vec::with_capacity(path_stack.len() - cycle_start + 1);
+                for &idx in &path_stack[cycle_start..] {
+                    if let Some((node_id, _)) = dag.nodes.get_index(idx) {
+                        cycle_path.push(node_id.as_str());
+                    }
                 }
+                if let Some((node_id, _)) = dag.nodes.get_index(v) {
+                    cycle_path.push(node_id.as_str());
+                }
+                return Err(DagValidationError::CycleDetected(cycle_path.join(" -> ")));
+            } else if v_state == 0 {
+                dfs(v, adj, state, path_stack, dag)?;
             }
         }
 
         path_stack.pop();
-        state.insert(u, 2);
+        state[u] = 2;
         Ok(())
     }
 
-    for node_id in dag.nodes.keys() {
-        let node_id_str = node_id.as_str();
-        if state.get(node_id_str).copied().unwrap_or(0) == 0 {
-            dfs(node_id_str, &adj, &mut state, &mut path_stack)?;
+    for i in 0..n {
+        if state[i] == 0 {
+            dfs(i, &adj, &mut state, &mut path_stack, dag)?;
         }
     }
 
     // 4. 到達性チェック (entry_node から到達可能か)
-    let mut reachable = HashSet::new();
-    let mut queue = vec![dag.entry_node.as_str()];
-    reachable.insert(dag.entry_node.as_str());
+    let entry_idx = dag.nodes.get_index_of(&dag.entry_node).unwrap();
+    let mut reachable = vec![false; n];
+    let mut queue = vec![entry_idx];
+    reachable[entry_idx] = true;
 
     while let Some(curr) = queue.pop() {
-        if let Some(neighbors) = adj.get(curr) {
-            for &nxt in neighbors {
-                if reachable.insert(nxt) {
-                    queue.push(nxt);
-                }
+        for &nxt in &adj[curr] {
+            if !reachable[nxt] {
+                reachable[nxt] = true;
+                queue.push(nxt);
             }
         }
     }
@@ -268,8 +281,9 @@ pub fn compile_dag(dag: &DagDefinition) -> Result<CompiledDag, DagValidationErro
     let unreachable: Vec<String> = dag
         .nodes
         .keys()
-        .filter(|k| !reachable.contains(k.as_str()))
-        .cloned()
+        .enumerate()
+        .filter(|(idx, _)| !reachable[*idx])
+        .map(|(_, k)| k.clone())
         .collect();
 
     if !unreachable.is_empty() {
@@ -277,27 +291,24 @@ pub fn compile_dag(dag: &DagDefinition) -> Result<CompiledDag, DagValidationErro
     }
 
     // 5. 逆隣接リストおよび先祖関係 (上流先行ノード集合) マップの構築
-    let mut rev_adj: HashMap<&str, Vec<&str>> = HashMap::new();
-    for (&u, neighbors) in &adj {
+    let mut rev_adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (u, neighbors) in adj.iter().enumerate() {
         for &v in neighbors {
-            rev_adj.entry(v).or_default().push(u);
+            rev_adj[v].push(u);
         }
     }
 
-    let mut ancestors: HashMap<&str, HashSet<&str>> = HashMap::new();
-    for node_id in dag.nodes.keys().map(String::as_str) {
-        let mut anc_set = HashSet::new();
-        let mut q = vec![node_id];
+    let mut ancestors = vec![vec![false; n]; n];
+    for (i, anc_row) in ancestors.iter_mut().enumerate() {
+        let mut q = vec![i];
         while let Some(curr) = q.pop() {
-            if let Some(preds) = rev_adj.get(curr) {
-                for &pred in preds {
-                    if anc_set.insert(pred) {
-                        q.push(pred);
-                    }
+            for &pred in &rev_adj[curr] {
+                if !anc_row[pred] {
+                    anc_row[pred] = true;
+                    q.push(pred);
                 }
             }
         }
-        ancestors.insert(node_id, anc_set);
     }
 
     // 6. 条件式の静的検証と型解決コンパイル (フィールド妥当性・先祖参照・型整合性)
@@ -356,39 +367,39 @@ pub fn compile_dag(dag: &DagDefinition) -> Result<CompiledDag, DagValidationErro
 /// 2. 上流に同一の並行ノード (`Parallel`) に由来する複数タスクが存在する場合、暗黙のフィールド参照は曖昧となるため、
 ///    `node_id.value` (または `node_id.confidence`) 形式での明示指定を要求するエラーを返す。
 fn resolve_upstream_inference_nodes<'a>(
-    node_id: &'a str,
+    node_idx: usize,
     node: &'a DagNode,
     field: &str,
     dag: &'a DagDefinition,
-    rev_adj: &HashMap<&str, Vec<&str>>,
+    rev_adj: &[Vec<usize>],
 ) -> Result<IndexMap<&'a str, &'a Question>, DagValidationError> {
+    let (node_id, _) = dag.nodes.get_index(node_idx).unwrap();
     if let Some(q) = node.question() {
         let mut map = IndexMap::new();
-        map.insert(node_id, q);
+        map.insert(node_id.as_str(), q);
         return Ok(map);
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = vec![false; dag.nodes.len()];
     let mut q = VecDeque::new();
-    if let Some(preds) = rev_adj.get(node_id) {
-        for &pred in preds {
-            if visited.insert(pred) {
-                q.push_back(pred);
-            }
+    for &pred in &rev_adj[node_idx] {
+        if !visited[pred] {
+            visited[pred] = true;
+            q.push_back(pred);
         }
     }
 
     let mut upstream_nodes: IndexMap<&'a str, &'a Question> = IndexMap::new();
     while let Some(curr) = q.pop_front() {
-        if let Some((curr_key, curr_node)) = dag.nodes.get_key_value(curr) {
-            if let Some(question) = curr_node.question() {
-                upstream_nodes.insert(curr_key.as_str(), question);
-                // 直近の Inference ノードに到達したため、この経路の更なる上流探索は打ち切る。
-            } else if let Some(preds) = rev_adj.get(curr) {
-                for &pred in preds {
-                    if visited.insert(pred) {
-                        q.push_back(pred);
-                    }
+        let (curr_key, curr_node) = dag.nodes.get_index(curr).unwrap();
+        if let Some(question) = curr_node.question() {
+            upstream_nodes.insert(curr_key.as_str(), question);
+            // 直近の Inference ノードに到達したため、この経路の更なる上流探索は打ち切る。
+        } else {
+            for &pred in &rev_adj[curr] {
+                if !visited[pred] {
+                    visited[pred] = true;
+                    q.push_back(pred);
                 }
             }
         }
@@ -439,13 +450,14 @@ fn resolve_upstream_inference_nodes<'a>(
 /// 1. `resolve_upstream_inference_nodes` による上流存在性・並行曖昧性検証。
 /// 2. 合流する複数の直近上流 `Inference` ノード間で質問タイプ (`question_type`) が不一致の場合はエラー。
 fn resolve_upstream_questions<'a>(
-    node_id: &'a str,
+    node_idx: usize,
     node: &'a DagNode,
     field: &str,
     dag: &'a DagDefinition,
-    rev_adj: &HashMap<&str, Vec<&str>>,
+    rev_adj: &[Vec<usize>],
 ) -> Result<IndexMap<&'a str, &'a Question>, DagValidationError> {
-    let upstream_nodes = resolve_upstream_inference_nodes(node_id, node, field, dag, rev_adj)?;
+    let upstream_nodes = resolve_upstream_inference_nodes(node_idx, node, field, dag, rev_adj)?;
+    let (node_id, _) = dag.nodes.get_index(node_idx).unwrap();
 
     // 合流する全上流 Inference ノード間で質問タイプ (question_type) が一致しているか検証。
     let first_type = upstream_nodes.values().next().unwrap().question_type;
@@ -473,14 +485,15 @@ fn resolve_upstream_questions<'a>(
 /// 各ノードの条件式リスト (`conditions`) に対し、フィールド妥当性・先祖参照・型整合性を静的検証し、型付き条件へ事前コンパイルする。
 fn validate_node_conditions(
     dag: &DagDefinition,
-    ancestors: &HashMap<&str, HashSet<&str>>,
-    rev_adj: &HashMap<&str, Vec<&str>>,
+    ancestors: &[Vec<bool>],
+    rev_adj: &[Vec<usize>],
 ) -> Result<IndexMap<String, Vec<CompiledCondition>>, DagValidationError> {
     let mut compiled_map = IndexMap::with_capacity(dag.nodes.len());
-    for (node_id, node) in &dag.nodes {
+    for (node_idx, (node_id, node)) in dag.nodes.iter().enumerate() {
         let mut compiled_list = Vec::with_capacity(node.conditions().len());
         for cond in node.conditions() {
-            let compiled = validate_single_condition(node_id, node, cond, dag, ancestors, rev_adj)?;
+            let compiled =
+                validate_single_condition(node_idx, node_id, node, cond, dag, ancestors, rev_adj)?;
             compiled_list.push(compiled);
         }
         compiled_map.insert(node_id.clone(), compiled_list);
@@ -495,26 +508,26 @@ fn validate_node_conditions(
 /// 実行時にも補間対象から除外される。そのため本検証の対象はノード定義内の `question.instructions` および `question.criteria` のみである。
 fn validate_prompt_interpolations(
     dag: &DagDefinition,
-    ancestors: &HashMap<&str, HashSet<&str>>,
+    ancestors: &[Vec<bool>],
 ) -> Result<(), DagValidationError> {
-    for (node_id, node) in &dag.nodes {
+    for (node_idx, (node_id, node)) in dag.nodes.iter().enumerate() {
         let Some(question) = node.question() else {
             continue;
         };
 
         // instructions 内の補間変数検証
-        validate_template_placeholders(node_id, &question.instructions, dag, ancestors)?;
+        validate_template_placeholders(node_idx, node_id, &question.instructions, dag, ancestors)?;
 
         // criteria 内の補間変数検証
         match &question.criteria {
             Some(Criteria::Map(map)) => {
                 for desc in map.values() {
-                    validate_template_placeholders(node_id, desc, dag, ancestors)?;
+                    validate_template_placeholders(node_idx, node_id, desc, dag, ancestors)?;
                 }
             }
             Some(Criteria::List(list)) => {
                 for item in list {
-                    validate_template_placeholders(node_id, item, dag, ancestors)?;
+                    validate_template_placeholders(node_idx, node_id, item, dag, ancestors)?;
                 }
             }
             None => {}
@@ -524,10 +537,11 @@ fn validate_prompt_interpolations(
 }
 
 fn validate_template_placeholders(
+    node_idx: usize,
     node_id: &str,
     template: &str,
     dag: &DagDefinition,
-    ancestors: &HashMap<&str, HashSet<&str>>,
+    ancestors: &[Vec<bool>],
 ) -> Result<(), DagValidationError> {
     let placeholders = extract_placeholders(template);
     for ph in placeholders {
@@ -545,7 +559,7 @@ fn validate_template_placeholders(
             });
         }
 
-        let Some(ref_node) = dag.nodes.get(ph.node_id) else {
+        let Some(ref_idx) = dag.nodes.get_index_of(ph.node_id) else {
             return Err(DagValidationError::InvalidInterpolation {
                 node_id: node_id.to_string(),
                 placeholder,
@@ -555,6 +569,7 @@ fn validate_template_placeholders(
                 ),
             });
         };
+        let (_, ref_node) = dag.nodes.get_index(ref_idx).unwrap();
 
         if ref_node.node_type() != DagNodeType::Inference {
             return Err(DagValidationError::InvalidInterpolation {
@@ -576,10 +591,7 @@ fn validate_template_placeholders(
             });
         }
 
-        if !ancestors
-            .get(node_id)
-            .is_some_and(|anc| anc.contains(ph.node_id))
-        {
+        if !ancestors[node_idx][ref_idx] {
             return Err(DagValidationError::InvalidInterpolation {
                 node_id: node_id.to_string(),
                 placeholder,
@@ -594,12 +606,13 @@ fn validate_template_placeholders(
 }
 
 fn validate_single_condition(
+    node_idx: usize,
     node_id: &str,
     node: &DagNode,
     cond: &NodeCondition,
     dag: &DagDefinition,
-    ancestors: &HashMap<&str, HashSet<&str>>,
-    rev_adj: &HashMap<&str, Vec<&str>>,
+    ancestors: &[Vec<bool>],
+    rev_adj: &[Vec<usize>],
 ) -> Result<CompiledCondition, DagValidationError> {
     let field = ConditionField::parse(&cond.field);
 
@@ -615,13 +628,14 @@ fn validate_single_condition(
             node_id: ref_id,
             prop,
         } => {
-            let Some(ref_node) = dag.nodes.get(ref_id) else {
+            let Some(ref_idx) = dag.nodes.get_index_of(ref_id) else {
                 return Err(DagValidationError::InvalidCondition {
                     node_id: node_id.to_string(),
                     field: cond.field.clone(),
                     reason: format!("参照先ノード '{ref_id}' が nodes マップ内に存在しません。"),
                 });
             };
+            let (_, ref_node) = dag.nodes.get_index(ref_idx).unwrap();
             if ref_node.node_type() != DagNodeType::Inference {
                 return Err(DagValidationError::InvalidCondition {
                     node_id: node_id.to_string(),
@@ -632,10 +646,7 @@ fn validate_single_condition(
                     ),
                 });
             }
-            if !ancestors
-                .get(node_id)
-                .is_some_and(|anc| anc.contains(ref_id))
-            {
+            if !ancestors[node_idx][ref_idx] {
                 return Err(DagValidationError::InvalidCondition {
                     node_id: node_id.to_string(),
                     field: cond.field.clone(),
@@ -681,7 +692,7 @@ fn validate_single_condition(
             }
         }
         ConditionField::Confidence => {
-            resolve_upstream_inference_nodes(node_id, node, &cond.field, dag, rev_adj)?;
+            resolve_upstream_inference_nodes(node_idx, node, &cond.field, dag, rev_adj)?;
             if cond.op == NodeConditionOp::In {
                 return Err(DagValidationError::InvalidCondition {
                     node_id: node_id.to_string(),
@@ -699,7 +710,7 @@ fn validate_single_condition(
             }
         }
         ConditionField::Route => {
-            resolve_upstream_inference_nodes(node_id, node, &cond.field, dag, rev_adj)?;
+            resolve_upstream_inference_nodes(node_idx, node, &cond.field, dag, rev_adj)?;
             if !matches!(cond.op, NodeConditionOp::Eq | NodeConditionOp::Neq) {
                 return Err(DagValidationError::InvalidCondition {
                     node_id: node_id.to_string(),
@@ -718,7 +729,7 @@ fn validate_single_condition(
         }
         ConditionField::Answer => {
             let upstream_nodes =
-                resolve_upstream_questions(node_id, node, &cond.field, dag, rev_adj)?;
+                resolve_upstream_questions(node_idx, node, &cond.field, dag, rev_adj)?;
             let q_type = upstream_nodes.values().next().map(|q| q.question_type);
 
             match q_type {

@@ -9,7 +9,7 @@ use crate::contract::CalibrationConfig;
 use crate::error::{CoreError, Result};
 use crate::math::{
     composite_confidence_and_argmax, normalized_variance_confidence_from_variance,
-    noul_probability, score_moments_iter, softmax_into,
+    noul_probability_with_bias, score_moments_iter, softmax_into,
 };
 use crate::schema::{Answer, Criteria, Question, QuestionType};
 
@@ -194,10 +194,10 @@ pub fn evaluate_score(logits: &[f64], criteria: &Criteria, temperature: f64) -> 
     evaluate_score_with_buf(logits, criteria, temperature, &mut probs_buf, None)
 }
 
-/// Noul プリミティブの生ロジットから真偽確率判定結果を算出する。
+/// Noul プリミティブの生ロジットからバイアス補正項付きで真偽確率判定結果を算出する。
 ///
 /// # 概要
-/// - 入力ロジットの 2 要素 $(z_{\text{true}}, z_{\text{false}})$ の差分から、
+/// - 入力ロジットの 2 要素 $(z_{\text{true}}, z_{\text{false}})$ の差分から、バイアス補正項 `bias` を差し引いた上で、
 ///   数値安定シグモイド関数により言明が真である確率 $P(\text{true}) \in [0.0, 1.0]$ を直接算出する。
 /// - Jev 公式 API 契約に従い、Noul 型の判定結果では `choice`, `score`, `probabilities`, `confidence`
 ///   をすべて `None` とし、`noul: Some(P(true))` のみを格納した `Answer` を返却する。
@@ -206,10 +206,11 @@ pub fn evaluate_score(logits: &[f64], criteria: &Criteria, temperature: f64) -> 
 /// # 引数
 /// - `logits`: 生ロジットスライス(`f64`)。真・偽に対応する厳密に 2 要素が必要。
 /// - `temperature`: 適用する較正温度パラメータ $\tau$。
+/// - `bias`: 肯定過信バイアス補正オフセット $b$。有限実数。
 ///
 /// # 戻り値
 /// - 成功時は Noul 判定が格納された `Answer`、要素数不一致等の場合は `CoreError`。
-pub fn evaluate_noul(logits: &[f64], temperature: f64) -> Result<Answer> {
+pub fn evaluate_noul_with_bias(logits: &[f64], temperature: f64, bias: f64) -> Result<Answer> {
     if logits.len() != 2 {
         return Err(CoreError::MathError {
             question_id: None,
@@ -220,8 +221,17 @@ pub fn evaluate_noul(logits: &[f64], temperature: f64) -> Result<Answer> {
         });
     }
 
-    let prob_true = noul_probability(logits[0], logits[1], temperature)?;
+    let prob_true = noul_probability_with_bias(logits[0], logits[1], temperature, bias)?;
     Ok(Answer::noul(prob_true))
+}
+
+/// Noul プリミティブの生ロジットから真偽確率判定結果を算出する。
+///
+/// # 概要
+/// - 内部でバイアス補正 `0.0` を指定して [`evaluate_noul_with_bias`] を呼び出す。
+#[inline]
+pub fn evaluate_noul(logits: &[f64], temperature: f64) -> Result<Answer> {
+    evaluate_noul_with_bias(logits, temperature, 0.0)
 }
 
 /// 作業用バッファを活用し、質問定義、生ロジット、および較正設定から型安全に判定結果 (`Answer`) を導出する。
@@ -250,7 +260,7 @@ pub fn evaluate_question_with_buf(
         }),
         QuestionType::Noul => {
             let temperature = config.get_temperature(QuestionType::Noul, 2);
-            evaluate_noul(logits, temperature)
+            evaluate_noul_with_bias(logits, temperature, config.get_noul_bias())
         }
     };
 
@@ -469,6 +479,13 @@ mod tests {
         let prob = answer.as_noul().unwrap();
         assert!(prob > 0.90 && prob <= 1.0);
 
+        // evaluate_noul_with_bias の検証
+        let answer_zero_bias = evaluate_noul_with_bias(&logits, 1.0, 0.0).unwrap();
+        assert_eq!(answer.as_noul(), answer_zero_bias.as_noul());
+
+        let answer_biased = evaluate_noul_with_bias(&logits, 1.0, 1.0).unwrap();
+        assert!(answer_biased.as_noul().unwrap() < prob);
+
         // 異常系: ロジット数が 2 以外 (不足・過剰)
         assert!(matches!(
             evaluate_noul(&[], 1.0),
@@ -508,6 +525,13 @@ mod tests {
         let q_noul = Question::new_noul("真偽を判定せよ。");
         let ans_noul = evaluate_question(&q_noul, &[2.5, 0.0], &config).unwrap();
         assert!(ans_noul.as_noul().unwrap() > 0.85);
+
+        // 4. Noul でバイアス補正が設定されている場合の検証
+        let mut custom_calib = CalibrationConfig::default();
+        custom_calib.temperature_map.noul_bias = 2.0;
+        let ans_noul_biased = evaluate_question(&q_noul, &[2.5, 0.0], &custom_calib).unwrap();
+        // バイアス 2.0 が引かれるため、実効ロジット差は 2.5 - 2.0 = 0.5 となり確率は低下する
+        assert!(ans_noul_biased.as_noul().unwrap() < ans_noul.as_noul().unwrap());
     }
 
     #[test]

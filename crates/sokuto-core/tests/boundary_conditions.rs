@@ -492,4 +492,45 @@ mod deterministic_and_contract {
         assert!(ans_noul.as_noul().unwrap() > 0.99);
         assert!(ans_noul.effective_confidence() > 0.98);
     }
+
+    #[test]
+    fn test_noul_bias_backward_compatibility_and_suppression() {
+        // 1. noul_bias フィールドが存在しないレガシー JSON からのデシリアライズ後方互換性
+        let legacy_json = r#"{
+            "version": "1.0",
+            "default_temperature": 1.0,
+            "temperature_map": {
+                "choice": {},
+                "score": {},
+                "noul": 1.0
+            }
+        }"#;
+        let config_legacy = CalibrationConfig::from_json_str(legacy_json).unwrap();
+        assert_eq!(config_legacy.get_noul_bias(), 0.0);
+
+        let q_noul = Question::new_noul("この言明は妥当か？");
+        let ans_unbiased = evaluate_question(&q_noul, &[2.0, 1.0], &config_legacy).unwrap();
+
+        // 2. noul_bias が設定された場合、肯定過信バイアスが抑制されること
+        let biased_json = r#"{
+            "version": "1.0",
+            "default_temperature": 1.0,
+            "temperature_map": {
+                "choice": {},
+                "score": {},
+                "noul": 1.0,
+                "noul_bias": 1.0
+            }
+        }"#;
+        let config_biased = CalibrationConfig::from_json_str(biased_json).unwrap();
+        assert_eq!(config_biased.get_noul_bias(), 1.0);
+
+        let ans_biased = evaluate_question(&q_noul, &[2.0, 1.0], &config_biased).unwrap();
+        // logit_diff = 2.0 - 1.0 = 1.0
+        // unbiased: (1.0 - 0.0) / 1.0 = 1.0 -> prob = sigmoid(1.0) ≈ 0.731
+        // biased:   (1.0 - 1.0) / 1.0 = 0.0 -> prob = sigmoid(0.0) = 0.5
+        assert!((ans_unbiased.as_noul().unwrap() - 0.7310585786300049).abs() < 1e-6);
+        assert!((ans_biased.as_noul().unwrap() - 0.5).abs() < 1e-6);
+        assert!(ans_biased.as_noul().unwrap() < ans_unbiased.as_noul().unwrap());
+    }
 }

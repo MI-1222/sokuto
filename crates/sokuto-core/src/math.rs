@@ -918,10 +918,11 @@ pub fn bimodality_coefficient(probabilities: &[f64]) -> Result<f64> {
     bimodality_coefficient_iter(probabilities)
 }
 
-/// Noul 型の言明真実確率値 $P(\text{true}) \in [0.0, 1.0]$ を算出する。
+/// Noul 型の言明真実確率値 $P(\text{true}) \in [0.0, 1.0]$ をロジットバイアス補正項付きで算出する。
 ///
 /// # 概要
-/// - ロジット差分 $x = (z_{\text{true}} - z_{\text{false}}) / \tau_{\text{eff}}$ に対し、
+/// - 肯定過信バイアスを抑制するため、バイアスオフセット $b$ を減算したロジット差分
+///   $x = (z_{\text{true}} - z_{\text{false}} - b) / \tau_{\text{eff}}$ に対し、
 ///   符号分岐型シグモイド $\sigma(x)$ を用いることで指数オーバーフローおよびアンダーフローを完全に排除する。
 /// - $x \ge 0$ のときは $\frac{1}{1 + \exp(-x)}$、$x < 0$ のときは $\frac{\exp(x)}{1 + \exp(x)}$ を計算する。
 ///
@@ -929,14 +930,27 @@ pub fn bimodality_coefficient(probabilities: &[f64]) -> Result<f64> {
 /// - `logit_true`: 真(True)候補の生ロジット。
 /// - `logit_false`: 偽(False)候補の生ロジット。
 /// - `temperature`: 較正温度パラメータ $\tau$。正の有限実数。
+/// - `bias`: 肯定過信バイアス補正オフセット $b$。有限実数。
 ///
 /// # 戻り値
 /// - 成功時は `[0.0, 1.0]` にクランプされた真実確率、不正時は `CoreError::MathError`。
-pub fn noul_probability(logit_true: f64, logit_false: f64, temperature: f64) -> Result<f64> {
+pub fn noul_probability_with_bias(
+    logit_true: f64,
+    logit_false: f64,
+    temperature: f64,
+    bias: f64,
+) -> Result<f64> {
     if !temperature.is_finite() || temperature <= 0.0 {
         return Err(CoreError::MathError {
             question_id: None,
             message: format!("温度パラメータは正の実数である必要があります: {temperature}。"),
+        });
+    }
+
+    if !bias.is_finite() {
+        return Err(CoreError::MathError {
+            question_id: None,
+            message: format!("バイアス補正値は有限実数である必要があります: {bias}。"),
         });
     }
 
@@ -948,7 +962,7 @@ pub fn noul_probability(logit_true: f64, logit_false: f64, temperature: f64) -> 
     }
 
     let effective_tau = temperature.max(1e-4);
-    let diff = (logit_true - logit_false) / effective_tau;
+    let diff = (logit_true - logit_false - bias) / effective_tau;
 
     let prob = if diff >= 0.0 {
         1.0 / (1.0 + (-diff).exp())
@@ -958,6 +972,15 @@ pub fn noul_probability(logit_true: f64, logit_false: f64, temperature: f64) -> 
     };
 
     Ok(prob.clamp(0.0, 1.0))
+}
+
+/// Noul 型の言明真実確率値 $P(\text{true}) \in [0.0, 1.0]$ を算出する。
+///
+/// # 概要
+/// - 内部でバイアス補正 `0.0` を指定して [`noul_probability_with_bias`] を呼び出す。
+#[inline]
+pub fn noul_probability(logit_true: f64, logit_false: f64, temperature: f64) -> Result<f64> {
+    noul_probability_with_bias(logit_true, logit_false, temperature, 0.0)
 }
 
 /// Noul 型の真実確率から、決定の尖り度に基づく正規化確信度 $C_{\text{noul}} \in [0.0, 1.0]$ を算出する。
@@ -1350,6 +1373,23 @@ mod tests {
         assert!(noul_probability(1.0, 0.0, 0.0).is_err());
         assert!(noul_probability(1.0, 0.0, -1.0).is_err());
         assert!(noul_probability(1.0, 0.0, f64::NAN).is_err());
+
+        // バイアス補正付きの検証
+        let prob_no_bias = noul_probability_with_bias(2.0, 1.0, 1.0, 0.0).unwrap();
+        assert_eq!(prob_no_bias, noul_probability(2.0, 1.0, 1.0).unwrap());
+
+        // 正のバイアス (肯定過信の抑制 -> 確率低下)
+        let prob_suppressed = noul_probability_with_bias(2.0, 1.0, 1.0, 0.5).unwrap();
+        assert!(prob_suppressed < prob_no_bias);
+
+        // 負のバイアス (確率上昇)
+        let prob_boosted = noul_probability_with_bias(2.0, 1.0, 1.0, -0.5).unwrap();
+        assert!(prob_boosted > prob_no_bias);
+
+        // 非有限バイアス
+        assert!(noul_probability_with_bias(1.0, 0.0, 1.0, f64::NAN).is_err());
+        assert!(noul_probability_with_bias(1.0, 0.0, 1.0, f64::INFINITY).is_err());
+        assert!(noul_probability_with_bias(1.0, 0.0, 1.0, f64::NEG_INFINITY).is_err());
     }
 
     #[test]

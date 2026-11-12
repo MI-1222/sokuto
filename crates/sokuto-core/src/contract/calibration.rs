@@ -146,6 +146,11 @@ pub struct TemperatureMap {
     /// Noul 型向けの二値判定温度係数(デフォルト: 1.0)。
     #[serde(default = "default_noul_temperature")]
     pub noul: f64,
+
+    /// Noul 型向けのロジットバイアス補正オフセット(デフォルト: 0.0)
+    /// 正値を指定すると肯定過信バイアスを抑制する方向へロジット差分をシフトする。
+    #[serde(default)]
+    pub noul_bias: f64,
 }
 
 fn default_noul_temperature() -> f64 {
@@ -163,7 +168,8 @@ fn validate_temperature(label: &str, temperature: f64) -> Result<()> {
 }
 
 impl TemperatureMap {
-    /// 各プリミティブの温度テーブル内のすべての温度値が正の有限実数であることを検証する。
+    /// 各プリミティブの温度テーブル内のすべての温度値が正の有限実数であり、
+    /// かつ `noul_bias` が有限実数であることを検証する。
     pub fn validate(&self) -> Result<()> {
         for (spec, &temp) in &self.choice {
             validate_temperature(&format!("temperature_map.choice[\"{spec}\"]"), temp)?;
@@ -172,6 +178,14 @@ impl TemperatureMap {
             validate_temperature(&format!("temperature_map.score[\"{spec}\"]"), temp)?;
         }
         validate_temperature("temperature_map.noul", self.noul)?;
+        if !self.noul_bias.is_finite() {
+            return Err(CoreError::InvalidCalibrationConfig {
+                message: format!(
+                    "temperature_map.noul_bias ({}) は有限実数である必要があります。",
+                    self.noul_bias
+                ),
+            });
+        }
         Ok(())
     }
 }
@@ -192,6 +206,7 @@ impl Default for TemperatureMap {
             choice,
             score,
             noul: 1.0,
+            noul_bias: 0.0,
         }
     }
 }
@@ -314,6 +329,12 @@ impl CalibrationConfig {
         }
     }
 
+    /// Noul 型向けのロジットバイアス補正オフセット値を取得する。
+    #[inline]
+    pub fn get_noul_bias(&self) -> f64 {
+        self.temperature_map.noul_bias
+    }
+
     /// バケットマップを走査し、候補数に一致する温度を探索する。
     #[inline]
     fn resolve_bucket(&self, table: &IndexMap<BucketSpec, f64>, count: usize) -> f64 {
@@ -352,6 +373,7 @@ mod tests {
                 choice,
                 score,
                 noul: 0.95,
+                noul_bias: 0.15,
             },
         );
 
@@ -359,7 +381,7 @@ mod tests {
         let loaded = CalibrationConfig::from_json_str(&json).unwrap();
         assert_eq!(config, loaded);
 
-        // 温度取得のテスト
+        // 温度取得およびバイアス取得のテスト
         assert_eq!(loaded.get_temperature(QuestionType::Choice, 2), 1.05);
         assert_eq!(loaded.get_temperature(QuestionType::Choice, 4), 1.15);
         assert_eq!(loaded.get_temperature(QuestionType::Choice, 8), 1.25);
@@ -369,6 +391,7 @@ mod tests {
         assert_eq!(loaded.get_temperature(QuestionType::Score, 7), 1.10);
 
         assert_eq!(loaded.get_temperature(QuestionType::Noul, 1), 0.95);
+        assert_eq!(loaded.get_noul_bias(), 0.15);
 
         // TemperatureMap 内の BucketSpec キーが正しく保持されていることを検証
         assert_eq!(loaded.temperature_map.choice.len(), 4);
@@ -426,6 +449,7 @@ mod tests {
                 choice,
                 score: IndexMap::new(),
                 noul: 1.0,
+                noul_bias: 0.0,
             },
         );
 
@@ -539,7 +563,28 @@ mod tests {
             ));
         }
 
-        // 6. 内包する gating_thresholds が不正な場合も委譲して拒否。
+        // 6. temperature_map.noul_bias が非有限値の場合は拒否、負値やゼロは許容。
+        for bad_bias in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let map = TemperatureMap {
+                noul_bias: bad_bias,
+                ..TemperatureMap::default()
+            };
+            let cfg = CalibrationConfig::default().with_temperature_map(map);
+            assert!(matches!(
+                cfg.validate(),
+                Err(CoreError::InvalidCalibrationConfig { .. })
+            ));
+        }
+        for valid_bias in [0.0, -1.5, 2.0] {
+            let map = TemperatureMap {
+                noul_bias: valid_bias,
+                ..TemperatureMap::default()
+            };
+            let cfg = CalibrationConfig::default().with_temperature_map(map);
+            assert!(cfg.validate().is_ok());
+        }
+
+        // 7. 内包する gating_thresholds が不正な場合も委譲して拒否。
         let bad_gating = GatingThresholds {
             high_threshold: 0.3,
             low_threshold: 0.7,
@@ -551,15 +596,50 @@ mod tests {
             Err(CoreError::InvalidGatingConfig { .. })
         ));
 
-        // 7. from_json_str でのロード時にも不正な温度が即座に拒否されること。
+        // 8. from_json_str でのロード時にも不正な温度が即座に拒否されること。
         let invalid_json_cases = [
             r#"{"version":"1.0","default_temperature":0.0,"temperature_map":{"choice":{},"score":{},"noul":1.0}}"#,
             r#"{"version":"1.0","default_temperature":1.0,"temperature_map":{"choice":{"2":-0.5},"score":{},"noul":1.0}}"#,
             r#"{"version":"1.0","default_temperature":1.0,"temperature_map":{"choice":{},"score":{},"noul":0.0}}"#,
+            r#"{"version":"1.0","default_temperature":1.0,"temperature_map":{"choice":{},"score":{},"noul":1.0,"noul_bias":"invalid"}}"#,
         ];
         for json_str in invalid_json_cases {
             let err = CalibrationConfig::from_json_str(json_str).unwrap_err();
-            assert!(matches!(err, CoreError::InvalidCalibrationConfig { .. }));
+            assert!(
+                matches!(err, CoreError::InvalidCalibrationConfig { .. })
+                    || matches!(err, CoreError::SerializationError { .. })
+            );
         }
+    }
+
+    #[test]
+    fn test_noul_bias_backward_compatibility() {
+        // noul_bias フィールドが存在しないレガシーな calibration.json
+        let legacy_json = r#"{
+            "version": "1.0",
+            "default_temperature": 1.0,
+            "temperature_map": {
+                "choice": {"2": 1.05},
+                "score": {"2-5": 1.00},
+                "noul": 0.95
+            }
+        }"#;
+        let config = CalibrationConfig::from_json_str(legacy_json).unwrap();
+        assert_eq!(config.get_noul_bias(), 0.0);
+        assert_eq!(config.temperature_map.noul, 0.95);
+
+        // noul_bias フィールドが明示的に指定された calibration.json
+        let biased_json = r#"{
+            "version": "1.0",
+            "default_temperature": 1.0,
+            "temperature_map": {
+                "choice": {},
+                "score": {},
+                "noul": 0.95,
+                "noul_bias": 0.35
+            }
+        }"#;
+        let config_biased = CalibrationConfig::from_json_str(biased_json).unwrap();
+        assert_eq!(config_biased.get_noul_bias(), 0.35);
     }
 }

@@ -448,38 +448,10 @@ impl InferenceEngine {
         }
 
         // 各質問の前処理と縮小
-        let mut processed_questions = IndexMap::with_capacity(questions.len());
-        let mut original_keys_map: IndexMap<String, Vec<String>> = IndexMap::new();
-
-        for (q_key, question) in questions {
-            let should_trigger = question.question_type == QuestionType::Choice
-                && question
-                    .criteria
-                    .as_ref()
-                    .and_then(|c| c.as_map())
-                    .map(|map| coarse_config.should_trigger(map.len()))
-                    .unwrap_or(false);
-
-            if should_trigger {
-                let map = question
-                    .criteria
-                    .as_ref()
-                    .and_then(|c| c.as_map())
-                    .expect("should_trigger により Map が保証されている。");
-
-                let original_keys: Vec<String> = map.keys().cloned().collect();
-                let query = format!("State: {}\nInstructions: {}", state, question.instructions);
-
-                let filtered = filter_top_candidates(&query, map, coarse_config, scorer)?;
-                let sub_question =
-                    Question::new_choice(question.instructions.clone(), filtered.selected);
-
-                processed_questions.insert(q_key.clone(), sub_question);
-                original_keys_map.insert(q_key.clone(), original_keys);
-            } else {
-                processed_questions.insert(q_key.clone(), question.clone());
-            }
-        }
+        let PreparedCoarseBatch {
+            processed_questions,
+            original_keys_map,
+        } = prepare_coarse_questions(state, questions, coarse_config, scorer)?;
 
         // バッチ推論を実行 (最大候補数 K_max が縮小された状態で単一フォワードパス)
         let mut answers =
@@ -599,38 +571,10 @@ impl InferenceEngine {
         let effective_chunk_size = chunk_size.max(1);
 
         // 1. 各質問の前処理と粗スクリーニング (Top-M 抽出)
-        let mut processed_questions = IndexMap::with_capacity(questions.len());
-        let mut original_keys_map: IndexMap<String, Vec<String>> = IndexMap::new();
-
-        for (q_key, question) in questions {
-            let should_trigger = question.question_type == QuestionType::Choice
-                && question
-                    .criteria
-                    .as_ref()
-                    .and_then(|c| c.as_map())
-                    .map(|map| coarse_config.should_trigger(map.len()))
-                    .unwrap_or(false);
-
-            if should_trigger {
-                let map = question
-                    .criteria
-                    .as_ref()
-                    .and_then(|c| c.as_map())
-                    .expect("should_trigger により Map が保証されている。");
-
-                let original_keys: Vec<String> = map.keys().cloned().collect();
-                let query = format!("State: {}\nInstructions: {}", state, question.instructions);
-
-                let filtered = filter_top_candidates(&query, map, coarse_config, scorer)?;
-                let sub_question =
-                    Question::new_choice(question.instructions.clone(), filtered.selected);
-
-                processed_questions.insert(q_key.clone(), sub_question);
-                original_keys_map.insert(q_key.clone(), original_keys);
-            } else {
-                processed_questions.insert(q_key.clone(), question.clone());
-            }
-        }
+        let PreparedCoarseBatch {
+            processed_questions,
+            original_keys_map,
+        } = prepare_coarse_questions(state, questions, coarse_config, scorer)?;
 
         // 2. 共通 State を 1 度だけエンコードし全チャンクで再利用
         let state_ids = tokenizer.encode_state(state)?;
@@ -820,6 +764,61 @@ struct BatchEvalContext<'a> {
     state: &'a str,
     calib_config: &'a CalibrationConfig,
     gating_config: Option<&'a GatingConfig>,
+}
+
+/// 粗密探索の前処理結果として、縮小済み質問マップと元候補キー配列マップを保持する。
+struct PreparedCoarseBatch {
+    /// 閾値を超える `Choice` 質問が Top-$M$ 候補に縮小された質問マップ。
+    processed_questions: IndexMap<String, Question>,
+    /// 縮小対象となった質問の元候補キー配列マップ。
+    original_keys_map: IndexMap<String, Vec<String>>,
+}
+
+/// 粗密探索の前処理として、候補数が閾値を超える `Choice` 質問を Top-$M$ 候補へ縮小する。
+///
+/// 縮小対象となった質問については全候補の元キー配列を `original_keys_map` に記録し、
+/// 閾値以下の `Choice` 質問および `Choice` 以外の質問は元の定義のまま保持する。
+///
+/// # 引数
+/// - `state`: 共通文脈テキスト。
+/// - `questions`: 評価対象の質問マップ。
+/// - `coarse_config`: 粗密探索設定。
+/// - `scorer`: 類似度スコアラー実装。
+///
+/// # 戻り値
+/// 縮小済み質問マップと元候補キー配列マップを格納した `PreparedCoarseBatch`。
+fn prepare_coarse_questions<S: CoarseScorer>(
+    state: &str,
+    questions: &IndexMap<String, Question>,
+    coarse_config: &CoarseToFineConfig,
+    scorer: &S,
+) -> Result<PreparedCoarseBatch> {
+    let mut processed_questions = IndexMap::with_capacity(questions.len());
+    let mut original_keys_map: IndexMap<String, Vec<String>> = IndexMap::new();
+
+    for (q_key, question) in questions {
+        if question.question_type == QuestionType::Choice
+            && let Some(map) = question.criteria.as_ref().and_then(|c| c.as_map())
+            && coarse_config.should_trigger(map.len())
+        {
+            let original_keys: Vec<String> = map.keys().cloned().collect();
+            let query = format!("State: {}\nInstructions: {}", state, question.instructions);
+
+            let filtered = filter_top_candidates(&query, map, coarse_config, scorer)?;
+            let sub_question =
+                Question::new_choice(question.instructions.clone(), filtered.selected);
+
+            processed_questions.insert(q_key.clone(), sub_question);
+            original_keys_map.insert(q_key.clone(), original_keys);
+        } else {
+            processed_questions.insert(q_key.clone(), question.clone());
+        }
+    }
+
+    Ok(PreparedCoarseBatch {
+        processed_questions,
+        original_keys_map,
+    })
 }
 
 /// 粗密探索で縮小推論された各質問の結果を全候補空間へ復元し、複合確信度の再計算とゲーティングを適用する。
@@ -1034,5 +1033,92 @@ mod tests {
                 .map(|p| p < 0.05),
             Some(true)
         );
+    }
+
+    #[test]
+    fn test_prepare_coarse_questions_screens_only_large_choice() {
+        struct MockBatchScorer;
+
+        impl CoarseScorer for MockBatchScorer {
+            fn score_candidates(
+                &self,
+                _query: &str,
+                candidates: &IndexMap<String, String>,
+            ) -> Result<Vec<f32>> {
+                Ok(candidates
+                    .keys()
+                    .enumerate()
+                    .map(|(idx, _)| idx as f32)
+                    .collect())
+            }
+        }
+
+        let mut large_criteria = IndexMap::new();
+        large_criteria.insert("c1".to_string(), "候補1".to_string());
+        large_criteria.insert("c2".to_string(), "候補2".to_string());
+        large_criteria.insert("c3".to_string(), "候補3".to_string());
+        large_criteria.insert("c4".to_string(), "候補4".to_string());
+
+        let mut small_criteria = IndexMap::new();
+        small_criteria.insert("s1".to_string(), "小候補1".to_string());
+        small_criteria.insert("s2".to_string(), "小候補2".to_string());
+
+        let mut questions = IndexMap::new();
+        questions.insert(
+            "large".to_string(),
+            Question::new_choice("大候補質問", large_criteria),
+        );
+        questions.insert(
+            "small".to_string(),
+            Question::new_choice("小候補質問", small_criteria),
+        );
+        questions.insert("noul".to_string(), Question::new_noul("真偽質問?"));
+
+        let coarse_config = CoarseToFineConfig {
+            threshold: 3,
+            top_m: 2,
+            preserve_negative: false,
+            negative_keys: vec![],
+        };
+
+        let PreparedCoarseBatch {
+            processed_questions: processed,
+            original_keys_map,
+        } = prepare_coarse_questions("状態テキスト", &questions, &coarse_config, &MockBatchScorer)
+            .unwrap();
+
+        assert_eq!(processed.len(), 3);
+        assert_eq!(original_keys_map.len(), 1);
+        assert_eq!(
+            original_keys_map.get("large").map(|v| v.as_slice()),
+            Some(
+                &[
+                    "c1".to_string(),
+                    "c2".to_string(),
+                    "c3".to_string(),
+                    "c4".to_string()
+                ][..]
+            )
+        );
+
+        let screened_keys: Vec<&String> = processed
+            .get("large")
+            .and_then(|q| q.criteria.as_ref())
+            .and_then(|c| c.as_map())
+            .unwrap()
+            .keys()
+            .collect();
+        assert_eq!(screened_keys, vec!["c3", "c4"]);
+
+        let small_keys: Vec<&String> = processed
+            .get("small")
+            .and_then(|q| q.criteria.as_ref())
+            .and_then(|c| c.as_map())
+            .unwrap()
+            .keys()
+            .collect();
+        assert_eq!(small_keys, vec!["s1", "s2"]);
+        assert!(!original_keys_map.contains_key("small"));
+        assert!(!original_keys_map.contains_key("noul"));
     }
 }

@@ -202,6 +202,18 @@ impl InferenceEngine {
         self.sessions.len()
     }
 
+    /// 推論を呼び出さないユニットテスト用の空エンジンを生成する。
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            sessions: Vec::new(),
+            next_session_idx: AtomicUsize::new(0),
+            active_provider: ExecutionProvider::CPU,
+            input_names: Vec::new(),
+            output_names: Vec::new(),
+        }
+    }
+
     /// 平坦化された生テンソルスライスを受け取り、推論を実行してロジットを返却する。
     ///
     /// # 引数

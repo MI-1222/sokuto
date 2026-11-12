@@ -144,7 +144,10 @@ impl InProcessDagExecutor {
         let mut escalation_prompt = None;
         let mut escalation_gating = None;
 
-        while step_count < self.max_steps {
+        loop {
+            if step_count >= self.max_steps {
+                return Err(DagError::StepLimitExceeded(self.max_steps));
+            }
             step_count += 1;
             let node = dag
                 .nodes
@@ -373,10 +376,6 @@ impl InProcessDagExecutor {
                     break;
                 }
             }
-        }
-
-        if step_count >= self.max_steps {
-            return Err(DagError::StepLimitExceeded(self.max_steps));
         }
 
         Ok(DagExecutionResult {
@@ -1238,5 +1237,129 @@ mod tests {
             &mut unchanged,
         );
         assert_eq!(unchanged.as_ref().and_then(|a| a.as_noul()), Some(0.80));
+    }
+
+    /// 指定ステップ数を持つ直列 Branch/Escalate DAG を生成するテスト用ヘルパー。
+    fn build_linear_control_dag(num_steps: usize, terminate_with_escalate: bool) -> DagDefinition {
+        use crate::dag::schema::DagNode;
+
+        let mut nodes = IndexMap::new();
+        for i in 0..num_steps {
+            let is_last = i + 1 == num_steps;
+            let node_id = format!("step_{i}");
+            let node = if is_last && terminate_with_escalate {
+                DagNode {
+                    node_type: DagNodeType::Escalate,
+                    question: None,
+                    conditions: Vec::new(),
+                    parallel_nodes: Vec::new(),
+                    join_node: None,
+                    reason: Some("テスト終端エスカレーション。".to_string()),
+                }
+            } else {
+                let conditions = if is_last {
+                    Vec::new()
+                } else {
+                    vec![NodeCondition {
+                        field: "confidence".to_string(),
+                        op: NodeConditionOp::ConfidenceGte,
+                        value: Some(serde_json::json!(0.0)),
+                        target_node: format!("step_{}", i + 1),
+                    }]
+                };
+                DagNode {
+                    node_type: DagNodeType::Branch,
+                    question: None,
+                    conditions,
+                    parallel_nodes: Vec::new(),
+                    join_node: None,
+                    reason: None,
+                }
+            };
+            nodes.insert(node_id, node);
+        }
+
+        DagDefinition {
+            dag_id: "max_steps_boundary_dag".to_string(),
+            timeout_ms: 500,
+            entry_node: "step_0".to_string(),
+            nodes,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_dag_max_steps_exact_boundary_succeeds() {
+        let engine = Arc::new(InferenceEngine::empty_for_test());
+        let tokenizer = Arc::new(JevTokenizer::empty_for_test());
+        let calib = CalibrationConfig::default();
+
+        // 1. max_steps = 1 の単一 Branch ノード DAG (next_node == None で正常終了)
+        let executor_1 =
+            InProcessDagExecutor::new(engine.clone(), tokenizer.clone(), calib.clone())
+                .with_max_steps(1);
+        let dag_single_branch = build_linear_control_dag(1, false);
+        let res_branch = executor_1
+            .execute("state", &dag_single_branch)
+            .await
+            .expect("max_steps = 1 で単一 Branch ノードの DAG は正常終了すること。");
+        assert_eq!(res_branch.execution_path, vec!["step_0"]);
+        assert!(!res_branch.escalated);
+
+        // 2. max_steps = 1 の単一 Escalate ノード DAG (Escalate の break で正常終了)
+        let dag_single_escalate = build_linear_control_dag(1, true);
+        let res_escalate = executor_1
+            .execute("state", &dag_single_escalate)
+            .await
+            .expect("max_steps = 1 で単一 Escalate ノードの DAG は正常終了すること。");
+        assert_eq!(res_escalate.execution_path, vec!["step_0"]);
+        assert!(res_escalate.escalated);
+
+        // 3. max_steps = 2 でちょうど 2 ステップ目に終端する DAG も正常終了すること
+        let executor_2 = InProcessDagExecutor::new(engine, tokenizer, calib).with_max_steps(2);
+        let dag_two_steps = build_linear_control_dag(2, true);
+        let res_two = executor_2
+            .execute("state", &dag_two_steps)
+            .await
+            .expect("ちょうど max_steps ステップ目で正常終了する DAG は成功すること。");
+        assert_eq!(res_two.execution_path, vec!["step_0", "step_1"]);
+        assert!(res_two.escalated);
+    }
+
+    #[tokio::test]
+    async fn test_run_dag_max_steps_exceeded_fails() {
+        let engine = Arc::new(InferenceEngine::empty_for_test());
+        let tokenizer = Arc::new(JevTokenizer::empty_for_test());
+        let calib = CalibrationConfig::default();
+
+        // 1. max_steps = 1 に対して 2 ステップ以上必要な DAG は上限超過エラーになること
+        let executor_1 =
+            InProcessDagExecutor::new(engine.clone(), tokenizer.clone(), calib.clone())
+                .with_max_steps(1);
+        let dag_two_steps = build_linear_control_dag(2, false);
+        let err_1 = executor_1
+            .execute("state", &dag_two_steps)
+            .await
+            .expect_err("max_steps = 1 を超えて 2 ステップ目へ遷移する場合はエラーになること。");
+        assert!(matches!(err_1, DagError::StepLimitExceeded(1)));
+
+        // 2. max_steps = 2 に対して 3 ステップ必要な DAG は上限超過エラーになること
+        let executor_2 =
+            InProcessDagExecutor::new(engine.clone(), tokenizer.clone(), calib.clone())
+                .with_max_steps(2);
+        let dag_three_steps = build_linear_control_dag(3, false);
+        let err_2 = executor_2
+            .execute("state", &dag_three_steps)
+            .await
+            .expect_err("max_steps = 2 を超えて 3 ステップ目へ遷移する場合はエラーになること。");
+        assert!(matches!(err_2, DagError::StepLimitExceeded(2)));
+
+        // 3. max_steps = 0 は 1 ステップ目に入る前に上限超過エラーになること
+        let executor_0 = InProcessDagExecutor::new(engine, tokenizer, calib).with_max_steps(0);
+        let dag_one_step = build_linear_control_dag(1, false);
+        let err_0 = executor_0
+            .execute("state", &dag_one_step)
+            .await
+            .expect_err("max_steps = 0 は 1 ステップも実行できずエラーになること。");
+        assert!(matches!(err_0, DagError::StepLimitExceeded(0)));
     }
 }

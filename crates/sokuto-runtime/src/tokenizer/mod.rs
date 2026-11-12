@@ -181,6 +181,21 @@ impl JevTokenizer {
         &self.inner
     }
 
+    /// トークナイズを呼び出さないユニットテスト用のダミートークナイザーを生成する。
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        let word_level = tokenizers::models::wordlevel::WordLevel::default();
+        Self {
+            inner: tokenizers::Tokenizer::new(word_level),
+            op_token_id: 0,
+            pad_token_id: None,
+            leading_special_tokens: Vec::new(),
+            trailing_special_tokens: Vec::new(),
+            state_prefix_tokens: Vec::new(),
+            max_sequence_length: MAX_SEQUENCE_LENGTH,
+        }
+    }
+
     /// 文字列を特殊トークン付加なしでエンコードする。
     fn encode_text(&self, text: &str) -> Result<Vec<u32>> {
         let encoding = self

@@ -402,6 +402,10 @@ pub struct FilteredCandidates {
 /// - `candidates`: 全候補の順序付きマップ。
 /// - `config`: 粗密探索設定。
 /// - `scorer`: 類似度スコアラー。
+///
+/// # エラー
+/// - `scorer.score_candidates` が失敗した場合。
+/// - `scorer.score_candidates` が返却したスコア数と評価対象候補数が一致しない場合は `RuntimeError::InvalidTensorData`。
 pub fn filter_top_candidates(
     query: &str,
     candidates: &IndexMap<String, String>,
@@ -450,6 +454,13 @@ pub fn filter_top_candidates(
         }
 
         let scores = scorer.score_candidates(query, &unpinned_map)?;
+        if scores.len() != candidate_entries.len() {
+            return Err(RuntimeError::InvalidTensorData(format!(
+                "CoarseScorer の返却スコア数不一致: 期待値={}, 実際={}",
+                candidate_entries.len(),
+                scores.len()
+            )));
+        }
 
         // (score, orig_idx) のリストを作成
         let mut scored_items: Vec<(f32, usize)> = candidate_entries
@@ -861,5 +872,52 @@ mod tests {
             vec!["1".to_string(), "2".to_string(), "3".to_string()],
         );
         assert!(!config.is_applicable(&q_score));
+    }
+
+    #[test]
+    fn test_filter_top_candidates_rejects_scorer_length_mismatch() {
+        struct MismatchScorer {
+            scores: Vec<f32>,
+        }
+
+        impl CoarseScorer for MismatchScorer {
+            fn score_candidates(
+                &self,
+                _query: &str,
+                _candidates: &IndexMap<String, String>,
+            ) -> Result<Vec<f32>> {
+                Ok(self.scores.clone())
+            }
+        }
+
+        let mut candidates = IndexMap::new();
+        for i in 0..5 {
+            candidates.insert(format!("cand_{i}"), format!("候補 {i}"));
+        }
+
+        let config = CoarseToFineConfig {
+            threshold: 2,
+            top_m: 3,
+            preserve_negative: false,
+            negative_keys: Vec::new(),
+        };
+
+        // 1. 短いスライス (空および不足) を返却した場合はエラーとなること
+        for short_scores in [Vec::new(), vec![0.9, 0.8, 0.7]] {
+            let scorer = MismatchScorer {
+                scores: short_scores,
+            };
+            let err = filter_top_candidates("クエリ", &candidates, &config, &scorer)
+                .expect_err("スコア数不足時は InvalidTensorData エラーとなること。");
+            assert!(matches!(err, RuntimeError::InvalidTensorData(_)));
+        }
+
+        // 2. 過剰な要素数のスライスを返却した場合もエラーとなること
+        let long_scorer = MismatchScorer {
+            scores: vec![0.5; 6],
+        };
+        let err_long = filter_top_candidates("クエリ", &candidates, &config, &long_scorer)
+            .expect_err("スコア数超過時も InvalidTensorData エラーとなること。");
+        assert!(matches!(err_long, RuntimeError::InvalidTensorData(_)));
     }
 }

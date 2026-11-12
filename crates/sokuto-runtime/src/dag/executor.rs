@@ -559,17 +559,22 @@ fn matches_confidence(cond: &NodeCondition, answer: Option<&Answer>) -> bool {
 }
 
 /// `route` (ゲーティングルート) フィールドの一致比較を評価する。
+///
+/// `answer` または `answer.gating` が `None` の場合 (未推論状態またはゲーティング無効時)、
+/// および比較対象値が文字列でない場合は `false` を返す。
 fn matches_route(cond: &NodeCondition, answer: Option<&Answer>) -> bool {
-    let route_str = answer
-        .and_then(|a| a.gating.as_ref())
-        .map(|g| match g.route {
-            DecisionRoute::AutoExecute => "auto_execute",
-            DecisionRoute::ConfirmOrEscalate => "confirm_or_escalate",
-            DecisionRoute::Fallback => "fallback",
-        })
-        .unwrap_or("auto_execute");
+    let Some(gating) = answer.and_then(|a| a.gating.as_ref()) else {
+        return false;
+    };
+    let Some(target_str) = cond.value.as_ref().and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let route_str = match gating.route {
+        DecisionRoute::AutoExecute => "auto_execute",
+        DecisionRoute::ConfirmOrEscalate => "confirm_or_escalate",
+        DecisionRoute::Fallback => "fallback",
+    };
 
-    let target_str = cond.value.as_ref().and_then(|v| v.as_str()).unwrap_or("");
     match cond.op {
         NodeConditionOp::Eq => route_str == target_str,
         NodeConditionOp::Neq => route_str != target_str,
@@ -962,6 +967,88 @@ mod tests {
         assert_eq!(
             evaluate_conditions(&conditions[3..], Some(&ans), &context),
             Some("card_issue".to_string())
+        );
+    }
+
+    #[test]
+    fn test_matches_route_does_not_default_to_auto_execute_when_missing() {
+        let context = IndexMap::new();
+        let route_conditions = vec![
+            NodeCondition {
+                field: "route".to_string(),
+                op: NodeConditionOp::Eq,
+                value: Some(serde_json::json!("auto_execute")),
+                target_node: "auto_node".to_string(),
+            },
+            NodeCondition {
+                field: "route".to_string(),
+                op: NodeConditionOp::Neq,
+                value: Some(serde_json::json!("auto_execute")),
+                target_node: "non_auto_node".to_string(),
+            },
+            NodeCondition {
+                field: "route".to_string(),
+                op: NodeConditionOp::Neq,
+                value: Some(serde_json::json!("fallback")),
+                target_node: "non_fallback_node".to_string(),
+            },
+        ];
+
+        // 1. answer が None (未推論状態) の場合、Eq/Neq ともに "auto_execute" へフォールバックせず false となること。
+        assert_eq!(evaluate_conditions(&route_conditions, None, &context), None);
+
+        // 2. answer.gating が None (ゲーティング無効時) の場合も同様に false となること。
+        let ungated_answer = Answer::choice("transfer", IndexMap::new(), 0.30);
+        assert_eq!(
+            evaluate_conditions(&route_conditions, Some(&ungated_answer), &context),
+            None
+        );
+
+        // 3. gating が付与されている場合は通常どおり評価されること。
+        let auto_gating = sokuto_core::gating::GatingMetadata {
+            route: DecisionRoute::AutoExecute,
+            confidence: 0.95,
+            entropy: None,
+            margin: None,
+            energy: None,
+            is_ood: false,
+            reason: "high_conf".to_string(),
+            escalation: None,
+        };
+        let auto_answer =
+            Answer::choice("transfer", IndexMap::new(), 0.95).with_gating(auto_gating);
+        assert_eq!(
+            evaluate_conditions(&route_conditions, Some(&auto_answer), &context),
+            Some("auto_node".to_string())
+        );
+
+        let fallback_gating = sokuto_core::gating::GatingMetadata {
+            route: DecisionRoute::Fallback,
+            confidence: 0.20,
+            entropy: None,
+            margin: None,
+            energy: None,
+            is_ood: true,
+            reason: "ood".to_string(),
+            escalation: None,
+        };
+        let fallback_answer =
+            Answer::choice("transfer", IndexMap::new(), 0.20).with_gating(fallback_gating);
+        assert_eq!(
+            evaluate_conditions(&route_conditions, Some(&fallback_answer), &context),
+            Some("non_auto_node".to_string())
+        );
+
+        // 4. 比較値が非文字列または None の場合は Neq でも誤マッチしないこと。
+        let invalid_value_conds = vec![NodeCondition {
+            field: "route".to_string(),
+            op: NodeConditionOp::Neq,
+            value: None,
+            target_node: "should_not_match".to_string(),
+        }];
+        assert_eq!(
+            evaluate_conditions(&invalid_value_conds, Some(&auto_answer), &context),
+            None
         );
     }
 

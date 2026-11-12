@@ -88,7 +88,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Arc::new(CalibrationConfig::default())
     };
 
+    let gating_config = calib_config.gating_config();
+
     let state = AppState::new(engine, tokenizer, calib_config)
+        .with_gating_config(gating_config)
+        .load_hierarchical_mapping_from_dir(&model_dir)
         .init_dual_engine_from_dir(&model_dir, session_config);
 
     let state = Arc::new(state);

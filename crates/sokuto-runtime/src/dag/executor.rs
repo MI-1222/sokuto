@@ -544,6 +544,24 @@ fn matches_confidence(cond: &NodeCondition, answer: Option<&Answer>) -> bool {
     normalized_op.eval_f64(conf, target_val)
 }
 
+/// 文字列値に対する `Eq` / `Neq` 条件を評価する。
+///
+/// 比較対象値が文字列でない場合 (欠損値 `None` や数値・真偽値・配列等) は `false` を返す。
+fn matches_str_eq_neq(
+    op: NodeConditionOp,
+    actual: &str,
+    value: Option<&serde_json::Value>,
+) -> bool {
+    let Some(target_str) = value.and_then(|v| v.as_str()) else {
+        return false;
+    };
+    match op {
+        NodeConditionOp::Eq => actual == target_str,
+        NodeConditionOp::Neq => actual != target_str,
+        _ => false,
+    }
+}
+
 /// `route` (ゲーティングルート) フィールドの一致比較を評価する。
 ///
 /// `answer` または `answer.gating` が `None` の場合 (未推論状態またはゲーティング無効時)、
@@ -552,20 +570,13 @@ fn matches_route(cond: &NodeCondition, answer: Option<&Answer>) -> bool {
     let Some(gating) = answer.and_then(|a| a.gating.as_ref()) else {
         return false;
     };
-    let Some(target_str) = cond.value.as_ref().and_then(|v| v.as_str()) else {
-        return false;
-    };
     let route_str = match gating.route {
         DecisionRoute::AutoExecute => "auto_execute",
         DecisionRoute::ConfirmOrEscalate => "confirm_or_escalate",
         DecisionRoute::Fallback => "fallback",
     };
 
-    match cond.op {
-        NodeConditionOp::Eq => route_str == target_str,
-        NodeConditionOp::Neq => route_str != target_str,
-        _ => false,
-    }
+    matches_str_eq_neq(cond.op, route_str, cond.value.as_ref())
 }
 
 /// `answer` / `value` フィールドに対する型別 (Noul / Choice / Score) 条件評価を行う。
@@ -608,15 +619,12 @@ fn matches_noul_value(cond: &NodeCondition, noul_val: f64) -> bool {
 }
 
 /// Choice 判定の選択キーに対する文字列比較および集合包含 (`In`) 比較を評価する。
+///
+/// `Eq` / `Neq` で比較対象値が文字列でない場合 (欠損値 `None` や数値・真偽値等) は `false` を返す。
 fn matches_choice_value(cond: &NodeCondition, choice_val: &str) -> bool {
     match cond.op {
-        NodeConditionOp::Eq => {
-            let target_str = cond.value.as_ref().and_then(|v| v.as_str()).unwrap_or("");
-            choice_val == target_str
-        }
-        NodeConditionOp::Neq => {
-            let target_str = cond.value.as_ref().and_then(|v| v.as_str()).unwrap_or("");
-            choice_val != target_str
+        NodeConditionOp::Eq | NodeConditionOp::Neq => {
+            matches_str_eq_neq(cond.op, choice_val, cond.value.as_ref())
         }
         NodeConditionOp::In => cond
             .value
@@ -673,7 +681,7 @@ fn matches_context_property(
                 Some(serde_json::Value::Bool(true)) => ctx_val.value == "true",
                 Some(serde_json::Value::Bool(false)) => ctx_val.value == "false",
                 Some(serde_json::Value::Number(n)) => eq_display(&ctx_val.value, n),
-                _ => ctx_val.value.is_empty(),
+                _ => return false,
             };
             match cond.op {
                 NodeConditionOp::Eq => is_eq,
@@ -1361,5 +1369,86 @@ mod tests {
             .await
             .expect_err("max_steps = 0 は 1 ステップも実行できずエラーになること。");
         assert!(matches!(err_0, DagError::StepLimitExceeded(0)));
+    }
+
+    #[test]
+    fn test_matches_choice_and_context_rejects_missing_or_incompatible_values() {
+        let mut context = IndexMap::new();
+        context.insert("label".to_string(), NodeContextValue::new("transfer", 0.95));
+        context.insert("empty_label".to_string(), NodeContextValue::new("", 0.95));
+
+        let choice_transfer = Answer::choice("transfer", IndexMap::new(), 0.95);
+        let choice_empty = Answer::choice("", IndexMap::new(), 0.95);
+
+        let incompatible_choice_values = vec![
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(123)),
+            Some(serde_json::json!(true)),
+            Some(serde_json::json!(["transfer"])),
+            Some(serde_json::json!({"key": "transfer"})),
+        ];
+
+        // 1. Choice の Eq / Neq は欠損値・非文字列に対して常に false となること
+        for val in incompatible_choice_values {
+            for op in [NodeConditionOp::Eq, NodeConditionOp::Neq] {
+                let conds = vec![NodeCondition {
+                    field: "answer".to_string(),
+                    op,
+                    value: val.clone(),
+                    target_node: "should_not_match".to_string(),
+                }];
+                assert_eq!(
+                    evaluate_conditions(&conds, Some(&choice_transfer), &context),
+                    None,
+                    "Choice(transfer) に対する非互換値 {val:?} ({op:?}) が誤マッチしてはならない。"
+                );
+                assert_eq!(
+                    evaluate_conditions(&conds, Some(&choice_empty), &context),
+                    None,
+                    "Choice('') に対する非互換値 {val:?} ({op:?}) が誤マッチしてはならない。"
+                );
+            }
+        }
+
+        // 通常の文字列 Eq / Neq は期待どおり動作すること
+        assert_eq!(
+            evaluate_conditions(
+                &[NodeCondition {
+                    field: "answer".to_string(),
+                    op: NodeConditionOp::Neq,
+                    value: Some(serde_json::json!("card")),
+                    target_node: "not_card".to_string(),
+                }],
+                Some(&choice_transfer),
+                &context,
+            ),
+            Some("not_card".to_string())
+        );
+
+        // 2. ContextProp::Value の Eq / Neq は None / Null / Array / Object に対して常に false となること
+        let incompatible_context_values = vec![
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(["transfer"])),
+            Some(serde_json::json!({"key": "transfer"})),
+        ];
+        for val in incompatible_context_values {
+            for field in ["label.value", "empty_label.value"] {
+                for op in [NodeConditionOp::Eq, NodeConditionOp::Neq] {
+                    let conds = vec![NodeCondition {
+                        field: field.to_string(),
+                        op,
+                        value: val.clone(),
+                        target_node: "should_not_match".to_string(),
+                    }];
+                    assert_eq!(
+                        evaluate_conditions(&conds, None, &context),
+                        None,
+                        "{field} に対する非互換値 {val:?} ({op:?}) が誤マッチしてはならない。"
+                    );
+                }
+            }
+        }
     }
 }

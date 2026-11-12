@@ -238,11 +238,7 @@ pub fn validate_dag(dag: &DagDefinition) -> Result<(), DagValidationError> {
         .collect();
 
     if !unreachable.is_empty() {
-        tracing::warn!(
-            "DAG '{}' にエントリノードから到達不能な孤立ノードが検出されました: {:?}",
-            dag.dag_id,
-            unreachable
-        );
+        return Err(DagValidationError::UnreachableNodes(unreachable));
     }
 
     Ok(())
@@ -375,5 +371,96 @@ mod tests {
             res,
             Err(DagValidationError::TargetNodeNotFound { .. })
         ));
+    }
+
+    #[test]
+    fn test_unreachable_nodes_rejected() {
+        let mut nodes = IndexMap::new();
+        nodes.insert(
+            "entry".to_string(),
+            DagNode {
+                node_type: DagNodeType::Branch,
+                question: None,
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: Some("終端".to_string()),
+            },
+        );
+        nodes.insert(
+            "orphan".to_string(),
+            DagNode {
+                node_type: DagNodeType::Escalate,
+                question: None,
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: Some("孤立ノード".to_string()),
+            },
+        );
+
+        let dag = DagDefinition {
+            dag_id: "unreachable_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "entry".to_string(),
+            nodes,
+        };
+
+        let res = validate_dag(&dag);
+        assert_eq!(
+            res,
+            Err(DagValidationError::UnreachableNodes(vec![
+                "orphan".to_string()
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_parallel_dag_reachability_valid() {
+        let mut nodes = IndexMap::new();
+        nodes.insert(
+            "parallel_entry".to_string(),
+            DagNode {
+                node_type: DagNodeType::Parallel,
+                question: None,
+                conditions: Vec::new(),
+                parallel_nodes: vec!["p1".to_string(), "p2".to_string()],
+                join_node: Some("join".to_string()),
+                reason: None,
+            },
+        );
+        for id in ["p1", "p2"] {
+            nodes.insert(
+                id.to_string(),
+                DagNode {
+                    node_type: DagNodeType::Inference,
+                    question: Some(Question::new_noul(format!("質問 {id}"))),
+                    conditions: Vec::new(),
+                    parallel_nodes: Vec::new(),
+                    join_node: None,
+                    reason: None,
+                },
+            );
+        }
+        nodes.insert(
+            "join".to_string(),
+            DagNode {
+                node_type: DagNodeType::Branch,
+                question: None,
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: Some("合流終端".to_string()),
+            },
+        );
+
+        let dag = DagDefinition {
+            dag_id: "parallel_valid_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "parallel_entry".to_string(),
+            nodes,
+        };
+
+        assert!(validate_dag(&dag).is_ok());
     }
 }

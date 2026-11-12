@@ -5,6 +5,7 @@
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use sokuto_core::gating::DecisionRoute;
 use sokuto_core::schema::{Answer, Question};
 
 /// 宣言的 DAG 定義構造体。
@@ -210,6 +211,17 @@ impl NodeCondition {
         }
     }
 
+    /// ルート比較用の有効な識別子を抽出し、型安全な `DecisionRoute` に変換する。
+    pub fn route_value_as_decision_route(&self) -> Option<DecisionRoute> {
+        let s = self.value.as_ref()?.as_str()?;
+        match s {
+            "auto_execute" => Some(DecisionRoute::AutoExecute),
+            "confirm_or_escalate" => Some(DecisionRoute::ConfirmOrEscalate),
+            "fallback" => Some(DecisionRoute::Fallback),
+            _ => None,
+        }
+    }
+
     /// 自身を事前パース・型解決済みの `CompiledCondition` へ変換する。
     pub fn compile(&self) -> Option<CompiledCondition> {
         CompiledCondition::from_node_condition(self)
@@ -288,6 +300,104 @@ impl NodeConditionOp {
             other => Some(other),
         }
     }
+
+    /// 等価専用演算子への変換を試みる。
+    ///
+    /// `Eq` または `Neq` の場合は `Some` を返し、大小比較や集合演算子等の無効な組み合わせは `None` を返す。
+    #[inline]
+    pub fn to_equality(self) -> Option<EqualityOp> {
+        match self {
+            Self::Eq => Some(EqualityOp::Eq),
+            Self::Neq => Some(EqualityOp::Neq),
+            _ => None,
+        }
+    }
+
+    /// 数値・順序比較演算子への変換を試みる。
+    ///
+    /// 確信度エイリアス (`ConfidenceGte`, `ConfidenceLt`) は正規化され、
+    /// 集合演算子 (`In`) は数値比較に不適合なため `None` を返す。
+    #[inline]
+    pub fn to_comparison(self) -> Option<ComparisonOp> {
+        match self {
+            Self::Eq => Some(ComparisonOp::Eq),
+            Self::Neq => Some(ComparisonOp::Neq),
+            Self::Gt => Some(ComparisonOp::Gt),
+            Self::Gte | Self::ConfidenceGte => Some(ComparisonOp::Gte),
+            Self::Lt | Self::ConfidenceLt => Some(ComparisonOp::Lt),
+            Self::Lte => Some(ComparisonOp::Lte),
+            Self::In => None,
+        }
+    }
+}
+
+/// 等価・不等価比較専用の演算子。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EqualityOp {
+    /// 等価 (`==`)。
+    Eq,
+    /// 不等価 (`!=`)。
+    Neq,
+}
+
+impl EqualityOp {
+    /// 浮動小数点数比較で用いる許容誤差イプシロン。
+    const FLOAT_EPSILON: f64 = 1e-6;
+
+    /// 2 つの等価比較可能な値が条件を満たすかを判定する。
+    #[inline]
+    pub fn matches<T: PartialEq + ?Sized>(self, lhs: &T, rhs: &T) -> bool {
+        match self {
+            Self::Eq => lhs == rhs,
+            Self::Neq => lhs != rhs,
+        }
+    }
+
+    /// 2 つの有限浮動小数点数を許容誤差 (`1e-6`) 付きで等価比較する。
+    #[inline]
+    pub fn eval_f64(self, lhs: f64, rhs: f64) -> bool {
+        match self {
+            Self::Eq => (lhs - rhs).abs() < Self::FLOAT_EPSILON,
+            Self::Neq => (lhs - rhs).abs() >= Self::FLOAT_EPSILON,
+        }
+    }
+}
+
+/// 数値・順序比較演算子。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonOp {
+    /// 等価 (`==`)。
+    Eq,
+    /// 不等価 (`!=`)。
+    Neq,
+    /// より大きい (`>`)。
+    Gt,
+    /// 以上 (`>=`)。
+    Gte,
+    /// より小さい (`<`)。
+    Lt,
+    /// 以下 (`<=`)。
+    Lte,
+}
+
+impl ComparisonOp {
+    /// 浮動小数点数比較で用いる許容誤差イプシロン。
+    const FLOAT_EPSILON: f64 = 1e-6;
+
+    /// 2 つの有限浮動小数点数を演算子のセマンティクスに従って許容誤差 (`1e-6`) 付きで比較する。
+    #[inline]
+    pub fn eval_f64(self, lhs: f64, rhs: f64) -> bool {
+        match self {
+            Self::Eq => (lhs - rhs).abs() < Self::FLOAT_EPSILON,
+            Self::Neq => (lhs - rhs).abs() >= Self::FLOAT_EPSILON,
+            Self::Gt => lhs > rhs + Self::FLOAT_EPSILON,
+            Self::Gte => lhs >= rhs - Self::FLOAT_EPSILON,
+            Self::Lt => lhs < rhs - Self::FLOAT_EPSILON,
+            Self::Lte => lhs <= rhs + Self::FLOAT_EPSILON,
+        }
+    }
 }
 
 /// コンテキストノード参照 (`node_id.prop`) で参照可能なプロパティ種別。
@@ -341,12 +451,12 @@ impl<'a> ConditionField<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompiledAnswerPredicate {
     /// Noul または汎用真偽値判定 (実効確率 >= 0.5 の真偽判定)。
-    Bool { op: NodeConditionOp, expected: bool },
+    Bool { op: EqualityOp, expected: bool },
     /// 数値閾値判定 (Score または Noul 連続確率)。
-    Numeric { op: NodeConditionOp, threshold: f64 },
+    Numeric { op: ComparisonOp, threshold: f64 },
     /// 文字列一致判定 (Choice) または文字列/真偽値/数値文字列の等価判定。
     String {
-        op: NodeConditionOp,
+        op: EqualityOp,
         expected: String,
         /// もし数値としても解釈可能なら事前パースした有限 f64。
         as_f64: Option<f64>,
@@ -364,11 +474,7 @@ impl CompiledAnswerPredicate {
             Self::Bool { op, expected } => {
                 if let Some(noul_val) = ans.as_noul() {
                     let is_true = noul_val >= 0.5;
-                    match op {
-                        NodeConditionOp::Eq => is_true == *expected,
-                        NodeConditionOp::Neq => is_true != *expected,
-                        _ => false,
-                    }
+                    op.matches(&is_true, expected)
                 } else {
                     false
                 }
@@ -391,11 +497,7 @@ impl CompiledAnswerPredicate {
                 if let Some(noul_val) = ans.as_noul() {
                     if let Some(tb) = as_bool {
                         let is_true = noul_val >= 0.5;
-                        return match op {
-                            NodeConditionOp::Eq => is_true == *tb,
-                            NodeConditionOp::Neq => is_true != *tb,
-                            _ => false,
-                        };
+                        return op.matches(&is_true, tb);
                     }
                     if let Some(num) = as_f64 {
                         return op.eval_f64(noul_val, *num);
@@ -403,11 +505,7 @@ impl CompiledAnswerPredicate {
                     return false;
                 }
                 if let Some(choice_val) = ans.as_choice() {
-                    return match op {
-                        NodeConditionOp::Eq => choice_val == expected,
-                        NodeConditionOp::Neq => choice_val != expected,
-                        _ => false,
-                    };
+                    return op.matches(choice_val, expected);
                 }
                 if let Some(score_val) = ans.as_score() {
                     if let Some(num) = as_f64 {
@@ -442,19 +540,28 @@ impl CompiledAnswerPredicate {
             }
             Some(Self::In { candidates })
         } else if let Some(b) = cond.value.as_ref().and_then(|v| v.as_bool()) {
-            Some(Self::Bool {
-                op: cond.op,
-                expected: b,
+            let op = cond.op.to_equality()?;
+            Some(Self::Bool { op, expected: b })
+        } else if let Some(comp_op) = cond.op.to_comparison().filter(|o| {
+            matches!(
+                o,
+                ComparisonOp::Gt | ComparisonOp::Gte | ComparisonOp::Lt | ComparisonOp::Lte
+            )
+        }) {
+            // 大小比較の場合は数値として解釈 (数値リテラルまたは数値文字列)
+            let threshold = cond.value_as_f64()?;
+            Some(Self::Numeric {
+                op: comp_op,
+                threshold,
             })
         } else if let Some(n) = cond.value.as_ref().and_then(|v| v.as_f64()) {
             if !n.is_finite() {
                 return None;
             }
-            Some(Self::Numeric {
-                op: cond.op,
-                threshold: n,
-            })
+            let op = cond.op.to_comparison()?;
+            Some(Self::Numeric { op, threshold: n })
         } else if let Some(s) = cond.value.as_ref().and_then(|v| v.as_str()) {
+            let op = cond.op.to_equality()?;
             let as_bool = match s {
                 "true" => Some(true),
                 "false" => Some(false),
@@ -462,7 +569,7 @@ impl CompiledAnswerPredicate {
             };
             let as_f64 = s.trim().parse::<f64>().ok().filter(|f| f.is_finite());
             Some(Self::String {
-                op: cond.op,
+                op,
                 expected: s.to_string(),
                 as_f64,
                 as_bool,
@@ -477,22 +584,22 @@ impl CompiledAnswerPredicate {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConditionPredicate {
     /// 実効確信度 (`confidence`) に対する数値閾値比較。
-    Confidence { op: NodeConditionOp, threshold: f64 },
+    Confidence { op: ComparisonOp, threshold: f64 },
     /// ゲーティングルート (`route`) に対する等価判定。
     Route {
-        op: NodeConditionOp,
-        expected: String,
+        op: EqualityOp,
+        expected: DecisionRoute,
     },
     /// 先行ノードの回答値コンテキスト (`<node_id>.value` / `<node_id>.answer`) に対する等価判定。
     ContextValue {
         node_id: String,
-        op: NodeConditionOp,
+        op: EqualityOp,
         expected: String,
     },
     /// 先行ノードの確信度コンテキスト (`<node_id>.confidence`) に対する数値閾値比較。
     ContextConfidence {
         node_id: String,
-        op: NodeConditionOp,
+        op: ComparisonOp,
         threshold: f64,
     },
     /// 現在のノードの判定結果 (`answer` / `value`) に対する型付き判定。
@@ -507,23 +614,18 @@ impl ConditionPredicate {
         match ConditionField::parse(&cond.field) {
             ConditionField::Confidence => {
                 let threshold = cond.value_as_f64()?;
-                let op = cond.op.normalize_confidence()?;
+                let op = cond.op.to_comparison()?;
                 Some(Self::Confidence { op, threshold })
             }
             ConditionField::Route => {
-                if !matches!(cond.op, NodeConditionOp::Eq | NodeConditionOp::Neq) {
-                    return None;
-                }
-                let expected = cond.route_value_as_str()?.to_string();
-                Some(Self::Route {
-                    op: cond.op,
-                    expected,
-                })
+                let op = cond.op.to_equality()?;
+                let expected = cond.route_value_as_decision_route()?;
+                Some(Self::Route { op, expected })
             }
             ConditionField::ContextProperty { node_id, prop } => match prop {
                 ContextProp::Confidence => {
                     let threshold = cond.value_as_f64()?;
-                    let op = cond.op.normalize_confidence()?;
+                    let op = cond.op.to_comparison()?;
                     Some(Self::ContextConfidence {
                         node_id: node_id.to_string(),
                         op,
@@ -531,13 +633,11 @@ impl ConditionPredicate {
                     })
                 }
                 ContextProp::Value => {
-                    if !matches!(cond.op, NodeConditionOp::Eq | NodeConditionOp::Neq) {
-                        return None;
-                    }
+                    let op = cond.op.to_equality()?;
                     let expected = cond.context_value_as_string()?;
                     Some(Self::ContextValue {
                         node_id: node_id.to_string(),
-                        op: cond.op,
+                        op,
                         expected,
                     })
                 }
@@ -577,21 +677,15 @@ impl CompiledCondition {
                 let Some(gating) = answer.and_then(|a| a.gating.as_ref()) else {
                     return false;
                 };
-                match op {
-                    NodeConditionOp::Eq => gating.route.as_str() == expected,
-                    NodeConditionOp::Neq => gating.route.as_str() != expected,
-                    _ => false,
-                }
+                op.matches(&gating.route, expected)
             }
             ConditionPredicate::ContextValue {
                 node_id,
                 op,
                 expected,
-            } => context.get(node_id).is_some_and(|ctx_val| match op {
-                NodeConditionOp::Eq => ctx_val.value == *expected,
-                NodeConditionOp::Neq => ctx_val.value != *expected,
-                _ => false,
-            }),
+            } => context
+                .get(node_id)
+                .is_some_and(|ctx_val| op.matches(&ctx_val.value, expected)),
             ConditionPredicate::ContextConfidence {
                 node_id,
                 op,
@@ -844,7 +938,7 @@ mod tests {
         assert_eq!(
             compiled.predicate,
             ConditionPredicate::Confidence {
-                op: NodeConditionOp::Gte,
+                op: ComparisonOp::Gte,
                 threshold: 0.85,
             }
         );
@@ -860,7 +954,7 @@ mod tests {
             compiled_ctx.predicate,
             ConditionPredicate::ContextValue {
                 node_id: "prev_node".to_string(),
-                op: NodeConditionOp::Eq,
+                op: EqualityOp::Eq,
                 expected: "transfer".to_string(),
             }
         );
@@ -884,8 +978,8 @@ mod tests {
         assert_eq!(
             compiled_route.predicate,
             ConditionPredicate::Route {
-                op: NodeConditionOp::Eq,
-                expected: "auto_execute".to_string(),
+                op: EqualityOp::Eq,
+                expected: DecisionRoute::AutoExecute,
             }
         );
 
@@ -901,7 +995,7 @@ mod tests {
             compiled_ctx_conf.predicate,
             ConditionPredicate::ContextConfidence {
                 node_id: "upstream_node".to_string(),
-                op: NodeConditionOp::Lt,
+                op: ComparisonOp::Lt,
                 threshold: 0.5,
             }
         );
@@ -920,5 +1014,34 @@ mod tests {
                 candidates: vec!["apple".to_string(), "banana".to_string()],
             })
         );
+    }
+
+    #[test]
+    fn test_equality_op() {
+        assert!(EqualityOp::Eq.matches("hello", "hello"));
+        assert!(!EqualityOp::Eq.matches("hello", "world"));
+        assert!(EqualityOp::Neq.matches("hello", "world"));
+        assert!(!EqualityOp::Neq.matches("hello", "hello"));
+
+        assert!(EqualityOp::Eq.matches(&DecisionRoute::AutoExecute, &DecisionRoute::AutoExecute));
+        assert!(!EqualityOp::Eq.matches(&DecisionRoute::AutoExecute, &DecisionRoute::Fallback));
+        assert!(EqualityOp::Neq.matches(&DecisionRoute::AutoExecute, &DecisionRoute::Fallback));
+
+        assert!(EqualityOp::Eq.eval_f64(1.0, 1.0 + 5e-7));
+        assert!(!EqualityOp::Eq.eval_f64(1.0, 1.0 + 2e-6));
+        assert!(EqualityOp::Neq.eval_f64(1.0, 1.0 + 2e-6));
+        assert!(!EqualityOp::Neq.eval_f64(1.0, 1.0 + 5e-7));
+    }
+
+    #[test]
+    fn test_comparison_op() {
+        assert!(ComparisonOp::Eq.eval_f64(1.0, 1.0 + 5e-7));
+        assert!(!ComparisonOp::Eq.eval_f64(1.0, 1.0 + 2e-6));
+        assert!(ComparisonOp::Neq.eval_f64(1.0, 1.0 + 2e-6));
+        assert!(ComparisonOp::Gt.eval_f64(1.0 + 2e-6, 1.0));
+        assert!(!ComparisonOp::Gt.eval_f64(1.0, 1.0));
+        assert!(ComparisonOp::Gte.eval_f64(1.0 - 5e-7, 1.0));
+        assert!(ComparisonOp::Lt.eval_f64(1.0 - 2e-6, 1.0));
+        assert!(ComparisonOp::Lte.eval_f64(1.0 + 5e-7, 1.0));
     }
 }

@@ -18,8 +18,9 @@ pub use pool::{
     LowLatencyResourcePool, LowLatencySessionPool, PoolError, PooledResource, PooledSession,
 };
 pub use schema::{
-    CompiledAnswerPredicate, CompiledCondition, CompiledDag, CompiledDagNode, ConditionField,
-    ConditionPredicate, ContextProp, DagDefinition, DagExecutionResult, DagNode, DagNodeType,
-    NodeCondition, NodeConditionOp, StepExecutionResult, parse_condition_f64,
+    ComparisonOp, CompiledAnswerPredicate, CompiledCondition, CompiledDag, CompiledDagNode,
+    ConditionField, ConditionPredicate, ContextProp, DagDefinition, DagExecutionResult, DagNode,
+    DagNodeType, EqualityOp, NodeCondition, NodeConditionOp, StepExecutionResult,
+    parse_condition_f64,
 };
 pub use validator::{DagValidationError, compile_dag, validate_dag};

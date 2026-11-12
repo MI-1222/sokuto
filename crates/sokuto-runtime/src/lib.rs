@@ -16,10 +16,10 @@ pub mod hierarchical;
 pub mod tokenizer;
 
 pub use dag::{
-    CompiledCondition, CompiledDag, CompiledDagNode, DagDefinition, DagError, DagExecutionResult,
-    DagNode, DagNodeType, InProcessDagExecutor, LowLatencyResourcePool, LowLatencySessionPool,
-    NodeCondition, NodeConditionOp, PooledResource, PooledSession, StepExecutionResult,
-    compile_dag, validate_dag,
+    ComparisonOp, CompiledCondition, CompiledDag, CompiledDagNode, DagDefinition, DagError,
+    DagExecutionResult, DagNode, DagNodeType, EqualityOp, InProcessDagExecutor,
+    LowLatencyResourcePool, LowLatencySessionPool, NodeCondition, NodeConditionOp, PooledResource,
+    PooledSession, StepExecutionResult, compile_dag, validate_dag,
 };
 
 pub use engine::{

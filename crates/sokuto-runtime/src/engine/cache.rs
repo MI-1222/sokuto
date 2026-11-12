@@ -450,7 +450,8 @@ impl CachedStateFeatures {
     /// - `state_mask`: `State` 有効トークンマスク列。空の場合は全トークン有効 (`1`) として補完される。
     ///
     /// # エラー
-    /// - `shape` が 3 次元未満の場合は [`RuntimeError::ModelContractViolation`] を返す。
+    /// - `shape` が 3 次元でない場合は [`RuntimeError::ModelContractViolation`] を返す。
+    /// - `raw_slice` の要素数が `shape` の総要素数と一致しない場合、または要素数計算がオーバーフローした場合は [`RuntimeError::InvalidTensorData`] を返す。
     /// - `state_mask` が非空かつ要素数が `shape[0] * shape[1]` と一致しない場合は [`RuntimeError::InvalidTensorData`] を返す。
     pub fn new_compressed(
         hash_key: u64,
@@ -465,7 +466,8 @@ impl CachedStateFeatures {
     /// `f32` スライスと State 原文テキストを指定された圧縮モードで変換してキャッシュエントリを生成する。
     ///
     /// # エラー
-    /// - `shape` が 3 次元未満の場合は [`RuntimeError::ModelContractViolation`] を返す。
+    /// - `shape` が 3 次元でない場合は [`RuntimeError::ModelContractViolation`] を返す。
+    /// - `raw_slice` の要素数が `shape` の総要素数と一致しない場合、または要素数計算がオーバーフローした場合は [`RuntimeError::InvalidTensorData`] を返す。
     /// - `state_mask` が非空かつ要素数が `shape[0] * shape[1]` と一致しない場合は [`RuntimeError::InvalidTensorData`] を返す。
     pub fn new_compressed_with_text(
         hash_key: u64,
@@ -475,13 +477,34 @@ impl CachedStateFeatures {
         state_mask: Vec<i64>,
         state_text: Option<String>,
     ) -> Result<Self> {
-        let hidden_size = if shape.len() >= 3 {
-            shape[2]
-        } else {
+        if shape.len() != 3 {
             return Err(RuntimeError::ModelContractViolation(format!(
                 "State特徴量は3次元テンソルである必要があります: {shape:?}。"
             )));
-        };
+        }
+
+        let total_elements = shape[0]
+            .checked_mul(shape[1])
+            .and_then(|v| v.checked_mul(shape[2]))
+            .ok_or_else(|| {
+                RuntimeError::InvalidTensorData(
+                    "テンソル要素数の計算がオーバーフローしました。".to_string(),
+                )
+            })?;
+
+        if raw_slice.len() != total_elements {
+            return Err(RuntimeError::InvalidTensorData(format!(
+                "raw_slice の要素数 ({}) が shape ({shape:?}) の総要素数 ({total_elements}) と一致しません。",
+                raw_slice.len()
+            )));
+        }
+
+        let hidden_size = shape[2];
+        if mode == CacheCompressionMode::Int8Symmetric && hidden_size == 0 {
+            return Err(RuntimeError::InvalidTensorData(
+                "Int8Symmetric モードでは hidden_size は 1 以上である必要があります。".to_string(),
+            ));
+        }
 
         let state_mask = validate_and_normalize_state_mask(&shape, state_mask)?;
 
@@ -1964,5 +1987,77 @@ mod tests {
             raw_valid.state_mask_for_batch(2),
             vec![1, 1, 0, 0, 1, 1, 0, 0]
         );
+    }
+
+    #[test]
+    fn test_cached_state_features_validates_raw_slice_length() {
+        let key = StateCacheManager::compute_key("raw-slice-len-validation-test");
+        let seq_len = 4;
+        let hidden_size = 8;
+        let shape = vec![1, seq_len, hidden_size];
+        let total_elements = seq_len * hidden_size;
+
+        // 1. スライス長不足時に各モードでパニックせず InvalidTensorData が返ること。
+        let short_data: Vec<f32> = vec![0.5f32; total_elements - 1];
+        for mode in [
+            CacheCompressionMode::None,
+            CacheCompressionMode::Fp16,
+            CacheCompressionMode::Int8Symmetric,
+        ] {
+            let res =
+                CachedStateFeatures::new_compressed(key, shape.clone(), &short_data, mode, vec![]);
+            assert!(
+                matches!(res, Err(RuntimeError::InvalidTensorData(_))),
+                "{mode:?} モードでスライス長不足時に InvalidTensorData が返る必要があります。"
+            );
+        }
+
+        // 2. スライス長超過時に各モードでパニックせず InvalidTensorData が返ること。
+        let long_data: Vec<f32> = vec![0.5f32; total_elements + 1];
+        for mode in [
+            CacheCompressionMode::None,
+            CacheCompressionMode::Fp16,
+            CacheCompressionMode::Int8Symmetric,
+        ] {
+            let res =
+                CachedStateFeatures::new_compressed(key, shape.clone(), &long_data, mode, vec![]);
+            assert!(
+                matches!(res, Err(RuntimeError::InvalidTensorData(_))),
+                "{mode:?} モードでスライス長超過時に InvalidTensorData が返る必要があります。"
+            );
+        }
+
+        // 3. shape が 3 次元でない場合は ModelContractViolation が返ること。
+        let valid_data: Vec<f32> = vec![0.5f32; total_elements];
+        let invalid_shapes = vec![
+            vec![seq_len, hidden_size],
+            vec![1, 1, seq_len, hidden_size],
+            vec![],
+        ];
+        for invalid_shape in invalid_shapes {
+            let res = CachedStateFeatures::new_compressed(
+                key,
+                invalid_shape,
+                &valid_data,
+                CacheCompressionMode::None,
+                vec![],
+            );
+            assert!(
+                matches!(res, Err(RuntimeError::ModelContractViolation(_))),
+                "3次元以外の形状では ModelContractViolation が返る必要があります。"
+            );
+        }
+
+        // 4. Int8Symmetric で hidden_size == 0 の場合は InvalidTensorData が返ること。
+        let zero_hidden_shape = vec![1, 4, 0];
+        let zero_data: Vec<f32> = vec![];
+        let res = CachedStateFeatures::new_compressed(
+            key,
+            zero_hidden_shape,
+            &zero_data,
+            CacheCompressionMode::Int8Symmetric,
+            vec![],
+        );
+        assert!(matches!(res, Err(RuntimeError::InvalidTensorData(_))));
     }
 }

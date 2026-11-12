@@ -8,9 +8,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use indexmap::IndexMap;
 use sokuto_core::schema::{Criteria, Question, QuestionType};
 
-use crate::dag::executor::{ConditionField, ContextProp};
 use crate::dag::interpolate::extract_placeholders;
-use crate::dag::schema::{DagDefinition, DagNode, DagNodeType, NodeCondition, NodeConditionOp};
+use crate::dag::schema::{
+    CompiledAnswerPredicate, CompiledCondition, CompiledDag, CompiledDagNode, ConditionField,
+    ConditionPredicate, ContextProp, DagDefinition, DagNode, DagNodeType, NodeCondition,
+    NodeConditionOp,
+};
 
 /// DAG 静的検証で発生するエラー型。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -77,15 +80,23 @@ pub enum DagValidationError {
 /// DAG 定義の整合性と無閉路性を静的に検証する。
 ///
 /// # 検査項目
+/// DAG の静的検証を行い、整合性を確認する。
+pub fn validate_dag(dag: &DagDefinition) -> Result<(), DagValidationError> {
+    compile_dag(dag).map(|_| ())
+}
+
+/// DAG を静的検証し、実行用プラン `CompiledDag` へ事前コンパイルする。
+///
+/// 以下の整合性検証を実行する:
 /// 1. `nodes` が 1 つ以上のノードを含むこと。
 /// 2. `entry_node` が `nodes` に実在すること。
 /// 3. 各ノードのプロパティ検証 (推論ノードの質問、並行ノードの合流先など)。
 /// 4. すべての遷移先 (`target_node`, `parallel_nodes`, `join_node`) が実在すること。
 /// 5. DFS による有向グラフの閉路 (サイクル) 検出。
 /// 6. `entry_node` から全ノードへの到達性確認。
-/// 7. 各条件式のフィールド・上流参照・型整合性検証。
+/// 7. 各条件式のフィールド・上流参照・型整合性検証および型付き条件への事前コンパイル。
 /// 8. 全 Inference ノードのプロンプト補間変数 (`{node_id.prop}`) の参照先実在性・プロパティ名・上流先行性検証。
-pub fn validate_dag(dag: &DagDefinition) -> Result<(), DagValidationError> {
+pub fn compile_dag(dag: &DagDefinition) -> Result<CompiledDag, DagValidationError> {
     if dag.nodes.is_empty() {
         return Err(DagValidationError::EmptyNodes);
     }
@@ -280,13 +291,50 @@ pub fn validate_dag(dag: &DagDefinition) -> Result<(), DagValidationError> {
         ancestors.insert(node_id, anc_set);
     }
 
-    // 6. 条件式の静的検証 (フィールド妥当性・先祖参照・型整合性)
-    validate_node_conditions(dag, &ancestors, &rev_adj)?;
+    // 6. 条件式の静的検証と型解決コンパイル (フィールド妥当性・先祖参照・型整合性)
+    let mut compiled_conditions = validate_node_conditions(dag, &ancestors, &rev_adj)?;
 
     // 7. プロンプト補間変数の静的検証 (参照先実在性・プロパティ名・上流先行性)
     validate_prompt_interpolations(dag, &ancestors)?;
 
-    Ok(())
+    // 8. CompiledDagNode へのマッピング
+    let mut compiled_nodes = IndexMap::with_capacity(dag.nodes.len());
+    for (node_id, node) in &dag.nodes {
+        let conds = compiled_conditions.swap_remove(node_id).unwrap_or_default();
+        let compiled_node = match node {
+            DagNode::Inference {
+                question, reason, ..
+            } => CompiledDagNode::Inference {
+                question: question.clone(),
+                conditions: conds,
+                reason: reason.clone(),
+            },
+            DagNode::Branch { reason, .. } => CompiledDagNode::Branch {
+                conditions: conds,
+                reason: reason.clone(),
+            },
+            DagNode::Parallel {
+                parallel_nodes,
+                join_node,
+                reason,
+            } => CompiledDagNode::Parallel {
+                parallel_nodes: parallel_nodes.clone(),
+                join_node: join_node.clone(),
+                reason: reason.clone(),
+            },
+            DagNode::Escalate { reason } => CompiledDagNode::Escalate {
+                reason: reason.clone(),
+            },
+        };
+        compiled_nodes.insert(node_id.clone(), compiled_node);
+    }
+
+    Ok(CompiledDag {
+        dag_id: dag.dag_id.clone(),
+        timeout_ms: dag.timeout_ms,
+        entry_node: dag.entry_node.clone(),
+        nodes: compiled_nodes,
+    })
 }
 
 /// 条件式を評価する対象の上流推論ノード群を探索・解決する。
@@ -413,19 +461,23 @@ fn resolve_upstream_questions<'a>(
     Ok(upstream_nodes)
 }
 
-/// 各ノードの条件式リスト (`conditions`) に対し、フィールド妥当性・先祖参照・型整合性を静的検証する。
+/// 各ノードの条件式リスト (`conditions`) に対し、フィールド妥当性・先祖参照・型整合性を静的検証し、型付き条件へ事前コンパイルする。
 fn validate_node_conditions(
     dag: &DagDefinition,
     ancestors: &HashMap<&str, HashSet<&str>>,
     rev_adj: &HashMap<&str, Vec<&str>>,
-) -> Result<(), DagValidationError> {
+) -> Result<IndexMap<String, Vec<CompiledCondition>>, DagValidationError> {
+    let mut compiled_map = IndexMap::with_capacity(dag.nodes.len());
     for (node_id, node) in &dag.nodes {
+        let mut compiled_list = Vec::with_capacity(node.conditions().len());
         for cond in node.conditions() {
-            validate_single_condition(node_id, node, cond, dag, ancestors, rev_adj)?;
+            let compiled = validate_single_condition(node_id, node, cond, dag, ancestors, rev_adj)?;
+            compiled_list.push(compiled);
         }
+        compiled_map.insert(node_id.clone(), compiled_list);
     }
 
-    Ok(())
+    Ok(compiled_map)
 }
 
 /// 全 Inference ノードの Instructions および Criteria におけるプロンプト補間変数 (`{node_id.prop}`) を静的検証する。
@@ -536,15 +588,17 @@ fn validate_single_condition(
     dag: &DagDefinition,
     ancestors: &HashMap<&str, HashSet<&str>>,
     rev_adj: &HashMap<&str, Vec<&str>>,
-) -> Result<(), DagValidationError> {
+) -> Result<CompiledCondition, DagValidationError> {
     let field = ConditionField::parse(&cond.field);
 
-    match field {
-        ConditionField::Unknown => Err(DagValidationError::InvalidCondition {
-            node_id: node_id.to_string(),
-            field: cond.field.clone(),
-            reason: "未定義または構文不正なフィールド名です。".to_string(),
-        }),
+    let predicate = match field {
+        ConditionField::Unknown => {
+            return Err(DagValidationError::InvalidCondition {
+                node_id: node_id.to_string(),
+                field: cond.field.clone(),
+                reason: "未定義または構文不正なフィールド名です。".to_string(),
+            });
+        }
         ConditionField::ContextProperty {
             node_id: ref_id,
             prop,
@@ -588,12 +642,24 @@ fn validate_single_condition(
                                 .to_string(),
                         });
                     }
-                    if cond.value_as_f64().is_none() {
+                    let Some(threshold) = cond.value_as_f64() else {
                         return Err(DagValidationError::InvalidCondition {
                             node_id: node_id.to_string(),
                             field: cond.field.clone(),
                             reason: "確信度プロパティには有限数値 (または数値文字列) を指定する必要があります。".to_string(),
                         });
+                    };
+                    let op = match cond.op {
+                        NodeConditionOp::ConfidenceGte | NodeConditionOp::Gte => {
+                            NodeConditionOp::Gte
+                        }
+                        NodeConditionOp::ConfidenceLt | NodeConditionOp::Lt => NodeConditionOp::Lt,
+                        other => other,
+                    };
+                    ConditionPredicate::ContextConfidence {
+                        node_id: ref_id.to_string(),
+                        op,
+                        threshold,
                     }
                 }
                 ContextProp::Value => {
@@ -620,9 +686,19 @@ fn validate_single_condition(
                             reason: "コンテキスト値プロパティにはスカラー値 (文字列、真偽値、有限数値) を指定する必要があります。".to_string(),
                         });
                     }
+                    let expected = match cond.value.as_ref().unwrap() {
+                        serde_json::Value::String(s) => s.clone(),
+                        serde_json::Value::Bool(b) => b.to_string(),
+                        serde_json::Value::Number(n) => n.to_string(),
+                        _ => unreachable!(),
+                    };
+                    ConditionPredicate::ContextValue {
+                        node_id: ref_id.to_string(),
+                        op: cond.op,
+                        expected,
+                    }
                 }
             }
-            Ok(())
         }
         ConditionField::Confidence => {
             resolve_upstream_inference_nodes(node_id, node, &cond.field, dag, rev_adj)?;
@@ -634,14 +710,19 @@ fn validate_single_condition(
                         .to_string(),
                 });
             }
-            if cond.value_as_f64().is_none() {
+            let Some(threshold) = cond.value_as_f64() else {
                 return Err(DagValidationError::InvalidCondition {
                     node_id: node_id.to_string(),
                     field: cond.field.clone(),
                     reason: "confidence フィールドには有限数値 (または数値文字列) を指定する必要があります。".to_string(),
                 });
-            }
-            Ok(())
+            };
+            let op = match cond.op {
+                NodeConditionOp::ConfidenceGte | NodeConditionOp::Gte => NodeConditionOp::Gte,
+                NodeConditionOp::ConfidenceLt | NodeConditionOp::Lt => NodeConditionOp::Lt,
+                other => other,
+            };
+            ConditionPredicate::Confidence { op, threshold }
         }
         ConditionField::Route => {
             resolve_upstream_inference_nodes(node_id, node, &cond.field, dag, rev_adj)?;
@@ -664,7 +745,11 @@ fn validate_single_condition(
                     reason: "route フィールドには 'auto_execute', 'confirm_or_escalate', 'fallback' のいずれかの文字列を指定する必要があります。".to_string(),
                 });
             }
-            Ok(())
+            let expected = cond.value.as_ref().unwrap().as_str().unwrap().to_string();
+            ConditionPredicate::Route {
+                op: cond.op,
+                expected,
+            }
         }
         ConditionField::Answer => {
             let upstream_nodes =
@@ -821,9 +906,49 @@ fn validate_single_condition(
                 },
                 None => {}
             }
-            Ok(())
+
+            let ans_pred = if cond.op == NodeConditionOp::In {
+                let arr = cond.value.as_ref().unwrap().as_array().unwrap();
+                let candidates = arr
+                    .iter()
+                    .map(|item| item.as_str().unwrap().to_string())
+                    .collect();
+                CompiledAnswerPredicate::In { candidates }
+            } else if let Some(b) = cond.value.as_ref().and_then(|v| v.as_bool()) {
+                CompiledAnswerPredicate::Bool {
+                    op: cond.op,
+                    expected: b,
+                }
+            } else if let Some(n) = cond.value.as_ref().and_then(|v| v.as_f64()) {
+                CompiledAnswerPredicate::Numeric {
+                    op: cond.op,
+                    threshold: n,
+                }
+            } else if let Some(s) = cond.value.as_ref().and_then(|v| v.as_str()) {
+                let as_bool = match s {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => None,
+                };
+                let as_f64 = s.trim().parse::<f64>().ok().filter(|f| f.is_finite());
+                CompiledAnswerPredicate::String {
+                    op: cond.op,
+                    expected: s.to_string(),
+                    as_f64,
+                    as_bool,
+                }
+            } else {
+                unreachable!()
+            };
+
+            ConditionPredicate::Answer(ans_pred)
         }
-    }
+    };
+
+    Ok(CompiledCondition {
+        predicate,
+        target_node: cond.target_node.clone(),
+    })
 }
 
 #[cfg(test)]

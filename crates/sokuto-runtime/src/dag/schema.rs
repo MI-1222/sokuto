@@ -24,6 +24,13 @@ pub struct DagDefinition {
     pub nodes: IndexMap<String, DagNode>,
 }
 
+impl DagDefinition {
+    /// DAG 定義を静的検証し、実行用プラン `CompiledDag` へ事前コンパイルする。
+    pub fn compile(&self) -> Result<CompiledDag, crate::dag::validator::DagValidationError> {
+        crate::dag::validator::compile_dag(self)
+    }
+}
+
 fn default_timeout_ms() -> u64 {
     100
 }
@@ -177,6 +184,11 @@ impl NodeCondition {
     pub fn value_as_f64(&self) -> Option<f64> {
         parse_condition_f64(self.value.as_ref())
     }
+
+    /// 自身を事前パース・型解決済みの `CompiledCondition` へ変換する。
+    pub fn compile(&self) -> Option<CompiledCondition> {
+        CompiledCondition::from_node_condition(self)
+    }
 }
 
 /// 条件値 (`serde_json::Value`) を有限な `f64` として解釈する。
@@ -237,6 +249,403 @@ impl NodeConditionOp {
             Self::In | Self::ConfidenceGte | Self::ConfidenceLt => false,
         }
     }
+}
+
+/// コンテキストノード参照 (`node_id.prop`) で参照可能なプロパティ種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextProp {
+    /// 先行ノードの回答値 (`value` / `answer`)。
+    Value,
+    /// 先行ノードの確信度 (`confidence`)。
+    Confidence,
+}
+
+/// `NodeCondition.field` 文字列をパースした型安全な評価対象フィールド。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionField<'a> {
+    /// 現在のノードの実効確信度 (`confidence`)。
+    Confidence,
+    /// 現在のノードのゲーティングルート (`route`)。
+    Route,
+    /// 現在のノードの判定結果値 (`answer` / `value`)。
+    Answer,
+    /// 先行ノードの出力コンテキスト参照 (`<node_id>.<prop>`)。
+    ContextProperty { node_id: &'a str, prop: ContextProp },
+    /// 未定義または構文不正なフィールド名。
+    Unknown,
+}
+
+impl<'a> ConditionField<'a> {
+    /// フィールド名文字列を `ConditionField` にパースする。
+    pub fn parse(field: &'a str) -> Self {
+        match field {
+            "confidence" => Self::Confidence,
+            "route" => Self::Route,
+            "answer" | "value" => Self::Answer,
+            _ => match field.split_once('.') {
+                Some((node_id, "value" | "answer")) => Self::ContextProperty {
+                    node_id,
+                    prop: ContextProp::Value,
+                },
+                Some((node_id, "confidence")) => Self::ContextProperty {
+                    node_id,
+                    prop: ContextProp::Confidence,
+                },
+                _ => Self::Unknown,
+            },
+        }
+    }
+}
+
+/// コンパイル・型解決済みの回答値述語。
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompiledAnswerPredicate {
+    /// Noul または汎用真偽値判定 (実効確率 >= 0.5 の真偽判定)。
+    Bool { op: NodeConditionOp, expected: bool },
+    /// 数値閾値判定 (Score または Noul 連続確率)。
+    Numeric { op: NodeConditionOp, threshold: f64 },
+    /// 文字列一致判定 (Choice) または文字列/真偽値/数値文字列の等価判定。
+    String {
+        op: NodeConditionOp,
+        expected: String,
+        /// もし数値としても解釈可能なら事前パースした有限 f64。
+        as_f64: Option<f64>,
+        /// もし "true" / "false" 文字列なら事前パースした真偽値。
+        as_bool: Option<bool>,
+    },
+    /// 選択肢集合包含判定 (Choice `in`)。
+    In { candidates: Vec<String> },
+}
+
+impl CompiledAnswerPredicate {
+    /// 回答結果 (`Answer`) に対する適合判定を行う。
+    pub fn matches(&self, ans: &Answer) -> bool {
+        match self {
+            Self::Bool { op, expected } => {
+                if let Some(noul_val) = ans.as_noul() {
+                    let is_true = noul_val >= 0.5;
+                    match op {
+                        NodeConditionOp::Eq => is_true == *expected,
+                        NodeConditionOp::Neq => is_true != *expected,
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            }
+            Self::Numeric { op, threshold } => {
+                if let Some(score_val) = ans.as_score() {
+                    op.eval_f64(score_val, *threshold)
+                } else if let Some(noul_val) = ans.as_noul() {
+                    op.eval_f64(noul_val, *threshold)
+                } else {
+                    false
+                }
+            }
+            Self::String {
+                op,
+                expected,
+                as_f64,
+                as_bool,
+            } => {
+                if let Some(noul_val) = ans.as_noul() {
+                    if let Some(tb) = as_bool {
+                        let is_true = noul_val >= 0.5;
+                        return match op {
+                            NodeConditionOp::Eq => is_true == *tb,
+                            NodeConditionOp::Neq => is_true != *tb,
+                            _ => false,
+                        };
+                    }
+                    if let Some(num) = as_f64 {
+                        return op.eval_f64(noul_val, *num);
+                    }
+                    return false;
+                }
+                if let Some(choice_val) = ans.as_choice() {
+                    return match op {
+                        NodeConditionOp::Eq => choice_val == expected,
+                        NodeConditionOp::Neq => choice_val != expected,
+                        _ => false,
+                    };
+                }
+                if let Some(score_val) = ans.as_score() {
+                    if let Some(num) = as_f64 {
+                        return op.eval_f64(score_val, *num);
+                    }
+                    return false;
+                }
+                false
+            }
+            Self::In { candidates } => {
+                if let Some(choice_val) = ans.as_choice() {
+                    candidates.iter().any(|c| c == choice_val)
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
+/// コンパイル・型解決済みの条件判定述語。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConditionPredicate {
+    /// 実効確信度 (`confidence`) に対する数値閾値比較。
+    Confidence { op: NodeConditionOp, threshold: f64 },
+    /// ゲーティングルート (`route`) に対する等価判定。
+    Route {
+        op: NodeConditionOp,
+        expected: String,
+    },
+    /// 先行ノードの回答値コンテキスト (`<node_id>.value` / `<node_id>.answer`) に対する等価判定。
+    ContextValue {
+        node_id: String,
+        op: NodeConditionOp,
+        expected: String,
+    },
+    /// 先行ノードの確信度コンテキスト (`<node_id>.confidence`) に対する数値閾値比較。
+    ContextConfidence {
+        node_id: String,
+        op: NodeConditionOp,
+        threshold: f64,
+    },
+    /// 現在のノードの判定結果 (`answer` / `value`) に対する型付き判定。
+    Answer(CompiledAnswerPredicate),
+}
+
+/// コンパイル・型解決済みのノード遷移条件。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompiledCondition {
+    /// 事前解決された述語。
+    pub predicate: ConditionPredicate,
+    /// 条件合致時の遷移先ノード ID。
+    pub target_node: String,
+}
+
+impl CompiledCondition {
+    /// 単一条件の適合判定を行う。
+    #[inline]
+    pub fn matches(
+        &self,
+        answer: Option<&Answer>,
+        context: &IndexMap<String, crate::dag::interpolate::NodeContextValue>,
+    ) -> bool {
+        match &self.predicate {
+            ConditionPredicate::Confidence { op, threshold } => {
+                let conf = answer.map(Answer::effective_confidence).unwrap_or(0.0);
+                op.eval_f64(conf, *threshold)
+            }
+            ConditionPredicate::Route { op, expected } => {
+                let Some(gating) = answer.and_then(|a| a.gating.as_ref()) else {
+                    return false;
+                };
+                match op {
+                    NodeConditionOp::Eq => gating.route.as_str() == expected,
+                    NodeConditionOp::Neq => gating.route.as_str() != expected,
+                    _ => false,
+                }
+            }
+            ConditionPredicate::ContextValue {
+                node_id,
+                op,
+                expected,
+            } => context.get(node_id).is_some_and(|ctx_val| match op {
+                NodeConditionOp::Eq => ctx_val.value == *expected,
+                NodeConditionOp::Neq => ctx_val.value != *expected,
+                _ => false,
+            }),
+            ConditionPredicate::ContextConfidence {
+                node_id,
+                op,
+                threshold,
+            } => context
+                .get(node_id)
+                .is_some_and(|ctx_val| op.eval_f64(ctx_val.confidence, *threshold)),
+            ConditionPredicate::Answer(ans_pred) => answer.is_some_and(|ans| ans_pred.matches(ans)),
+        }
+    }
+
+    /// 生の `NodeCondition` から `CompiledCondition` を構築する。
+    ///
+    /// 構文不正またはサポートされない演算子・値の組み合わせの場合は `None` を返す。
+    pub fn from_node_condition(cond: &NodeCondition) -> Option<Self> {
+        let predicate = match ConditionField::parse(&cond.field) {
+            ConditionField::Confidence => {
+                let threshold = cond.value_as_f64()?;
+                let op = match cond.op {
+                    NodeConditionOp::ConfidenceGte | NodeConditionOp::Gte => NodeConditionOp::Gte,
+                    NodeConditionOp::ConfidenceLt | NodeConditionOp::Lt => NodeConditionOp::Lt,
+                    NodeConditionOp::In => return None,
+                    other => other,
+                };
+                ConditionPredicate::Confidence { op, threshold }
+            }
+            ConditionField::Route => {
+                if !matches!(cond.op, NodeConditionOp::Eq | NodeConditionOp::Neq) {
+                    return None;
+                }
+                let expected = cond.value.as_ref()?.as_str()?.to_string();
+                ConditionPredicate::Route {
+                    op: cond.op,
+                    expected,
+                }
+            }
+            ConditionField::ContextProperty { node_id, prop } => match prop {
+                ContextProp::Confidence => {
+                    let threshold = cond.value_as_f64()?;
+                    let op = match cond.op {
+                        NodeConditionOp::ConfidenceGte | NodeConditionOp::Gte => {
+                            NodeConditionOp::Gte
+                        }
+                        NodeConditionOp::ConfidenceLt | NodeConditionOp::Lt => NodeConditionOp::Lt,
+                        _ => return None,
+                    };
+                    ConditionPredicate::ContextConfidence {
+                        node_id: node_id.to_string(),
+                        op,
+                        threshold,
+                    }
+                }
+                ContextProp::Value => {
+                    if !matches!(cond.op, NodeConditionOp::Eq | NodeConditionOp::Neq) {
+                        return None;
+                    }
+                    let expected = match cond.value.as_ref()? {
+                        serde_json::Value::String(s) => s.clone(),
+                        serde_json::Value::Bool(b) => b.to_string(),
+                        serde_json::Value::Number(n) => n.to_string(),
+                        _ => return None,
+                    };
+                    ConditionPredicate::ContextValue {
+                        node_id: node_id.to_string(),
+                        op: cond.op,
+                        expected,
+                    }
+                }
+            },
+            ConditionField::Answer => {
+                if cond.op == NodeConditionOp::In {
+                    let arr = cond.value.as_ref()?.as_array()?;
+                    let mut candidates = Vec::with_capacity(arr.len());
+                    for v in arr {
+                        candidates.push(v.as_str()?.to_string());
+                    }
+                    ConditionPredicate::Answer(CompiledAnswerPredicate::In { candidates })
+                } else if let Some(b) = cond.value.as_ref().and_then(|v| v.as_bool()) {
+                    ConditionPredicate::Answer(CompiledAnswerPredicate::Bool {
+                        op: cond.op,
+                        expected: b,
+                    })
+                } else if let Some(n) = cond.value.as_ref().and_then(|v| v.as_f64()) {
+                    if !n.is_finite() {
+                        return None;
+                    }
+                    ConditionPredicate::Answer(CompiledAnswerPredicate::Numeric {
+                        op: cond.op,
+                        threshold: n,
+                    })
+                } else if let Some(s) = cond.value.as_ref().and_then(|v| v.as_str()) {
+                    let as_bool = match s {
+                        "true" => Some(true),
+                        "false" => Some(false),
+                        _ => None,
+                    };
+                    let as_f64 = s.trim().parse::<f64>().ok().filter(|f| f.is_finite());
+                    ConditionPredicate::Answer(CompiledAnswerPredicate::String {
+                        op: cond.op,
+                        expected: s.to_string(),
+                        as_f64,
+                        as_bool,
+                    })
+                } else {
+                    return None;
+                }
+            }
+            ConditionField::Unknown => return None,
+        };
+
+        Some(Self {
+            predicate,
+            target_node: cond.target_node.clone(),
+        })
+    }
+}
+
+/// コンパイル・検証済みの実行用 DAG ノード。
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompiledDagNode {
+    /// 単一質問のモデル推論を実行するノード。
+    Inference {
+        question: Question,
+        conditions: Vec<CompiledCondition>,
+        reason: Option<String>,
+    },
+    /// 先行ノードの判定値・確信度のみに基づいて遷移先を決定する純粋な条件分岐ノード。
+    Branch {
+        conditions: Vec<CompiledCondition>,
+        reason: Option<String>,
+    },
+    /// 独立した複数の質問を並行実行し合流するノード。
+    Parallel {
+        parallel_nodes: Vec<String>,
+        join_node: String,
+        reason: Option<String>,
+    },
+    /// 確信度不足や例外検知時に上位 LLM または人手へ委ねるエスカレーションノード。
+    Escalate { reason: Option<String> },
+}
+
+impl CompiledDagNode {
+    /// ノードの種別を返す。
+    pub fn node_type(&self) -> DagNodeType {
+        match self {
+            Self::Inference { .. } => DagNodeType::Inference,
+            Self::Branch { .. } => DagNodeType::Branch,
+            Self::Parallel { .. } => DagNodeType::Parallel,
+            Self::Escalate { .. } => DagNodeType::Escalate,
+        }
+    }
+
+    /// 理由説明文を返す。
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Inference { reason, .. }
+            | Self::Branch { reason, .. }
+            | Self::Parallel { reason, .. }
+            | Self::Escalate { reason, .. } => reason.as_deref(),
+        }
+    }
+
+    /// 事前コンパイル済み条件付き遷移規則リストへの参照を返す。
+    pub fn conditions(&self) -> &[CompiledCondition] {
+        match self {
+            Self::Inference { conditions, .. } | Self::Branch { conditions, .. } => conditions,
+            Self::Parallel { .. } | Self::Escalate { .. } => &[],
+        }
+    }
+
+    /// 推論ノードの質問定義への参照を返す (Inference の場合)。
+    pub fn question(&self) -> Option<&Question> {
+        match self {
+            Self::Inference { question, .. } => Some(question),
+            _ => None,
+        }
+    }
+}
+
+/// コンパイル・検証済みの実行用 DAG プラン。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompiledDag {
+    /// DAG の一意識別子。
+    pub dag_id: String,
+    /// 全体タイムアウト時間 (ミリ秒)。
+    pub timeout_ms: u64,
+    /// 実行開始ノードの識別子。
+    pub entry_node: String,
+    /// コンパイル済みノードマップ。
+    pub nodes: IndexMap<String, CompiledDagNode>,
 }
 
 /// 単一ステップの実行結果記録。
@@ -378,5 +787,48 @@ mod tests {
         assert_eq!(parse_condition_f64(Some(&bool_val)), None);
 
         assert_eq!(parse_condition_f64(None), None);
+    }
+
+    #[test]
+    fn test_compiled_condition_from_node_condition() {
+        let cond_conf = NodeCondition {
+            field: "confidence".to_string(),
+            op: NodeConditionOp::ConfidenceGte,
+            value: Some(serde_json::json!(0.85)),
+            target_node: "target_a".to_string(),
+        };
+        let compiled = cond_conf.compile().expect("コンパイルに成功。");
+        assert_eq!(compiled.target_node, "target_a");
+        assert_eq!(
+            compiled.predicate,
+            ConditionPredicate::Confidence {
+                op: NodeConditionOp::Gte,
+                threshold: 0.85,
+            }
+        );
+
+        let cond_ctx_val = NodeCondition {
+            field: "prev_node.value".to_string(),
+            op: NodeConditionOp::Eq,
+            value: Some(serde_json::json!("transfer")),
+            target_node: "target_b".to_string(),
+        };
+        let compiled_ctx = cond_ctx_val.compile().expect("コンパイルに成功。");
+        assert_eq!(
+            compiled_ctx.predicate,
+            ConditionPredicate::ContextValue {
+                node_id: "prev_node".to_string(),
+                op: NodeConditionOp::Eq,
+                expected: "transfer".to_string(),
+            }
+        );
+
+        let cond_invalid = NodeCondition {
+            field: "invalid_field".to_string(),
+            op: NodeConditionOp::Eq,
+            value: Some(serde_json::json!(1)),
+            target_node: "target_c".to_string(),
+        };
+        assert!(cond_invalid.compile().is_none());
     }
 }

@@ -13,10 +13,10 @@ use sokuto_core::schema::{Answer, AnswerPayload, Question};
 use crate::dag::interpolate::{NodeContextValue, interpolate_prompt, interpolate_question};
 use crate::dag::pool::PoolError;
 use crate::dag::schema::{
-    DagDefinition, DagExecutionResult, DagNode, DagNodeType, NodeCondition, NodeConditionOp,
-    StepExecutionResult,
+    CompiledCondition, CompiledDag, CompiledDagNode, DagDefinition, DagExecutionResult,
+    DagNodeType, NodeCondition, StepExecutionResult,
 };
-use crate::dag::validator::{DagValidationError, validate_dag};
+use crate::dag::validator::{DagValidationError, compile_dag};
 use crate::engine::InferenceEngine;
 use crate::error::RuntimeError;
 use crate::tokenizer::JevTokenizer;
@@ -102,9 +102,17 @@ impl InProcessDagExecutor {
         state: &str,
         dag: &DagDefinition,
     ) -> Result<DagExecutionResult, DagError> {
-        // 1. 静的検証 (Fast-Fail)
-        validate_dag(dag)?;
+        // 1. 静的検証 & 事前コンパイル (Fast-Fail)
+        let compiled_dag = compile_dag(dag)?;
+        self.execute_compiled(state, &compiled_dag).await
+    }
 
+    /// 事前コンパイル済みの DAG を実行し、実行結果を返却する。
+    pub async fn execute_compiled(
+        &self,
+        state: &str,
+        dag: &CompiledDag,
+    ) -> Result<DagExecutionResult, DagError> {
         let timeout_duration = Duration::from_millis(dag.timeout_ms);
         let start_time = Instant::now();
 
@@ -125,7 +133,7 @@ impl InProcessDagExecutor {
     async fn run_dag(
         &self,
         initial_state: &str,
-        dag: &DagDefinition,
+        dag: &CompiledDag,
     ) -> Result<DagExecutionResult, DagError> {
         let mut context: IndexMap<String, NodeContextValue> = IndexMap::new();
         let mut steps: IndexMap<String, StepExecutionResult> = IndexMap::new();
@@ -157,7 +165,7 @@ impl InProcessDagExecutor {
             let step_start = Instant::now();
 
             match node {
-                DagNode::Inference {
+                CompiledDagNode::Inference {
                     question,
                     conditions,
                     reason,
@@ -176,7 +184,8 @@ impl InProcessDagExecutor {
                     final_answer = Some(answer.clone());
 
                     // 条件評価
-                    let next_node = evaluate_conditions(conditions, Some(&answer), &context);
+                    let next_node =
+                        evaluate_compiled_conditions(conditions, Some(&answer), &context);
                     let duration_ms = step_start.elapsed().as_secs_f64() * 1000.0;
 
                     steps.insert(
@@ -196,9 +205,9 @@ impl InProcessDagExecutor {
                         None => break,
                     }
                 }
-                DagNode::Branch { conditions, reason } => {
+                CompiledDagNode::Branch { conditions, reason } => {
                     let next_node =
-                        evaluate_conditions(conditions, final_answer.as_ref(), &context);
+                        evaluate_compiled_conditions(conditions, final_answer.as_ref(), &context);
                     let duration_ms = step_start.elapsed().as_secs_f64() * 1000.0;
 
                     steps.insert(
@@ -218,7 +227,7 @@ impl InProcessDagExecutor {
                         None => break,
                     }
                 }
-                DagNode::Parallel {
+                CompiledDagNode::Parallel {
                     parallel_nodes,
                     join_node,
                     reason,
@@ -286,7 +295,7 @@ impl InProcessDagExecutor {
                         None => break,
                     }
                 }
-                DagNode::Escalate { reason } => {
+                CompiledDagNode::Escalate { reason } => {
                     let duration_ms = step_start.elapsed().as_secs_f64() * 1000.0;
                     escalated = true;
                     escalation_reason = reason.clone();
@@ -469,6 +478,21 @@ fn record_parallel_results(
     }
 }
 
+/// コンパイル済み条件リストを順次評価し、最初に適合した条件の `target_node` を返却する (Short-circuit)。
+#[inline]
+pub fn evaluate_compiled_conditions(
+    conditions: &[CompiledCondition],
+    answer: Option<&Answer>,
+    context: &IndexMap<String, NodeContextValue>,
+) -> Option<String> {
+    for cond in conditions {
+        if cond.matches(answer, context) {
+            return Some(cond.target_node.clone());
+        }
+    }
+    None
+}
+
 /// 条件リストを順次評価し、最初に適合した条件の `target_node` を返却する (Short-circuit)。
 pub fn evaluate_conditions(
     conditions: &[NodeCondition],
@@ -476,247 +500,19 @@ pub fn evaluate_conditions(
     context: &IndexMap<String, NodeContextValue>,
 ) -> Option<String> {
     for cond in conditions {
-        if matches_condition(cond, answer, context) {
+        if let Some(compiled) = CompiledCondition::from_node_condition(cond)
+            && compiled.matches(answer, context)
+        {
             return Some(cond.target_node.clone());
         }
     }
     None
 }
 
-/// コンテキストノード参照 (`node_id.prop`) で参照可能なプロパティ種別。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ContextProp {
-    /// 先行ノードの回答値 (`value` / `answer`)。
-    Value,
-    /// 先行ノードの確信度 (`confidence`)。
-    Confidence,
-}
-
-/// `NodeCondition.field` 文字列をパースした型安全な評価対象フィールド。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConditionField<'a> {
-    /// 現在のノードの実効確信度 (`confidence`)。
-    Confidence,
-    /// 現在のノードのゲーティングルート (`route`)。
-    Route,
-    /// 現在のノードの判定結果値 (`answer` / `value`)。
-    Answer,
-    /// 先行ノードの出力コンテキスト参照 (`<node_id>.<prop>`)。
-    ContextProperty { node_id: &'a str, prop: ContextProp },
-    /// 未定義または構文不正なフィールド名。
-    Unknown,
-}
-
-impl<'a> ConditionField<'a> {
-    /// フィールド名文字列を `ConditionField` にパースする。
-    pub(crate) fn parse(field: &'a str) -> Self {
-        match field {
-            "confidence" => Self::Confidence,
-            "route" => Self::Route,
-            "answer" | "value" => Self::Answer,
-            _ => match field.split_once('.') {
-                Some((node_id, "value" | "answer")) => Self::ContextProperty {
-                    node_id,
-                    prop: ContextProp::Value,
-                },
-                Some((node_id, "confidence")) => Self::ContextProperty {
-                    node_id,
-                    prop: ContextProp::Confidence,
-                },
-                _ => Self::Unknown,
-            },
-        }
-    }
-}
-
-/// 単一条件の適合判定を行う。
-fn matches_condition(
-    cond: &NodeCondition,
-    answer: Option<&Answer>,
-    context: &IndexMap<String, NodeContextValue>,
-) -> bool {
-    match ConditionField::parse(&cond.field) {
-        ConditionField::Confidence => matches_confidence(cond, answer),
-        ConditionField::Route => matches_route(cond, answer),
-        ConditionField::Answer => answer.is_some_and(|ans| matches_answer_value(cond, ans)),
-        ConditionField::ContextProperty { node_id, prop } => context
-            .get(node_id)
-            .is_some_and(|ctx_val| matches_context_property(cond, ctx_val, prop)),
-        ConditionField::Unknown => false,
-    }
-}
-
-/// `confidence` フィールドに対する閾値比較を評価する。
-fn matches_confidence(cond: &NodeCondition, answer: Option<&Answer>) -> bool {
-    let conf = answer.map(Answer::effective_confidence).unwrap_or(0.0);
-    let Some(target_val) = cond.value_as_f64() else {
-        return false;
-    };
-    let normalized_op = match cond.op {
-        NodeConditionOp::ConfidenceGte => NodeConditionOp::Gte,
-        NodeConditionOp::ConfidenceLt => NodeConditionOp::Lt,
-        other => other,
-    };
-    normalized_op.eval_f64(conf, target_val)
-}
-
-/// 文字列値に対する `Eq` / `Neq` 条件を評価する。
-///
-/// 比較対象値が文字列でない場合 (欠損値 `None` や数値・真偽値・配列等) は `false` を返す。
-fn matches_str_eq_neq(
-    op: NodeConditionOp,
-    actual: &str,
-    value: Option<&serde_json::Value>,
-) -> bool {
-    let Some(target_str) = value.and_then(|v| v.as_str()) else {
-        return false;
-    };
-    match op {
-        NodeConditionOp::Eq => actual == target_str,
-        NodeConditionOp::Neq => actual != target_str,
-        _ => false,
-    }
-}
-
-/// `route` (ゲーティングルート) フィールドの一致比較を評価する。
-///
-/// `answer` または `answer.gating` が `None` の場合 (未推論状態またはゲーティング無効時)、
-/// および比較対象値が文字列でない場合は `false` を返す。
-fn matches_route(cond: &NodeCondition, answer: Option<&Answer>) -> bool {
-    let Some(gating) = answer.and_then(|a| a.gating.as_ref()) else {
-        return false;
-    };
-    matches_str_eq_neq(cond.op, gating.route.as_str(), cond.value.as_ref())
-}
-
-/// `answer` / `value` フィールドに対する型別 (Noul / Choice / Score) 条件評価を行う。
-fn matches_answer_value(cond: &NodeCondition, ans: &Answer) -> bool {
-    if let Some(noul_val) = ans.as_noul() {
-        return matches_noul_value(cond, noul_val);
-    }
-    if let Some(choice_val) = ans.as_choice() {
-        return matches_choice_value(cond, choice_val);
-    }
-    if let Some(score_val) = ans.as_score() {
-        return cond
-            .value_as_f64()
-            .is_some_and(|target_num| cond.op.eval_f64(score_val, target_num));
-    }
-    false
-}
-
-/// Noul 判定の真偽確率に対する真偽値または数値閾値比較を評価する。
-fn matches_noul_value(cond: &NodeCondition, noul_val: f64) -> bool {
-    let target_bool = match &cond.value {
-        Some(serde_json::Value::Bool(b)) => Some(*b),
-        Some(serde_json::Value::String(s)) => match s.as_str() {
-            "true" => Some(true),
-            "false" => Some(false),
-            _ => None,
-        },
-        _ => None,
-    };
-    if let Some(tb) = target_bool {
-        let is_true = noul_val >= 0.5;
-        return match cond.op {
-            NodeConditionOp::Eq => is_true == tb,
-            NodeConditionOp::Neq => is_true != tb,
-            _ => false,
-        };
-    }
-
-    cond.value_as_f64()
-        .is_some_and(|target_num| cond.op.eval_f64(noul_val, target_num))
-}
-
-/// Choice 判定の選択キーに対する文字列比較および集合包含 (`In`) 比較を評価する。
-///
-/// `Eq` / `Neq` で比較対象値が文字列でない場合 (欠損値 `None` や数値・真偽値等) は `false` を返す。
-fn matches_choice_value(cond: &NodeCondition, choice_val: &str) -> bool {
-    match cond.op {
-        NodeConditionOp::Eq | NodeConditionOp::Neq => {
-            matches_str_eq_neq(cond.op, choice_val, cond.value.as_ref())
-        }
-        NodeConditionOp::In => cond
-            .value
-            .as_ref()
-            .and_then(|v| v.as_array())
-            .is_some_and(|arr| {
-                arr.iter()
-                    .any(|item| item.as_str().is_some_and(|s| s == choice_val))
-            }),
-        _ => false,
-    }
-}
-
-/// `Display` 出力が対象文字列と完全一致するかをヒープ割り当てなしで判定する。
-fn eq_display(target: &str, value: &impl std::fmt::Display) -> bool {
-    struct EqBytesWriter<'a> {
-        remaining: &'a [u8],
-        matched: bool,
-    }
-
-    impl std::fmt::Write for EqBytesWriter<'_> {
-        fn write_str(&mut self, s: &str) -> std::fmt::Result {
-            if !self.matched {
-                return Ok(());
-            }
-            if let Some(rest) = self.remaining.strip_prefix(s.as_bytes()) {
-                self.remaining = rest;
-            } else {
-                self.matched = false;
-            }
-            Ok(())
-        }
-    }
-
-    let mut writer = EqBytesWriter {
-        remaining: target.as_bytes(),
-        matched: true,
-    };
-    std::fmt::write(&mut writer, format_args!("{value}")).is_ok()
-        && writer.matched
-        && writer.remaining.is_empty()
-}
-
-/// 先行ノードのコンテキストプロパティ (`value` / `confidence`) を評価する。
-fn matches_context_property(
-    cond: &NodeCondition,
-    ctx_val: &NodeContextValue,
-    prop: ContextProp,
-) -> bool {
-    match prop {
-        ContextProp::Value => {
-            let is_eq = match &cond.value {
-                Some(serde_json::Value::String(s)) => ctx_val.value == s.as_str(),
-                Some(serde_json::Value::Bool(true)) => ctx_val.value == "true",
-                Some(serde_json::Value::Bool(false)) => ctx_val.value == "false",
-                Some(serde_json::Value::Number(n)) => eq_display(&ctx_val.value, n),
-                _ => return false,
-            };
-            match cond.op {
-                NodeConditionOp::Eq => is_eq,
-                NodeConditionOp::Neq => !is_eq,
-                _ => false,
-            }
-        }
-        ContextProp::Confidence => {
-            let Some(target_num) = cond.value_as_f64() else {
-                return false;
-            };
-            let normalized_op = match cond.op {
-                NodeConditionOp::ConfidenceGte | NodeConditionOp::Gte => NodeConditionOp::Gte,
-                NodeConditionOp::ConfidenceLt | NodeConditionOp::Lt => NodeConditionOp::Lt,
-                _ => return false,
-            };
-            normalized_op.eval_f64(ctx_val.confidence, target_num)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dag::schema::{ConditionField, ContextProp, NodeConditionOp};
     use sokuto_core::gating::DecisionRoute;
 
     #[test]

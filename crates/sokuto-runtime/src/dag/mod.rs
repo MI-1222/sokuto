@@ -10,13 +10,16 @@ pub mod pool;
 pub mod schema;
 pub mod validator;
 
-pub use executor::{DagError, InProcessDagExecutor, evaluate_conditions};
+pub use executor::{
+    DagError, InProcessDagExecutor, evaluate_compiled_conditions, evaluate_conditions,
+};
 pub use interpolate::{NodeContextValue, interpolate_prompt, interpolate_question};
 pub use pool::{
     LowLatencyResourcePool, LowLatencySessionPool, PoolError, PooledResource, PooledSession,
 };
 pub use schema::{
-    DagDefinition, DagExecutionResult, DagNode, DagNodeType, NodeCondition, NodeConditionOp,
-    StepExecutionResult, parse_condition_f64,
+    CompiledAnswerPredicate, CompiledCondition, CompiledDag, CompiledDagNode, ConditionField,
+    ConditionPredicate, ContextProp, DagDefinition, DagExecutionResult, DagNode, DagNodeType,
+    NodeCondition, NodeConditionOp, StepExecutionResult, parse_condition_f64,
 };
-pub use validator::{DagValidationError, validate_dag};
+pub use validator::{DagValidationError, compile_dag, validate_dag};

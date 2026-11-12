@@ -34,7 +34,7 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::engine::config::{ExecutionProvider, SessionConfig};
 use crate::engine::gating::{evaluate_and_gate_answer, evaluate_and_gate_answer_with_buf};
-use crate::engine::session::{acquire_pooled_session, create_session_builder};
+use crate::engine::session::{acquire_pooled_session, build_session_pool};
 use crate::error::{Result, RuntimeError};
 use crate::tokenizer::{JevTokenizer, TokenizedQuestion};
 
@@ -841,36 +841,20 @@ impl DualSessionEngine {
         config: SessionConfig,
         cache_manager: Arc<StateCacheManager>,
     ) -> Result<Self> {
-        let pool_size = config.pool_size.max(1);
-        let mut state_sessions = Vec::with_capacity(pool_size);
-        let mut query_sessions = Vec::with_capacity(pool_size);
-        let mut active_provider = ExecutionProvider::CPU;
+        let state_path = state_model_path.as_ref();
+        let query_path = query_model_path.as_ref();
+        let (state_sessions, state_provider) =
+            build_session_pool(&config, |mut b| b.commit_from_file(state_path))?;
+        let (query_sessions, query_provider) =
+            build_session_pool(&config, |mut b| b.commit_from_file(query_path))?;
 
-        for i in 0..pool_size {
-            let (mut state_builder, provider) = create_session_builder(&config, pool_size)?;
-            if i == 0 {
-                active_provider = provider;
-            }
-            let s_session = state_builder
-                .commit_from_file(state_model_path.as_ref())
-                .map_err(RuntimeError::Ort)?;
-            state_sessions.push(Mutex::new(s_session));
-
-            let (mut query_builder, _) = create_session_builder(&config, pool_size)?;
-            let q_session = query_builder
-                .commit_from_file(query_model_path.as_ref())
-                .map_err(RuntimeError::Ort)?;
-            query_sessions.push(Mutex::new(q_session));
-        }
-
-        Ok(Self {
+        Ok(Self::init_with_pools(
             state_sessions,
             query_sessions,
-            next_state_idx: AtomicUsize::new(0),
-            next_query_idx: AtomicUsize::new(0),
+            state_provider,
+            query_provider,
             cache_manager,
-            active_provider,
-        })
+        ))
     }
 
     /// メモリ上のバイト列からデュアルモデルを読み込み、エンジンを初期化する。
@@ -886,36 +870,44 @@ impl DualSessionEngine {
         config: SessionConfig,
         cache_manager: Arc<StateCacheManager>,
     ) -> Result<Self> {
-        let pool_size = config.pool_size.max(1);
-        let mut state_sessions = Vec::with_capacity(pool_size);
-        let mut query_sessions = Vec::with_capacity(pool_size);
-        let mut active_provider = ExecutionProvider::CPU;
+        let (state_sessions, state_provider) =
+            build_session_pool(&config, |mut b| b.commit_from_memory(state_model_bytes))?;
+        let (query_sessions, query_provider) =
+            build_session_pool(&config, |mut b| b.commit_from_memory(query_model_bytes))?;
 
-        for i in 0..pool_size {
-            let (mut state_builder, provider) = create_session_builder(&config, pool_size)?;
-            if i == 0 {
-                active_provider = provider;
-            }
-            let s_session = state_builder
-                .commit_from_memory(state_model_bytes)
-                .map_err(RuntimeError::Ort)?;
-            state_sessions.push(Mutex::new(s_session));
+        Ok(Self::init_with_pools(
+            state_sessions,
+            query_sessions,
+            state_provider,
+            query_provider,
+            cache_manager,
+        ))
+    }
 
-            let (mut query_builder, _) = create_session_builder(&config, pool_size)?;
-            let q_session = query_builder
-                .commit_from_memory(query_model_bytes)
-                .map_err(RuntimeError::Ort)?;
-            query_sessions.push(Mutex::new(q_session));
+    /// 構築済みの State/Query セッションプールを統合し、エンジンインスタンスを完成させる。
+    fn init_with_pools(
+        state_sessions: Vec<Mutex<Session>>,
+        query_sessions: Vec<Mutex<Session>>,
+        state_provider: ExecutionProvider,
+        query_provider: ExecutionProvider,
+        cache_manager: Arc<StateCacheManager>,
+    ) -> Self {
+        if state_provider != query_provider {
+            tracing::warn!(
+                "State セッションと Query セッションで Execution Provider が不一致です (State: {}, Query: {})。",
+                state_provider.name(),
+                query_provider.name()
+            );
         }
 
-        Ok(Self {
+        Self {
             state_sessions,
             query_sessions,
             next_state_idx: AtomicUsize::new(0),
             next_query_idx: AtomicUsize::new(0),
             cache_manager,
-            active_provider,
-        })
+            active_provider: state_provider,
+        }
     }
 
     /// 構築済みのセッションからエンジンインスタンスを生成する。

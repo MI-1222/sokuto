@@ -67,8 +67,6 @@ impl InferenceEngine {
         }
 
         let pool_size = config.pool_size.max(1);
-        let mut sessions = Vec::with_capacity(pool_size);
-        let mut active_provider = ExecutionProvider::CPU;
 
         tracing::info!(
             "推論セッションの初期化を開始します (パス: {}, プール数: {})...",
@@ -76,17 +74,8 @@ impl InferenceEngine {
             pool_size
         );
 
-        for i in 0..pool_size {
-            let (mut builder, provider) = create_session_builder(&config, pool_size)?;
-            if i == 0 {
-                active_provider = provider;
-            }
-
-            let session = builder
-                .commit_from_file(model_path_ref)
-                .map_err(RuntimeError::Ort)?;
-            sessions.push(Mutex::new(session));
-        }
+        let (sessions, active_provider) =
+            build_session_pool(&config, |mut b| b.commit_from_file(model_path_ref))?;
 
         Self::init_with_sessions(sessions, active_provider)
     }
@@ -98,8 +87,6 @@ impl InferenceEngine {
     /// - `config`: セッション構築設定。
     pub fn from_bytes(model_bytes: &[u8], config: SessionConfig) -> Result<Self> {
         let pool_size = config.pool_size.max(1);
-        let mut sessions = Vec::with_capacity(pool_size);
-        let mut active_provider = ExecutionProvider::CPU;
 
         tracing::info!(
             "バイト列からの推論セッション初期化を開始します (サイズ: {} bytes, プール数: {})...",
@@ -107,17 +94,8 @@ impl InferenceEngine {
             pool_size
         );
 
-        for i in 0..pool_size {
-            let (mut builder, provider) = create_session_builder(&config, pool_size)?;
-            if i == 0 {
-                active_provider = provider;
-            }
-
-            let session = builder
-                .commit_from_memory(model_bytes)
-                .map_err(RuntimeError::Ort)?;
-            sessions.push(Mutex::new(session));
-        }
+        let (sessions, active_provider) =
+            build_session_pool(&config, |mut b| b.commit_from_memory(model_bytes))?;
 
         Self::init_with_sessions(sessions, active_provider)
     }
@@ -706,6 +684,66 @@ pub(crate) fn create_session_builder(
     Ok((builder, provider))
 }
 
+/// 指定された設定から `Session` プールを構築する内部共通ヘルパー関数。
+///
+/// `config.pool_size` (最小値 1) 分の [`SessionBuilder`] を生成し、
+/// `commit_fn` でモデルをコミットして `Mutex<Session>` のプールと有効な [`ExecutionProvider`] を返す。
+/// スロット 0 の Execution Provider を基準値とし、2 番目以降 (`i >= 1`) で異なる
+/// Execution Provider にフォールバックした場合は警告ログを出力する。
+///
+/// # 引数
+/// - `config`: セッション構築設定。
+/// - `commit_fn`: 構成済み [`SessionBuilder`] から [`Session`] を確定するクロージャ。
+pub(crate) fn build_session_pool<F>(
+    config: &SessionConfig,
+    mut commit_fn: F,
+) -> Result<(Vec<Mutex<Session>>, ExecutionProvider)>
+where
+    F: FnMut(SessionBuilder) -> ort::Result<Session>,
+{
+    build_session_pool_with(
+        config.pool_size,
+        |pool_size| create_session_builder(config, pool_size),
+        |builder| commit_fn(builder).map_err(RuntimeError::Ort),
+    )
+}
+
+/// ビルダー生成処理とセッション確定処理を注入してセッションプールを構築する内部補助関数。
+///
+/// [`build_session_pool`] の実体であり、ユニットテスト時にモックを使って
+/// プールサイズ正規化や Execution Provider 不一致検知を検証できるように分離している。
+fn build_session_pool_with<B, S, BF, CF>(
+    pool_size: usize,
+    mut build_fn: BF,
+    mut commit_fn: CF,
+) -> Result<(Vec<Mutex<S>>, ExecutionProvider)>
+where
+    BF: FnMut(usize) -> Result<(B, ExecutionProvider)>,
+    CF: FnMut(B) -> Result<S>,
+{
+    let effective_pool_size = pool_size.max(1);
+    let mut sessions = Vec::with_capacity(effective_pool_size);
+    let mut active_provider = ExecutionProvider::CPU;
+
+    for i in 0..effective_pool_size {
+        let (builder, provider) = build_fn(effective_pool_size)?;
+        if i == 0 {
+            active_provider = provider;
+        } else if provider != active_provider {
+            tracing::warn!(
+                "セッションプール内の Execution Provider が不一致です (スロット 0: {}, スロット {i}: {})。",
+                active_provider.name(),
+                provider.name()
+            );
+        }
+
+        let session = commit_fn(builder)?;
+        sessions.push(Mutex::new(session));
+    }
+
+    Ok((sessions, active_provider))
+}
+
 /// セッションプールから利用可能なスロットを借り受ける内部共通ヘルパー関数。
 ///
 /// `counter` によるラウンドロビン開始位置から非ブロッキング (`try_lock`) で空きスロットを優先探索し、
@@ -811,5 +849,71 @@ mod tests {
         let empty: Vec<Mutex<usize>> = Vec::new();
         let err = acquire_pooled_session(&empty, &counter, "State").unwrap_err();
         assert!(err.to_string().contains("State セッションプールが空です。"));
+    }
+
+    #[test]
+    fn test_build_session_pool_with_clamps_pool_size_and_tracks_provider() {
+        // pool_size = 0 指定時は最小値 1 へ正規化され、先頭スロットの EP が採用されること。
+        let mut observed_pool_sizes = Vec::new();
+        let (sessions, provider) = build_session_pool_with(
+            0,
+            |effective_size| {
+                observed_pool_sizes.push(effective_size);
+                Ok(("builder", ExecutionProvider::CoreML))
+            },
+            |b| Ok(format!("{b}-session")),
+        )
+        .unwrap();
+
+        assert_eq!(observed_pool_sizes, vec![1]);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(provider, ExecutionProvider::CoreML);
+        assert_eq!(*sessions[0].lock().unwrap(), "builder-session");
+    }
+
+    #[test]
+    fn test_build_session_pool_with_keeps_first_provider_on_fallback_and_propagates_errors() {
+        // スロット 0 の EP が基準値として維持され、後続スロットのフォールバック時も全スロットが構築されること。
+        let mut call_idx = 0usize;
+        let (sessions, provider) = build_session_pool_with(
+            3,
+            |_| {
+                let ep = if call_idx == 0 {
+                    ExecutionProvider::CUDA
+                } else {
+                    ExecutionProvider::CPU
+                };
+                call_idx += 1;
+                Ok((call_idx, ep))
+            },
+            |idx| Ok(idx * 10),
+        )
+        .unwrap();
+
+        assert_eq!(sessions.len(), 3);
+        assert_eq!(provider, ExecutionProvider::CUDA);
+        assert_eq!(*sessions[0].lock().unwrap(), 10);
+        assert_eq!(*sessions[1].lock().unwrap(), 20);
+        assert_eq!(*sessions[2].lock().unwrap(), 30);
+
+        // commit_fn が失敗した場合は即座にエラーが伝播すること。
+        let mut commit_count = 0usize;
+        let err = build_session_pool_with(
+            3,
+            |_| Ok(((), ExecutionProvider::CPU)),
+            |()| {
+                commit_count += 1;
+                if commit_count == 2 {
+                    Err(RuntimeError::ModelContractViolation(
+                        "commit failed".to_string(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(commit_count, 2);
+        assert!(err.to_string().contains("commit failed"));
     }
 }

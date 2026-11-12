@@ -61,6 +61,61 @@ impl BatchScratchpad {
     }
 }
 
+/// バッチ推論パイプラインの動作を制御するオプション構造体 (Parameter Object)。
+///
+/// ゲーティング設定、スクラッチパッドバッファ、マイクロバッチチャンクサイズ、
+/// および粗密 2 段階探索の設定を一元的に指定し、単一の一貫した推論エントリーポイントへ引き渡す。
+#[derive(Default)]
+pub struct BatchInferenceOptions<'a> {
+    /// 明示的なゲーティング設定 (任意、未指定時は `CalibrationConfig` から導出)。
+    pub gating_config: Option<&'a GatingConfig>,
+    /// 再利用可能な作業用スクラッチパッドバッファ (任意、未指定時は内部で一時確保)。
+    pub scratchpad: Option<&'a mut BatchScratchpad>,
+    /// 1 回のフォワードパスで処理する最大質問数 (任意、未指定時は一括実行)。
+    pub chunk_size: Option<usize>,
+    /// 粗密 2 段階探索の設定 (任意、指定時は候補数閾値を超える `Choice` 質問を事前スクリーニング)。
+    pub coarse_config: Option<&'a CoarseToFineConfig>,
+    /// 粗密 2 段階探索で使用する類似度スコアラー (任意、未設定時は `LexicalCoarseScorer` を使用)。
+    pub coarse_scorer: Option<&'a dyn CoarseScorer>,
+}
+
+impl<'a> BatchInferenceOptions<'a> {
+    /// 既定値でオプションを生成する。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// ゲーティング設定を指定する。
+    pub fn with_gating(mut self, gating_config: Option<&'a GatingConfig>) -> Self {
+        self.gating_config = gating_config;
+        self
+    }
+
+    /// 再利用可能なスクラッチパッドバッファを指定する。
+    pub fn with_scratchpad(mut self, scratchpad: &'a mut BatchScratchpad) -> Self {
+        self.scratchpad = Some(scratchpad);
+        self
+    }
+
+    /// マイクロバッチ分割の最大チャンクサイズを指定する。
+    pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.chunk_size = Some(chunk_size);
+        self
+    }
+
+    /// 粗密 2 段階探索の設定を指定する。
+    pub fn with_coarse_to_fine(mut self, coarse_config: &'a CoarseToFineConfig) -> Self {
+        self.coarse_config = Some(coarse_config);
+        self
+    }
+
+    /// 粗密 2 段階探索で用いる類似度スコアラーを指定する。
+    pub fn with_coarse_scorer(mut self, scorer: &'a dyn CoarseScorer) -> Self {
+        self.coarse_scorer = Some(scorer);
+        self
+    }
+}
+
 impl InferenceEngine {
     /// 事前パッキング済みバッチトークン列を受け取り、単一フォワードパスで各質問のロジットを算出する。
     ///
@@ -140,14 +195,161 @@ impl InferenceEngine {
         self.forward_batch_tokenized(&batch)
     }
 
-    /// 共通 State、複数質問群、および較正設定を受け取り、単一フォワードパスで判定結果を一括導出する。
+    /// 指定された推論オプション (`BatchInferenceOptions`) に基づき、複数質問の一括評価を実行する統一コアパイプライン。
     ///
-    /// # 処理フロー
-    /// 1. `tokenizer.encode_batch_questions` によるプレフィックス共有バッチ化。
-    /// 2. `forward_batch_tokenized_into` による単一フォワードパス実行。
-    /// 3. 各質問の真の候補数 $K_i$ によるスライス抽出とダミーロジット破棄。
-    /// 4. `sokuto_core::decision::evaluate_question_with_buf` による決定論的プリミティブ解決。
-    /// 5. 較正設定の閾値に基づき、透過的に確信度ゲーティングを適用して返却。
+    /// 粗密 2 段階探索の前処理、マイクロバッチ分割実行、スクラッチパッドバッファ再利用、
+    /// および確信度ゲーティング適用を単一のフローで統合制御する。
+    ///
+    /// # 引数
+    /// - `tokenizer`: Jev 高速トークナイザー。
+    /// - `state`: 共通文脈テキスト。
+    /// - `questions`: 質問識別子と質問定義のマップ。
+    /// - `calib_config`: 較正温度設定。
+    /// - `options`: バッチ推論の各種実行オプション。
+    pub fn evaluate_batch_questions_with_options(
+        &self,
+        tokenizer: &JevTokenizer,
+        state: &str,
+        questions: &IndexMap<String, Question>,
+        calib_config: &CalibrationConfig,
+        options: BatchInferenceOptions<'_>,
+    ) -> Result<IndexMap<String, Answer>> {
+        let BatchInferenceOptions {
+            gating_config,
+            scratchpad,
+            chunk_size,
+            coarse_config,
+            coarse_scorer,
+        } = options;
+
+        let mut prepared_coarse = None;
+        let mut coarse_state = None;
+
+        if let Some(coarse_cfg) = coarse_config {
+            coarse_cfg.validate()?;
+            if !questions.is_empty() {
+                let fallback_scorer;
+                let scorer: &dyn CoarseScorer = match coarse_scorer {
+                    Some(s) => s,
+                    None => {
+                        fallback_scorer = LexicalCoarseScorer::new(tokenizer);
+                        &fallback_scorer
+                    }
+                };
+                let prepared = prepare_coarse_questions(state, questions, coarse_cfg, scorer)?;
+                let energies = IndexMap::with_capacity(prepared.original_keys_map.len());
+                coarse_state = Some(CoarseRuntimeState {
+                    original_keys_map: prepared.original_keys_map,
+                    energies,
+                });
+                prepared_coarse = Some(prepared.processed_questions);
+            }
+        }
+
+        let effective_questions = prepared_coarse.as_ref().unwrap_or(questions);
+        let mut local_scratchpad;
+        let scratchpad = match scratchpad {
+            Some(sp) => sp,
+            None => {
+                local_scratchpad = BatchScratchpad::default();
+                &mut local_scratchpad
+            }
+        };
+
+        let mut answers = IndexMap::with_capacity(effective_questions.len());
+        let ctx = BatchEvalContext {
+            state,
+            calib_config,
+            gating_config,
+        };
+
+        if let Some(effective_chunk_size) = chunk_size
+            .map(|c| c.max(1))
+            .filter(|&c| effective_questions.len() > c)
+        {
+            let state_ids = tokenizer.encode_state(state)?;
+            for sub_questions in iter_map_chunks(effective_questions, effective_chunk_size) {
+                let batch = tokenizer.encode_batch_with_pretokenized_state(
+                    &state_ids,
+                    &sub_questions,
+                    tokenizer.max_sequence_length(),
+                )?;
+                self.execute_batch_chunk(
+                    &ctx,
+                    &batch,
+                    &sub_questions,
+                    questions,
+                    scratchpad,
+                    coarse_state.as_mut(),
+                    &mut answers,
+                )?;
+            }
+        } else {
+            let batch = tokenizer.encode_batch_questions(state, effective_questions)?;
+            self.execute_batch_chunk(
+                &ctx,
+                &batch,
+                effective_questions,
+                questions,
+                scratchpad,
+                coarse_state.as_mut(),
+                &mut answers,
+            )?;
+        }
+
+        if let Some(coarse) = coarse_state.as_ref() {
+            reconstruct_and_gate_batch_answers(
+                &ctx,
+                questions,
+                &coarse.original_keys_map,
+                &coarse.energies,
+                &mut answers,
+            )?;
+        }
+
+        Ok(answers)
+    }
+
+    /// 1 チャンク分のパッキング済みバッチを推論し、決定解決または粗密中間結果を格納する。
+    #[allow(clippy::too_many_arguments)]
+    fn execute_batch_chunk(
+        &self,
+        ctx: &BatchEvalContext<'_>,
+        batch: &BatchTokenizedQuestions,
+        chunk_questions: &IndexMap<String, Question>,
+        original_questions: &IndexMap<String, Question>,
+        scratchpad: &mut BatchScratchpad,
+        coarse_state: Option<&mut CoarseRuntimeState>,
+        answers: &mut IndexMap<String, Answer>,
+    ) -> Result<()> {
+        let num_options = batch.dims.num_options;
+        let total_logits = batch.dims.batch_size * num_options;
+        scratchpad.prepare(total_logits, num_options);
+
+        let flat_logits = &mut scratchpad.flat_logits[..total_logits];
+        self.forward_batch_tokenized_into(batch, flat_logits)?;
+
+        let probs_buf = &mut scratchpad.probs_buf[..num_options];
+        if let Some(coarse) = coarse_state {
+            resolve_coarse_batch_chunk(
+                ctx,
+                batch,
+                chunk_questions,
+                original_questions,
+                &coarse.original_keys_map,
+                flat_logits,
+                probs_buf,
+                &mut coarse.energies,
+                answers,
+            )?;
+        } else {
+            resolve_batch_answers(ctx, batch, chunk_questions, flat_logits, probs_buf, answers)?;
+        }
+
+        Ok(())
+    }
+
+    /// 共通 State、複数質問群、および較正設定を受け取り、単一フォワードパスで判定結果を一括導出する。
     ///
     /// # 引数
     /// - `tokenizer`: Jev 高速トークナイザー。
@@ -164,7 +366,13 @@ impl InferenceEngine {
         questions: &IndexMap<String, Question>,
         calib_config: &CalibrationConfig,
     ) -> Result<IndexMap<String, Answer>> {
-        self.evaluate_batch_questions_with_gating(tokenizer, state, questions, calib_config, None)
+        self.evaluate_batch_questions_with_options(
+            tokenizer,
+            state,
+            questions,
+            calib_config,
+            BatchInferenceOptions::default(),
+        )
     }
 
     /// ゲーティング設定を明示指定して、複数質問一括バッチ推論を実行する。
@@ -183,29 +391,13 @@ impl InferenceEngine {
         calib_config: &CalibrationConfig,
         gating_config: Option<&GatingConfig>,
     ) -> Result<IndexMap<String, Answer>> {
-        let batch = tokenizer.encode_batch_questions(state, questions)?;
-        let total_logits = batch.dims.batch_size * batch.dims.num_options;
-        let mut flat_logits = vec![0.0f64; total_logits];
-
-        self.forward_batch_tokenized_into(&batch, &mut flat_logits)?;
-
-        let mut answers = IndexMap::with_capacity(batch.dims.batch_size);
-        let mut probs_buf = vec![0.0f64; batch.dims.num_options];
-        let ctx = BatchEvalContext {
+        self.evaluate_batch_questions_with_options(
+            tokenizer,
             state,
-            calib_config,
-            gating_config,
-        };
-        resolve_batch_answers(
-            &ctx,
-            &batch,
             questions,
-            &flat_logits,
-            &mut probs_buf,
-            &mut answers,
-        )?;
-
-        Ok(answers)
+            calib_config,
+            BatchInferenceOptions::default().with_gating(gating_config),
+        )
     }
 
     /// スクラッチパッドバッファを再利用し、共通 State と複数質問群の判定結果を一括導出する。
@@ -226,13 +418,12 @@ impl InferenceEngine {
         calib_config: &CalibrationConfig,
         scratchpad: &mut BatchScratchpad,
     ) -> Result<IndexMap<String, Answer>> {
-        self.evaluate_batch_questions_with_scratchpad_and_gating(
+        self.evaluate_batch_questions_with_options(
             tokenizer,
             state,
             questions,
             calib_config,
-            None,
-            scratchpad,
+            BatchInferenceOptions::default().with_scratchpad(scratchpad),
         )
     }
 
@@ -254,30 +445,15 @@ impl InferenceEngine {
         gating_config: Option<&GatingConfig>,
         scratchpad: &mut BatchScratchpad,
     ) -> Result<IndexMap<String, Answer>> {
-        let batch = tokenizer.encode_batch_questions(state, questions)?;
-        let total_logits = batch.dims.batch_size * batch.dims.num_options;
-        let num_options = batch.dims.num_options;
-
-        scratchpad.prepare(total_logits, num_options);
-
-        self.forward_batch_tokenized_into(&batch, &mut scratchpad.flat_logits[..total_logits])?;
-
-        let mut answers = IndexMap::with_capacity(batch.dims.batch_size);
-        let ctx = BatchEvalContext {
+        self.evaluate_batch_questions_with_options(
+            tokenizer,
             state,
-            calib_config,
-            gating_config,
-        };
-        resolve_batch_answers(
-            &ctx,
-            &batch,
             questions,
-            &scratchpad.flat_logits[..total_logits],
-            &mut scratchpad.probs_buf,
-            &mut answers,
-        )?;
-
-        Ok(answers)
+            calib_config,
+            BatchInferenceOptions::default()
+                .with_gating(gating_config)
+                .with_scratchpad(scratchpad),
+        )
     }
 
     /// 共通 State と複数質問群を指定されたチャンクサイズで分割実行し、有効ロジットを返却する。
@@ -337,13 +513,12 @@ impl InferenceEngine {
         calib_config: &CalibrationConfig,
         chunk_size: usize,
     ) -> Result<IndexMap<String, Answer>> {
-        self.evaluate_batch_questions_chunked_with_gating(
+        self.evaluate_batch_questions_with_options(
             tokenizer,
             state,
             questions,
             calib_config,
-            chunk_size,
-            None,
+            BatchInferenceOptions::default().with_chunk_size(chunk_size),
         )
     }
 
@@ -365,57 +540,18 @@ impl InferenceEngine {
         chunk_size: usize,
         gating_config: Option<&GatingConfig>,
     ) -> Result<IndexMap<String, Answer>> {
-        let chunk_size = chunk_size.max(1);
-        if questions.len() <= chunk_size {
-            return self.evaluate_batch_questions_with_gating(
-                tokenizer,
-                state,
-                questions,
-                calib_config,
-                gating_config,
-            );
-        }
-
-        let state_ids = tokenizer.encode_state(state)?;
-        let mut answers = IndexMap::with_capacity(questions.len());
-        let ctx = BatchEvalContext {
+        self.evaluate_batch_questions_with_options(
+            tokenizer,
             state,
+            questions,
             calib_config,
-            gating_config,
-        };
-
-        for sub_questions in iter_map_chunks(questions, chunk_size) {
-            let batch = tokenizer.encode_batch_with_pretokenized_state(
-                &state_ids,
-                &sub_questions,
-                tokenizer.max_sequence_length(),
-            )?;
-
-            let total_logits = batch.dims.batch_size * batch.dims.num_options;
-            let mut flat_logits = vec![0.0f64; total_logits];
-            self.forward_batch_tokenized_into(&batch, &mut flat_logits)?;
-
-            let mut probs_buf = vec![0.0f64; batch.dims.num_options];
-            resolve_batch_answers(
-                &ctx,
-                &batch,
-                &sub_questions,
-                &flat_logits,
-                &mut probs_buf,
-                &mut answers,
-            )?;
-        }
-
-        Ok(answers)
+            BatchInferenceOptions::default()
+                .with_chunk_size(chunk_size)
+                .with_gating(gating_config),
+        )
     }
 
     /// 任意の類似度スコアラーを指定して、粗密 2 段階探索を適用した複数質問一括バッチ推論を実行する。
-    ///
-    /// # 処理フロー
-    /// 1. 各質問を走査し、`Choice` かつ候補数 $K > \text{threshold}$ の質問を個別に Top-M 候補にスクリーニング。
-    /// 2. 縮小質問群(および閾値以下の元質問群)をプレフィックス共有バッチ化。
-    /// 3. バッチ全体の最大候補数 $K_{\max}$ が圧縮された状態で単一フォワードパスを実行。
-    /// 4. 各質問の決定プリミティブを解決し、スクリーニングされた質問については除外候補を確率 0.0 として全候補確率マップを再構成。
     ///
     /// # 引数
     /// - `tokenizer`: Jev 高速トークナイザー。
@@ -433,55 +569,15 @@ impl InferenceEngine {
         coarse_config: &CoarseToFineConfig,
         scorer: &S,
     ) -> Result<IndexMap<String, Answer>> {
-        coarse_config.validate()?;
-
-        if questions.is_empty() {
-            return self.evaluate_batch_questions(tokenizer, state, questions, calib_config);
-        }
-
-        // 各質問の前処理と縮小
-        let PreparedCoarseBatch {
-            processed_questions,
-            original_keys_map,
-        } = prepare_coarse_questions(state, questions, coarse_config, scorer)?;
-
-        // バッチ推論を実行 (最大候補数 K_max が縮小された状態で単一フォワードパス)
-        let batch = tokenizer.encode_batch_questions(state, &processed_questions)?;
-        let total_logits = batch.dims.batch_size * batch.dims.num_options;
-        let mut flat_logits = vec![0.0f64; total_logits];
-        self.forward_batch_tokenized_into(&batch, &mut flat_logits)?;
-
-        let mut answers = IndexMap::with_capacity(questions.len());
-        let mut probs_buf = vec![0.0f64; batch.dims.num_options];
-        let mut coarse_energies: IndexMap<String, Option<f64>> =
-            IndexMap::with_capacity(original_keys_map.len());
-        let ctx = BatchEvalContext {
+        self.evaluate_batch_questions_with_options(
+            tokenizer,
             state,
+            questions,
             calib_config,
-            gating_config: None,
-        };
-
-        resolve_coarse_batch_chunk(
-            &ctx,
-            &batch,
-            &processed_questions,
-            questions,
-            &original_keys_map,
-            &flat_logits,
-            &mut probs_buf,
-            &mut coarse_energies,
-            &mut answers,
-        )?;
-
-        reconstruct_and_gate_batch_answers(
-            &ctx,
-            questions,
-            &original_keys_map,
-            &coarse_energies,
-            &mut answers,
-        )?;
-
-        Ok(answers)
+            BatchInferenceOptions::default()
+                .with_coarse_to_fine(coarse_config)
+                .with_coarse_scorer(scorer),
+        )
     }
 
     /// 既定の語彙スコアラー (`LexicalCoarseScorer`) を用いて、粗密 2 段階探索を適用した複数質問一括バッチ推論を実行する。
@@ -500,14 +596,12 @@ impl InferenceEngine {
         calib_config: &CalibrationConfig,
         coarse_config: &CoarseToFineConfig,
     ) -> Result<IndexMap<String, Answer>> {
-        let scorer = LexicalCoarseScorer::new(tokenizer);
-        self.evaluate_batch_questions_coarse_to_fine_with_scorer(
+        self.evaluate_batch_questions_with_options(
             tokenizer,
             state,
             questions,
             calib_config,
-            coarse_config,
-            &scorer,
+            BatchInferenceOptions::default().with_coarse_to_fine(coarse_config),
         )
     }
 
@@ -573,66 +667,21 @@ impl InferenceEngine {
         scorer: &S,
     ) -> Result<IndexMap<String, Answer>> {
         coarse_config.validate()?;
-
         if questions.is_empty() {
             return Ok(IndexMap::new());
         }
 
-        let effective_chunk_size = chunk_size.max(1);
-
-        // 1. 各質問の前処理と粗スクリーニング (Top-M 抽出)
-        let PreparedCoarseBatch {
-            processed_questions,
-            original_keys_map,
-        } = prepare_coarse_questions(state, questions, coarse_config, scorer)?;
-
-        // 2. 共通 State を 1 度だけエンコードし全チャンクで再利用
-        let state_ids = tokenizer.encode_state(state)?;
-        let mut answers = IndexMap::with_capacity(questions.len());
-        let mut coarse_energies: IndexMap<String, Option<f64>> =
-            IndexMap::with_capacity(original_keys_map.len());
-        let ctx = BatchEvalContext {
+        self.evaluate_batch_questions_with_options(
+            tokenizer,
             state,
-            calib_config,
-            gating_config,
-        };
-
-        // 3. マイクロバッチ分割逐次推論
-        for sub_questions in iter_map_chunks(&processed_questions, effective_chunk_size) {
-            let batch = tokenizer.encode_batch_with_pretokenized_state(
-                &state_ids,
-                &sub_questions,
-                tokenizer.max_sequence_length(),
-            )?;
-
-            let total_logits = batch.dims.batch_size * batch.dims.num_options;
-            let mut flat_logits = vec![0.0f64; total_logits];
-            self.forward_batch_tokenized_into(&batch, &mut flat_logits)?;
-
-            let mut probs_buf = vec![0.0f64; batch.dims.num_options];
-            resolve_coarse_batch_chunk(
-                &ctx,
-                &batch,
-                &sub_questions,
-                questions,
-                &original_keys_map,
-                &flat_logits,
-                &mut probs_buf,
-                &mut coarse_energies,
-                &mut answers,
-            )?;
-        }
-
-        // 4. スクリーニングされた質問の確率マップ・複合確信度を全候補空間に復元し、ゲーティングを適用
-        reconstruct_and_gate_batch_answers(
-            &ctx,
             questions,
-            &original_keys_map,
-            &coarse_energies,
-            &mut answers,
-        )?;
-
-        Ok(answers)
+            calib_config,
+            BatchInferenceOptions::default()
+                .with_coarse_to_fine(coarse_config)
+                .with_chunk_size(chunk_size)
+                .with_gating(gating_config)
+                .with_coarse_scorer(scorer),
+        )
     }
 
     /// 既定の語彙スコアラー (`LexicalCoarseScorer`) を用いて、粗密 2 段階探索とマイクロバッチチャンキングを統合した推論を実行する。
@@ -653,15 +702,14 @@ impl InferenceEngine {
         coarse_config: &CoarseToFineConfig,
         chunk_size: usize,
     ) -> Result<IndexMap<String, Answer>> {
-        let scorer = LexicalCoarseScorer::new(tokenizer);
-        self.evaluate_batch_questions_coarse_to_fine_chunked_with_scorer(
+        self.evaluate_batch_questions_coarse_to_fine_chunked_with_gating(
             tokenizer,
             state,
             questions,
             calib_config,
             coarse_config,
             chunk_size,
-            &scorer,
+            None,
         )
     }
 
@@ -686,16 +734,20 @@ impl InferenceEngine {
         chunk_size: usize,
         gating_config: Option<&GatingConfig>,
     ) -> Result<IndexMap<String, Answer>> {
-        let scorer = LexicalCoarseScorer::new(tokenizer);
-        self.evaluate_batch_questions_coarse_to_fine_chunked_with_gating_and_scorer(
+        coarse_config.validate()?;
+        if questions.is_empty() {
+            return Ok(IndexMap::new());
+        }
+
+        self.evaluate_batch_questions_with_options(
             tokenizer,
             state,
             questions,
             calib_config,
-            coarse_config,
-            chunk_size,
-            gating_config,
-            &scorer,
+            BatchInferenceOptions::default()
+                .with_coarse_to_fine(coarse_config)
+                .with_chunk_size(chunk_size)
+                .with_gating(gating_config),
         )
     }
 
@@ -753,6 +805,12 @@ struct PreparedCoarseBatch {
     original_keys_map: IndexMap<String, Vec<String>>,
 }
 
+/// 統一バッチ推論における粗密復元用の実行時状態。
+struct CoarseRuntimeState {
+    original_keys_map: IndexMap<String, Vec<String>>,
+    energies: IndexMap<String, Option<f64>>,
+}
+
 /// 粗密探索の前処理として、候補数が閾値を超える `Choice` 質問を Top-$M$ 候補へ縮小する。
 ///
 /// 縮小対象となった質問については全候補の元キー配列を `original_keys_map` に記録し、
@@ -766,7 +824,7 @@ struct PreparedCoarseBatch {
 ///
 /// # 戻り値
 /// 縮小済み質問マップと元候補キー配列マップを格納した `PreparedCoarseBatch`。
-fn prepare_coarse_questions<S: CoarseScorer>(
+fn prepare_coarse_questions<S: CoarseScorer + ?Sized>(
     state: &str,
     questions: &IndexMap<String, Question>,
     coarse_config: &CoarseToFineConfig,
@@ -1357,5 +1415,43 @@ mod tests {
         // 空マップの場合は空イテレータとなること。
         let empty: IndexMap<String, usize> = IndexMap::new();
         assert_eq!(iter_map_chunks(&empty, 2).count(), 0);
+    }
+
+    #[test]
+    fn test_batch_inference_options_builder() {
+        let default_opts = BatchInferenceOptions::default();
+        assert!(default_opts.gating_config.is_none());
+        assert!(default_opts.scratchpad.is_none());
+        assert!(default_opts.chunk_size.is_none());
+        assert!(default_opts.coarse_config.is_none());
+        assert!(default_opts.coarse_scorer.is_none());
+
+        let gating_cfg = GatingConfig::default();
+        let coarse_cfg = CoarseToFineConfig::default();
+        let mut scratchpad = BatchScratchpad::with_capacity(16, 4);
+        struct DummyScorer;
+        impl CoarseScorer for DummyScorer {
+            fn score_candidates(
+                &self,
+                _query: &str,
+                candidates: &IndexMap<String, String>,
+            ) -> Result<Vec<f32>> {
+                Ok(vec![0.0; candidates.len()])
+            }
+        }
+        let scorer = DummyScorer;
+
+        let opts = BatchInferenceOptions::new()
+            .with_gating(Some(&gating_cfg))
+            .with_scratchpad(&mut scratchpad)
+            .with_chunk_size(8)
+            .with_coarse_to_fine(&coarse_cfg)
+            .with_coarse_scorer(&scorer);
+
+        assert!(opts.gating_config.is_some());
+        assert!(opts.scratchpad.is_some());
+        assert_eq!(opts.chunk_size, Some(8));
+        assert!(opts.coarse_config.is_some());
+        assert!(opts.coarse_scorer.is_some());
     }
 }

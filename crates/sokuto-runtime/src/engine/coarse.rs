@@ -406,7 +406,7 @@ pub fn filter_top_candidates(
     query: &str,
     candidates: &IndexMap<String, String>,
     config: &CoarseToFineConfig,
-    scorer: &impl CoarseScorer,
+    scorer: &(impl CoarseScorer + ?Sized),
 ) -> Result<FilteredCandidates> {
     let total_candidates = candidates.len();
 

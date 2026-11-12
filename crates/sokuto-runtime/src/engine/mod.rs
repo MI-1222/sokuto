@@ -12,7 +12,7 @@ pub mod gating;
 pub mod provider;
 pub mod session;
 
-pub use batch::{BatchScratchpad, DEFAULT_MAX_BATCH_CHUNK_SIZE};
+pub use batch::{BatchInferenceOptions, BatchScratchpad, DEFAULT_MAX_BATCH_CHUNK_SIZE};
 pub use cache::{
     AlignedBuffer64, CacheCompressionMode, CachedStateFeatures, CachedTensorPayload,
     DEFAULT_DUAL_MAX_BATCH_CHUNK_SIZE, DualSessionEngine, StateCacheManager, is_aligned_64,

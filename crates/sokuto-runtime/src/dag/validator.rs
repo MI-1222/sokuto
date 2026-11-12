@@ -481,6 +481,9 @@ fn validate_node_conditions(
 }
 
 /// 全 Inference ノードの Instructions および Criteria におけるプロンプト補間変数 (`{node_id.prop}`) を静的検証する。
+///
+/// 外部入力である `initial_state` は静的定義に含まれず、意図しない変数展開や内部情報漏洩を防止するため
+/// 実行時にも補間対象から除外される。そのため本検証の対象はノード定義内の `question.instructions` および `question.criteria` のみである。
 fn validate_prompt_interpolations(
     dag: &DagDefinition,
     ancestors: &HashMap<&str, HashSet<&str>>,

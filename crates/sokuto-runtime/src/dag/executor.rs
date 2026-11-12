@@ -10,7 +10,7 @@ use indexmap::IndexMap;
 use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_core::schema::{Answer, AnswerPayload, Question};
 
-use crate::dag::interpolate::{NodeContextValue, interpolate_prompt, interpolate_question};
+use crate::dag::interpolate::{NodeContextValue, interpolate_question};
 use crate::dag::pool::PoolError;
 use crate::dag::schema::{
     CompiledCondition, CompiledDag, CompiledDagNode, DagDefinition, DagExecutionResult,
@@ -139,8 +139,8 @@ impl InProcessDagExecutor {
         let mut steps: IndexMap<String, StepExecutionResult> = IndexMap::new();
         let mut execution_path: Vec<String> = Vec::new();
 
-        // スクラッチバッファをループ外で事前確保し、各ステップで再利用する
-        let mut scratch_state = String::with_capacity(initial_state.len() + 64);
+        // 外部入力である state は変数補間を行わず、Arc<str> で各非同期タスクへゼロコピー共有する
+        let state: Arc<str> = Arc::from(initial_state);
 
         let mut curr_node_id = dag.entry_node.clone();
         let mut step_count = 0;
@@ -170,12 +170,7 @@ impl InProcessDagExecutor {
                     conditions,
                     reason,
                 } => {
-                    let handle = self.spawn_inference_task(
-                        initial_state,
-                        question,
-                        &context,
-                        &mut scratch_state,
-                    );
+                    let handle = self.spawn_inference_task(Arc::clone(&state), question, &context);
                     let answer = Self::await_inference_task(handle, "スレッド結合失敗").await?;
 
                     // コンテキストに結果を反映
@@ -246,12 +241,8 @@ impl InProcessDagExecutor {
                             ))
                         })?;
 
-                        let handle = self.spawn_inference_task(
-                            initial_state,
-                            raw_question,
-                            &context,
-                            &mut scratch_state,
-                        );
+                        let handle =
+                            self.spawn_inference_task(Arc::clone(&state), raw_question, &context);
                         let p_id = p_node_id.clone();
                         tasks.push(async move {
                             let ans =
@@ -379,33 +370,31 @@ impl InProcessDagExecutor {
 
     /// 単一質問に対する推論タスクをバックグラウンドスレッドへオフロードして生成する。
     ///
-    /// 入力プロンプトおよび質問内のプレースホルダーを変数補間した上で、
+    /// 質問内のプレースホルダーを変数補間した上で、
     /// `tokio::task::spawn_blocking` により推論エンジンを呼び出すタスクを生成する。
+    /// 外部入力テキスト (`state`) は、内部判定値や確信度の漏洩を防ぐため補間対象から除外し、
+    /// そのまま推論エンジンに渡す。
     ///
     /// # 引数
-    /// - `initial_state`: 初期入力テキスト。
+    /// - `state`: 初期入力テキスト。
     /// - `raw_question`: 未補間の質問仕様。
     /// - `context`: 現在のノード実行コンテキスト。
-    /// - `scratch_state`: プロンプト補間用のスクラッチバッファ。
     fn spawn_inference_task(
         &self,
-        initial_state: &str,
+        state: Arc<str>,
         raw_question: &Question,
         context: &IndexMap<String, NodeContextValue>,
-        scratch_state: &mut String,
     ) -> tokio::task::JoinHandle<Result<Answer, RuntimeError>> {
-        interpolate_prompt(initial_state, context, scratch_state);
         let interpolated_question = interpolate_question(raw_question, context);
 
         let engine = self.engine.clone();
         let tokenizer = self.tokenizer.clone();
         let calib_config = self.calib_config.clone();
-        let current_state = scratch_state.clone();
 
         tokio::task::spawn_blocking(move || {
             engine.predict_single_question(
                 &tokenizer,
-                &current_state,
+                &state,
                 &interpolated_question,
                 &calib_config,
             )
@@ -1261,5 +1250,53 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_spawn_inference_task_keeps_initial_state_uninterpolated() {
+        let engine = Arc::new(InferenceEngine::empty_for_test());
+        let tokenizer = Arc::new(JevTokenizer::empty_for_test());
+        let calib = CalibrationConfig::default();
+        let executor = InProcessDagExecutor::new(engine, tokenizer, calib);
+
+        let mut context = IndexMap::new();
+        context.insert(
+            "node_a".to_string(),
+            NodeContextValue::new("secret_value", 0.99),
+        );
+
+        // initial_state 内にプレースホルダー文字列が含まれる場合でも、補間されずそのまま推論タスクへ渡されること
+        let initial_state: Arc<str> =
+            Arc::from("User input containing {node_a.value} and {node_a.confidence}");
+        let raw_question = Question::new_noul("テスト判定".to_string());
+
+        let handle =
+            executor.spawn_inference_task(Arc::clone(&initial_state), &raw_question, &context);
+
+        // empty_for_test でも空ロジットから Answer が生成されるため、
+        // initial_state 内のプレースホルダーが展開されずに生テキストのまま維持されていることを検証する
+        let answer = InProcessDagExecutor::await_inference_task(handle, "推論タスク結合失敗")
+            .await
+            .expect("推論タスクの実行待機に成功。");
+
+        let prompt_template = answer
+            .gating
+            .as_ref()
+            .and_then(|g| g.escalation.as_ref())
+            .and_then(|e| e.prompt_template.as_deref())
+            .expect("エスカレーションプロンプトテンプレートの取得に成功。");
+
+        assert!(
+            prompt_template.contains("{node_a.value}"),
+            "initial_state 内のプレースホルダーが補間されず維持されている必要があります。"
+        );
+        assert!(
+            prompt_template.contains("{node_a.confidence}"),
+            "initial_state 内のプレースホルダーが補間されず維持されている必要があります。"
+        );
+        assert!(
+            !prompt_template.contains("secret_value"),
+            "context 内の値が initial_state 内へ漏洩・展開されてはなりません。"
+        );
     }
 }

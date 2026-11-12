@@ -40,17 +40,25 @@ pub struct LowLatencyResourcePool<T: Send + 'static> {
 impl<T: Send + 'static> LowLatencyResourcePool<T> {
     /// リソースリストからプールを新規作成する。
     ///
+    /// `items` が空の場合は `capacity = 0` の無効化プールとして構築し、セマフォをクローズして
+    /// `acquire` を即座に拒否する。
+    ///
     /// # 引数
     /// - `items`: プールに初期格納するリソース一覧。
     pub fn new(items: Vec<T>) -> Self {
-        let capacity = items.len().max(1);
-        let queue = Arc::new(ArrayQueue::new(capacity));
+        let capacity = items.len();
+        // ArrayQueue::new(0) はパニックするため、キュー自体の確保容量のみ最小 1 に補正する。
+        let queue = Arc::new(ArrayQueue::new(capacity.max(1)));
         for item in items {
             let _ = queue.push(item);
         }
+        let permits = Arc::new(Semaphore::new(capacity));
+        if capacity == 0 {
+            permits.close();
+        }
         Self {
             resources: queue,
-            permits: Arc::new(Semaphore::new(capacity)),
+            permits,
             capacity,
         }
     }
@@ -69,10 +77,15 @@ impl<T: Send + 'static> LowLatencyResourcePool<T> {
     ///
     /// Tokio 非同期コンテキストでセマフォ許可証を取得後、キューから `pop` する。
     /// 返却された `PooledResource` は `'static` であり、`spawn_blocking` への転送が可能である。
+    /// キャパシティが 0 の空プールに対してはタイムアウト待機を行わず即座に `PoolError::Closed` を返す。
     ///
     /// # 引数
     /// - `timeout`: 取得待機タイムアウト時間。
     pub async fn acquire(&self, timeout: Duration) -> Result<PooledResource<T>, PoolError> {
+        if self.capacity == 0 {
+            return Err(PoolError::Closed);
+        }
+
         let permit_result =
             tokio::time::timeout(timeout, self.permits.clone().acquire_owned()).await;
 
@@ -188,5 +201,20 @@ mod tests {
         let res = handle.await.expect("スレッド完了すること。");
         assert_eq!(res, "session_a_processed");
         assert_eq!(pool.available(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_empty_resource_pool_rejects_acquire_immediately() {
+        let pool: LowLatencyResourcePool<i32> = LowLatencyResourcePool::new(vec![]);
+        assert_eq!(pool.capacity(), 0);
+        assert_eq!(pool.available(), 0);
+
+        let start = std::time::Instant::now();
+        let res = pool.acquire(Duration::from_secs(5)).await;
+        assert!(matches!(res, Err(PoolError::Closed)));
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "空プールではタイムアウト待機せず即座に拒否されること。"
+        );
     }
 }

@@ -135,7 +135,17 @@ pub fn compile_dag(dag: &DagDefinition) -> Result<CompiledDag, DagValidationErro
                         target_node: join_node.clone(),
                     });
                 }
+                let mut seen_parallel_nodes = HashSet::with_capacity(parallel_nodes.len());
                 for p_node_id in parallel_nodes {
+                    if !seen_parallel_nodes.insert(p_node_id.as_str()) {
+                        return Err(DagValidationError::InvalidNodeSpec {
+                            node_id: node_id.clone(),
+                            node_type: node.node_type(),
+                            reason: format!(
+                                "Parallel ノードの parallel_nodes に重複したノード ID '{p_node_id}' が指定されています。"
+                            ),
+                        });
+                    }
                     let p_node = dag.nodes.get(p_node_id).ok_or_else(|| {
                         DagValidationError::TargetNodeNotFound {
                             from_node: node_id.clone(),
@@ -1858,6 +1868,35 @@ mod tests {
                 node_type: DagNodeType::Inference,
                 ..
             } if node_id == "p_task"
+        ));
+
+        // 4. Parallel ノードの parallel_nodes に重複したノード ID が指定されている場合は拒否
+        let mut nodes_duplicate = IndexMap::new();
+        nodes_duplicate.insert(
+            "parallel".to_string(),
+            DagNode::parallel(vec!["p_task".to_string(), "p_task".to_string()], "join"),
+        );
+        nodes_duplicate.insert(
+            "p_task".to_string(),
+            DagNode::inference(Question::new_noul("並行タスク".to_string()), Vec::new()),
+        );
+        nodes_duplicate.insert("join".to_string(), DagNode::escalate(Some("合流")));
+
+        let dag_duplicate = DagDefinition {
+            dag_id: "parallel_duplicate_task".to_string(),
+            timeout_ms: 100,
+            entry_node: "parallel".to_string(),
+            nodes: nodes_duplicate,
+        };
+        let err_duplicate = validate_dag(&dag_duplicate)
+            .expect_err("並行ノード ID に重複がある場合はエラーとなること。");
+        assert!(matches!(
+            err_duplicate,
+            DagValidationError::InvalidNodeSpec {
+                ref node_id,
+                node_type: DagNodeType::Parallel,
+                ref reason,
+            } if node_id == "parallel" && reason.contains("重複したノード ID 'p_task'")
         ));
     }
 

@@ -14,7 +14,7 @@ use crate::engine::coarse::{
     reconstruct_and_gate_answer,
 };
 use crate::engine::gating::{
-    apply_gating_to_answer_with_logits, calculate_choice_energy_with_config,
+    calculate_choice_energy_with_config, evaluate_and_gate_answer_with_buf,
 };
 use crate::engine::session::InferenceEngine;
 use crate::error::Result;
@@ -907,23 +907,15 @@ fn resolve_and_gate_answer(
     valid_logits: &[f64],
     probs_buf: &mut [f64],
 ) -> Result<Answer> {
-    let mut answer = evaluate_question_with_buf(
+    evaluate_and_gate_answer_with_buf(
         question,
         valid_logits,
-        ctx.calib_config,
         probs_buf,
-        Some(q_key),
-    )?;
-    apply_gating_to_answer_with_logits(
-        &mut answer,
-        Some(valid_logits),
         Some(ctx.state),
         Some(q_key),
-        Some(question),
         ctx.gating_config,
         ctx.calib_config,
-    );
-    Ok(answer)
+    )
 }
 
 /// `IndexMap` を指定されたチャンクサイズで分割し、挿入順を保った部分マップのイテレータを返す。

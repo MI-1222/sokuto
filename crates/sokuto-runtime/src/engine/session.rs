@@ -25,9 +25,7 @@ use crate::engine::coarse::{
     reconstruct_and_gate_answer,
 };
 use crate::engine::config::{ExecutionProvider, SessionConfig, auto_intra_threads};
-use crate::engine::gating::{
-    apply_gating_to_answer_with_logits, calculate_choice_energy_with_config,
-};
+use crate::engine::gating::{calculate_choice_energy_with_config, evaluate_and_gate_answer};
 use crate::engine::provider::register_execution_providers;
 use crate::error::{Result, RuntimeError};
 use crate::hierarchical::{
@@ -465,18 +463,14 @@ impl InferenceEngine {
             // バイパス: 通常の単一推論を実行
             let tokenized = tokenizer.encode_question(state, question)?;
             let logits = self.forward_question(&tokenized)?;
-            let mut answer =
-                evaluate_question(question, &logits, calib_config).map_err(RuntimeError::Core)?;
-            apply_gating_to_answer_with_logits(
-                &mut answer,
-                Some(&logits),
+            return evaluate_and_gate_answer(
+                question,
+                &logits,
                 Some(state),
                 None,
-                Some(question),
                 gating_config,
                 calib_config,
             );
-            return Ok(answer);
         };
 
         let original_keys: Vec<String> = map.keys().cloned().collect();
@@ -645,20 +639,7 @@ impl InferenceEngine {
     ) -> Result<Answer> {
         let tokenized = tokenizer.encode_question(state, question)?;
         let logits = self.forward_question(&tokenized)?;
-        let mut answer =
-            evaluate_question(question, &logits, calib_config).map_err(RuntimeError::Core)?;
-
-        apply_gating_to_answer_with_logits(
-            &mut answer,
-            Some(&logits),
-            Some(state),
-            None,
-            Some(question),
-            None,
-            calib_config,
-        );
-
-        Ok(answer)
+        evaluate_and_gate_answer(question, &logits, Some(state), None, None, calib_config)
     }
 }
 

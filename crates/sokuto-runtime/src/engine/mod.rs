@@ -30,7 +30,7 @@ pub use escalation::{
 pub use gating::{
     apply_gating_to_answer, apply_gating_to_answer_with_energy, apply_gating_to_answer_with_logits,
     apply_gating_to_answers, apply_gating_to_answers_with_logits, calculate_choice_energy,
-    resolve_gating_config,
+    evaluate_and_gate_answer, evaluate_and_gate_answer_with_buf, resolve_gating_config,
 };
 pub use provider::register_execution_providers;
 pub use session::{InferenceEngine, validate_op_indices};

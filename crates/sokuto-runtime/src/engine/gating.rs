@@ -33,6 +33,8 @@ pub fn resolve_gating_config(
 }
 
 use crate::engine::escalation::build_rich_escalation_prompt;
+use crate::error::{Result, RuntimeError};
+use sokuto_core::decision::evaluate_question_with_buf;
 use sokuto_core::gating::evaluate_answer_gating_opts;
 use sokuto_core::math::normalized_free_energy;
 use sokuto_core::schema::QuestionType;
@@ -171,6 +173,74 @@ pub fn apply_gating_to_answer_with_logits(
         gating_config,
         calib_config,
     );
+}
+
+/// 単一質問の決定数理評価からロジット由来エネルギー算出・確信度ゲーティングまでを一貫実行する (バッファ再利用版)。
+///
+/// 事前確保された作業バッファ `probs_buf` を再利用しつつ、`evaluate_question_with_buf` による
+/// 決定プリミティブ解決と [`apply_gating_to_answer_with_logits`] によるエネルギー算出・ゲーティング適用を一括で行う。
+///
+/// # 引数
+/// - `question`: 評価対象の質問定義。
+/// - `logits`: 推論エンジンから出力された生ロジットスライス。
+/// - `probs_buf`: 確率値書き込み用の作業バッファスライス (`logits` と同長が必要)。
+/// - `state`: 文脈テキスト (エスカレーションプロンプト構築用、任意)。
+/// - `question_id`: 質問識別子 (エラー診断およびプロンプト構築用、任意)。
+/// - `gating_config`: 明示的なゲーティング設定 (任意)。
+/// - `calib_config`: モデルのキャリブレーション設定。
+pub fn evaluate_and_gate_answer_with_buf(
+    question: &Question,
+    logits: &[f64],
+    probs_buf: &mut [f64],
+    state: Option<&str>,
+    question_id: Option<&str>,
+    gating_config: Option<&GatingConfig>,
+    calib_config: &CalibrationConfig,
+) -> Result<Answer> {
+    let mut answer =
+        evaluate_question_with_buf(question, logits, calib_config, probs_buf, question_id)
+            .map_err(RuntimeError::Core)?;
+    apply_gating_to_answer_with_logits(
+        &mut answer,
+        Some(logits),
+        state,
+        question_id,
+        Some(question),
+        gating_config,
+        calib_config,
+    );
+    Ok(answer)
+}
+
+/// 単一質問の決定数理評価からロジット由来エネルギー算出・確信度ゲーティングまでを一貫実行する。
+///
+/// 内部で確率計算用バッファを確保し、[`evaluate_and_gate_answer_with_buf`] へ委譲する。
+///
+/// # 引数
+/// - `question`: 評価対象の質問定義。
+/// - `logits`: 推論エンジンから出力された生ロジットスライス。
+/// - `state`: 文脈テキスト (エスカレーションプロンプト構築用、任意)。
+/// - `question_id`: 質問識別子 (エラー診断およびプロンプト構築用、任意)。
+/// - `gating_config`: 明示的なゲーティング設定 (任意)。
+/// - `calib_config`: モデルのキャリブレーション設定。
+pub fn evaluate_and_gate_answer(
+    question: &Question,
+    logits: &[f64],
+    state: Option<&str>,
+    question_id: Option<&str>,
+    gating_config: Option<&GatingConfig>,
+    calib_config: &CalibrationConfig,
+) -> Result<Answer> {
+    let mut probs_buf = vec![0.0f64; logits.len()];
+    evaluate_and_gate_answer_with_buf(
+        question,
+        logits,
+        &mut probs_buf,
+        state,
+        question_id,
+        gating_config,
+        calib_config,
+    )
 }
 
 /// 単一の判定結果 (`Answer`) に対し、解決されたゲーティング設定を適用する。
@@ -525,5 +595,74 @@ mod tests {
 
         assert!((custom_energy - expected_energy).abs() < 1e-12);
         assert!((custom_energy - default_energy).abs() > 1e-3);
+    }
+
+    #[test]
+    fn test_evaluate_and_gate_answer_pipeline() {
+        let calib = CalibrationConfig::default();
+        let gating_cfg = GatingConfig {
+            enabled: true,
+            thresholds: GatingThresholds {
+                high_threshold: 0.90,
+                low_threshold: 0.20,
+                top_margin_threshold: 0.80,
+                ood_enabled: true,
+                energy_threshold: 0.0,
+                energy_temperature: None,
+                ..GatingThresholds::default()
+            },
+        };
+
+        let mut criteria = IndexMap::new();
+        criteria.insert("a".to_string(), "候補A".to_string());
+        criteria.insert("b".to_string(), "候補B".to_string());
+        let q = Question::new_choice("選択せよ", criteria);
+
+        // 僅差ロジットは ConfirmOrEscalate とエスカレーションプロンプト・エネルギーを付与すること。
+        let ambiguous_logits = [2.5, 0.5];
+        let ans = evaluate_and_gate_answer(
+            &q,
+            &ambiguous_logits,
+            Some("入力文脈"),
+            Some("q_ambig"),
+            Some(&gating_cfg),
+            &calib,
+        )
+        .unwrap();
+        assert_eq!(ans.as_choice(), Some("a"));
+        let meta = ans.gating.as_ref().unwrap();
+        assert_eq!(meta.route, DecisionRoute::ConfirmOrEscalate);
+        assert!(meta.energy.is_some());
+        assert!(meta.escalation.is_some());
+
+        // バッファ再利用版でも同一結果が得られ、エラー時は question_id が維持されること。
+        let mut probs_buf = [0.0f64; 2];
+        let ans_buf = evaluate_and_gate_answer_with_buf(
+            &q,
+            &ambiguous_logits,
+            &mut probs_buf,
+            Some("入力文脈"),
+            Some("q_ambig"),
+            Some(&gating_cfg),
+            &calib,
+        )
+        .unwrap();
+        assert_eq!(ans_buf.as_choice(), Some("a"));
+        assert_eq!(
+            ans_buf.gating.as_ref().unwrap().energy,
+            ans.gating.as_ref().unwrap().energy
+        );
+
+        let err = evaluate_and_gate_answer_with_buf(
+            &q,
+            &[1.0],
+            &mut [0.0],
+            Some("入力文脈"),
+            Some("q_mismatch"),
+            Some(&gating_cfg),
+            &calib,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("q_mismatch"));
     }
 }

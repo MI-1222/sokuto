@@ -27,13 +27,12 @@ use sokuto_core::contract::model_spec::{
     TENSOR_OP_INDICES, TENSOR_QUERY_IDS, TENSOR_QUERY_MASK, TENSOR_STATE_HIDDEN_STATES,
     TENSOR_STATE_MASK,
 };
-use sokuto_core::decision::{evaluate_question, evaluate_question_with_buf};
 use sokuto_core::gating::GatingConfig;
 use sokuto_core::schema::{Answer, Question};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::engine::config::{ExecutionProvider, SessionConfig};
-use crate::engine::gating::apply_gating_to_answer_with_logits;
+use crate::engine::gating::{evaluate_and_gate_answer, evaluate_and_gate_answer_with_buf};
 use crate::engine::session::{acquire_pooled_session, create_session_builder};
 use crate::error::{Result, RuntimeError};
 use crate::tokenizer::{JevTokenizer, TokenizedQuestion};
@@ -415,6 +414,14 @@ impl CachedStateFeatures {
             compression_mode: CacheCompressionMode::None,
             state_mask,
             state_text,
+        }
+    }
+
+    /// 明示指定された文脈テキストとキャッシュ保持テキストから、ゲーティング用の有効文脈を解決する。
+    fn resolve_state_text<'a>(&'a self, state_text: Option<&'a str>) -> Option<&'a str> {
+        match state_text {
+            Some(s) if !s.trim().is_empty() => Some(s),
+            _ => self.state_text.as_deref(),
         }
     }
 
@@ -1301,6 +1308,7 @@ impl DualSessionEngine {
             tokenized_items.push((qid, q, t));
         }
 
+        let effective_state_text = cached_state.resolve_state_text(state_text);
         let mut scratch_probs = Vec::new();
         let mut reusable_state_val: Option<(usize, Arc<Value>)> = None;
 
@@ -1366,27 +1374,15 @@ impl DualSessionEngine {
                     scratch_probs.resize(k_i, 0.0);
                 }
 
-                let mut answer = evaluate_question_with_buf(
+                let answer = evaluate_and_gate_answer_with_buf(
                     q,
                     sample_logits,
-                    calib_config,
                     &mut scratch_probs[..k_i],
-                    Some(qid.as_str()),
-                )?;
-
-                let effective_state_text = match state_text {
-                    Some(s) if !s.trim().is_empty() => Some(s),
-                    _ => cached_state.state_text.as_deref(),
-                };
-                apply_gating_to_answer_with_logits(
-                    &mut answer,
-                    Some(sample_logits),
                     effective_state_text,
                     Some(qid.as_str()),
-                    Some(q),
                     gating_config,
                     calib_config,
-                );
+                )?;
 
                 answers.insert((*qid).clone(), answer);
             }
@@ -1467,24 +1463,15 @@ impl DualSessionEngine {
     ) -> Result<Answer> {
         let tokenized = tokenizer.encode_query(question)?;
         let logits = self.forward_query_raw(cached_state, &tokenized)?;
-        let mut answer =
-            evaluate_question(question, &logits, calib_config).map_err(RuntimeError::Core)?;
-
-        let effective_state_text = match state_text {
-            Some(s) if !s.trim().is_empty() => Some(s),
-            _ => cached_state.state_text.as_deref(),
-        };
-        apply_gating_to_answer_with_logits(
-            &mut answer,
-            Some(&logits),
+        let effective_state_text = cached_state.resolve_state_text(state_text);
+        evaluate_and_gate_answer(
+            question,
+            &logits,
             effective_state_text,
             None,
-            Some(question),
             None,
             calib_config,
-        );
-
-        Ok(answer)
+        )
     }
 }
 

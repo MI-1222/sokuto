@@ -269,6 +269,7 @@ impl InProcessDagExecutor {
                         &mut context,
                         &mut steps,
                         &mut final_answer,
+                        &mut last_inference_node_id,
                     );
 
                     steps.insert(
@@ -433,11 +434,12 @@ fn answer_to_context_value(answer: &Answer) -> NodeContextValue {
     }
 }
 
-/// 並行実行されたタスク群の判定結果を `context`・`steps` へ反映し、最後のタスク結果を `final_answer` に設定する。
+/// 並行実行されたタスク群の判定結果を `context`・`steps` へ反映し、最後のタスク結果を `final_answer` と `last_inference_node_id` に設定する。
 ///
 /// `futures_util::future::join_all` は入力タスク列 (`parallel_nodes`) の順序を保持するため、
-/// 最後のタスクの `Answer` を代表値として `final_answer` を更新し、後続の `Branch` ノードによる
-/// `field: "answer"` / `"confidence"` / `"route"` 参照および最終 `DagExecutionResult.final_answer` との整合を保つ。
+/// 最後のタスクの `Answer` を代表値として `final_answer` を更新し、ノード ID を `last_inference_node_id` に反映する。
+/// これにより後続の `Branch` ノードによる `field: "answer"` / `"confidence"` / `"route"` 参照や、
+/// `Escalate` 遷移時の質問定義・回答の整合性を保つ。
 fn record_parallel_results(
     parallel_answers: Vec<(String, Answer)>,
     join_node: Option<&str>,
@@ -445,6 +447,7 @@ fn record_parallel_results(
     context: &mut IndexMap<String, NodeContextValue>,
     steps: &mut IndexMap<String, StepExecutionResult>,
     final_answer: &mut Option<Answer>,
+    last_inference_node_id: &mut Option<String>,
 ) {
     let total = parallel_answers.len();
     let next_node = join_node.map(str::to_string);
@@ -455,6 +458,7 @@ fn record_parallel_results(
 
         if idx + 1 == total {
             *final_answer = Some(ans.clone());
+            *last_inference_node_id = Some(p_id.clone());
         }
 
         steps.insert(
@@ -959,9 +963,10 @@ mod tests {
         let mut context = IndexMap::new();
         let mut steps = IndexMap::new();
 
-        // Parallel 通過前の古い final_answer が残っているケースも模擬する
+        // Parallel 通過前の古い final_answer と last_inference_node_id が残っているケースも模擬する
         let stale_answer = Answer::noul(0.05);
         let mut final_answer = Some(stale_answer);
+        let mut last_inference_node_id = Some("stale_node".to_string());
 
         let task_a_ans = Answer::noul(0.92);
         let task_b_ans = Answer::choice("priority_high", IndexMap::new(), 0.88);
@@ -976,14 +981,20 @@ mod tests {
             &mut context,
             &mut steps,
             &mut final_answer,
+            &mut last_inference_node_id,
         );
 
-        // 1. final_answer が最後の並行タスク (priority_eval) の結果で上書きされていること
+        // 1. final_answer と last_inference_node_id が最後の並行タスク (priority_eval) の結果で上書きされていること
         assert_eq!(
             final_answer.as_ref().and_then(|a| a.as_choice()),
             Some("priority_high")
         );
         assert_eq!(final_answer.as_ref(), Some(&task_b_ans));
+        assert_eq!(
+            last_inference_node_id.as_deref(),
+            Some("priority_eval"),
+            "last_inference_node_id が最後の並行タスク ID で更新されている必要があります。"
+        );
 
         // 2. 両タスクの結果が context と steps に格納されていること
         assert_eq!(
@@ -1035,8 +1046,9 @@ mod tests {
             Some("escalate_fraud".to_string())
         );
 
-        // 4. 空結果時は既存の final_answer を維持すること
+        // 4. 空結果時は既存の final_answer と last_inference_node_id を維持すること
         let mut unchanged = Some(Answer::noul(0.80));
+        let mut unchanged_id = Some("preserved_node".to_string());
         record_parallel_results(
             Vec::new(),
             Some("join"),
@@ -1044,8 +1056,14 @@ mod tests {
             &mut context,
             &mut steps,
             &mut unchanged,
+            &mut unchanged_id,
         );
         assert_eq!(unchanged.as_ref().and_then(|a| a.as_noul()), Some(0.80));
+        assert_eq!(
+            unchanged_id.as_deref(),
+            Some("preserved_node"),
+            "空結果時は既存の last_inference_node_id が維持されている必要があります。"
+        );
     }
 
     /// 指定ステップ数を持つ直列 DAG (Inference / Branch / Escalate) を生成するテスト用ヘルパー。
@@ -1368,6 +1386,93 @@ mod tests {
         assert!(
             result.escalation_prompt.is_some(),
             "System 2 向け Guided CoT プロンプト案が生成される必要があります。"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_escalate_via_parallel_preserves_last_parallel_task_node_id_and_prompt() {
+        let engine = Arc::new(InferenceEngine::empty_for_test());
+        let tokenizer = Arc::new(JevTokenizer::empty_for_test());
+        let calib = CalibrationConfig::default();
+        let executor = InProcessDagExecutor::new(engine, tokenizer, calib);
+
+        let mut nodes = IndexMap::new();
+
+        // 1. 直前の推論ノード (古い推論ノード)
+        nodes.insert(
+            "node_a".to_string(),
+            DagNode::inference(
+                Question::new_noul("先行ノードの質問".to_string()),
+                vec![NodeCondition {
+                    field: "confidence".to_string(),
+                    op: NodeConditionOp::ConfidenceGte,
+                    value: Some(serde_json::json!(0.0)),
+                    target_node: "parallel_step".to_string(),
+                }],
+            ),
+        );
+
+        // 2. 並行ノード群
+        nodes.insert(
+            "p1".to_string(),
+            DagNode::inference(Question::new_noul("並行タスク1の質問".to_string()), vec![]),
+        );
+        nodes.insert(
+            "p2".to_string(),
+            DagNode::inference(Question::new_noul("並行タスク2の質問".to_string()), vec![]),
+        );
+
+        // 3. Parallel ノード
+        nodes.insert(
+            "parallel_step".to_string(),
+            DagNode::parallel(vec!["p1".to_string(), "p2".to_string()], "branch_join"),
+        );
+
+        // 4. Branch ノード (並行ノードからの合流では明示的な node_id.confidence 形式が必要)
+        nodes.insert(
+            "branch_join".to_string(),
+            DagNode::branch(vec![NodeCondition {
+                field: "p2.confidence".to_string(),
+                op: NodeConditionOp::ConfidenceGte,
+                value: Some(serde_json::json!(0.0)),
+                target_node: "escalate_node".to_string(),
+            }]),
+        );
+
+        // 5. Escalate ノード
+        nodes.insert(
+            "escalate_node".to_string(),
+            DagNode::escalate(Some("並行処理後のエスカレーション。")),
+        );
+
+        let dag = DagDefinition {
+            dag_id: "test_parallel_escalate_dag".to_string(),
+            timeout_ms: 1000,
+            entry_node: "node_a".to_string(),
+            nodes,
+        };
+
+        let result = executor
+            .execute("テスト入力", &dag)
+            .await
+            .expect("DAG 実行に成功。");
+
+        assert!(result.escalated);
+        assert_eq!(
+            result.execution_path,
+            vec!["node_a", "parallel_step", "branch_join", "escalate_node"]
+        );
+        assert_eq!(
+            result.escalation_node_id.as_deref(),
+            Some("p2"),
+            "Parallel 実行後は、最後の並行推論タスク (p2) の ID が escalation_node_id に記録される必要があります。"
+        );
+        let prompt = result
+            .escalation_prompt
+            .expect("エスカレーションプロンプトの生成に成功。");
+        assert!(
+            prompt.contains("並行タスク2の質問"),
+            "Escalate 時のプロンプト定義は古い node_a ではなく最後の並行タスク p2 の質問に基づく必要があります。"
         );
     }
 }

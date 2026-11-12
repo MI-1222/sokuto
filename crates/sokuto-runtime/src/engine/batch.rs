@@ -305,12 +305,7 @@ impl InferenceEngine {
         let state_ids = tokenizer.encode_state(state)?;
         let mut results = IndexMap::with_capacity(questions.len());
 
-        for chunk_slice in questions.iter().collect::<Vec<_>>().chunks(chunk_size) {
-            let mut sub_questions = IndexMap::with_capacity(chunk_slice.len());
-            for (k, v) in chunk_slice {
-                sub_questions.insert((*k).clone(), (*v).clone());
-            }
-
+        for sub_questions in iter_map_chunks(questions, chunk_size) {
             let batch = tokenizer.encode_batch_with_pretokenized_state(
                 &state_ids,
                 &sub_questions,
@@ -389,12 +384,7 @@ impl InferenceEngine {
             gating_config,
         };
 
-        for chunk_slice in questions.iter().collect::<Vec<_>>().chunks(chunk_size) {
-            let mut sub_questions = IndexMap::with_capacity(chunk_slice.len());
-            for (k, v) in chunk_slice {
-                sub_questions.insert((*k).clone(), (*v).clone());
-            }
-
+        for sub_questions in iter_map_chunks(questions, chunk_size) {
             let batch = tokenizer.encode_batch_with_pretokenized_state(
                 &state_ids,
                 &sub_questions,
@@ -608,16 +598,7 @@ impl InferenceEngine {
         };
 
         // 3. マイクロバッチ分割逐次推論
-        for chunk_slice in processed_questions
-            .iter()
-            .collect::<Vec<_>>()
-            .chunks(effective_chunk_size)
-        {
-            let mut sub_questions = IndexMap::with_capacity(chunk_slice.len());
-            for (k, v) in chunk_slice {
-                sub_questions.insert((*k).clone(), (*v).clone());
-            }
-
+        for sub_questions in iter_map_chunks(&processed_questions, effective_chunk_size) {
             let batch = tokenizer.encode_batch_with_pretokenized_state(
                 &state_ids,
                 &sub_questions,
@@ -943,6 +924,35 @@ fn resolve_and_gate_answer(
         ctx.calib_config,
     );
     Ok(answer)
+}
+
+/// `IndexMap` を指定されたチャンクサイズで分割し、挿入順を保った部分マップのイテレータを返す。
+///
+/// 一時ベクタへの `collect` を排除し、`IndexMap::get_index` による O(1) インデックス範囲走査で
+/// 必要なキャパシティのみを確保した部分マップを逐次生成する。`chunk_size` が 0 の場合は 1 として扱う。
+///
+/// # 引数
+/// - `map`: 分割元の順序付きマップ。
+/// - `chunk_size`: 1 チャンクあたりの最大要素数。
+fn iter_map_chunks<K, V>(
+    map: &IndexMap<K, V>,
+    chunk_size: usize,
+) -> impl Iterator<Item = IndexMap<K, V>> + '_
+where
+    K: Clone + Eq + std::hash::Hash,
+    V: Clone,
+{
+    let step = chunk_size.max(1);
+    (0..map.len()).step_by(step).map(move |start| {
+        let end = (start + step).min(map.len());
+        let mut sub_map = IndexMap::with_capacity(end - start);
+        for idx in start..end {
+            if let Some((key, value)) = map.get_index(idx) {
+                sub_map.insert(key.clone(), value.clone());
+            }
+        }
+        sub_map
+    })
 }
 
 /// トークナイズ済みバッチの全質問に対して決定解決とゲーティングを適用し、結果マップに格納する。
@@ -1322,5 +1332,38 @@ mod tests {
             coarse_ans.gating.as_ref().unwrap().energy,
             coarse_energies.get("q_coarse").copied().flatten()
         );
+    }
+
+    #[test]
+    fn test_iter_map_chunks_preserves_order_and_handles_edge_cases() {
+        let mut map = IndexMap::new();
+        for idx in 0..5 {
+            map.insert(format!("q{idx}"), idx);
+        }
+
+        // 端数を含む通常分割で挿入順と値が維持されること。
+        let chunks: Vec<Vec<(String, usize)>> = iter_map_chunks(&map, 2)
+            .map(|sub| sub.into_iter().collect())
+            .collect();
+        assert_eq!(
+            chunks,
+            vec![
+                vec![("q0".to_string(), 0), ("q1".to_string(), 1)],
+                vec![("q2".to_string(), 2), ("q3".to_string(), 3)],
+                vec![("q4".to_string(), 4)],
+            ]
+        );
+
+        // チャンクサイズが 0 の場合は 1 として安全に分割されること。
+        let single_chunks: Vec<usize> = iter_map_chunks(&map, 0).map(|sub| sub.len()).collect();
+        assert_eq!(single_chunks, vec![1, 1, 1, 1, 1]);
+
+        // チャンクサイズが要素数以上の場合は単一チャンクとなること。
+        let full_chunks: Vec<usize> = iter_map_chunks(&map, 10).map(|sub| sub.len()).collect();
+        assert_eq!(full_chunks, vec![5]);
+
+        // 空マップの場合は空イテレータとなること。
+        let empty: IndexMap<String, usize> = IndexMap::new();
+        assert_eq!(iter_map_chunks(&empty, 2).count(), 0);
     }
 }

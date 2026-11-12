@@ -3,8 +3,12 @@
 //! 実行前の DAG 定義に対し、循環参照 (閉路)、未定義ノード参照、
 //! 型契約違反、到達不能ノードを Fast-Fail で静的検証する。
 
-use crate::dag::schema::{DagDefinition, DagNodeType};
 use std::collections::{HashMap, HashSet};
+
+use sokuto_core::schema::{Criteria, Question, QuestionType};
+
+use crate::dag::executor::{ConditionField, ContextProp};
+use crate::dag::schema::{DagDefinition, DagNode, DagNodeType, NodeCondition, NodeConditionOp};
 
 /// DAG 静的検証で発生するエラー型。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -44,6 +48,17 @@ pub enum DagValidationError {
     /// エントリノードから到達不能な孤立ノードが存在する。
     #[error("エントリノードから到達不能な孤立ノードが検出されました: {0:?}。")]
     UnreachableNodes(Vec<String>),
+
+    /// 条件式のフィールド名・参照先・演算子と値の型が不正。
+    #[error("ノード '{node_id}' の条件式 (field='{field}') が不正です: {reason}。")]
+    InvalidCondition {
+        /// 条件式を持つノード ID。
+        node_id: String,
+        /// 条件式フィールド名。
+        field: String,
+        /// 理由説明文。
+        reason: String,
+    },
 }
 
 /// DAG 定義の整合性と無閉路性を静的に検証する。
@@ -55,6 +70,7 @@ pub enum DagValidationError {
 /// 4. すべての遷移先 (`target_node`, `parallel_nodes`, `join_node`) が実在すること。
 /// 5. DFS による有向グラフの閉路 (サイクル) 検出。
 /// 6. `entry_node` から全ノードへの到達性確認。
+/// 7. 各条件式のフィールド・上流参照・型整合性検証。
 pub fn validate_dag(dag: &DagDefinition) -> Result<(), DagValidationError> {
     if dag.nodes.is_empty() {
         return Err(DagValidationError::EmptyNodes);
@@ -241,7 +257,405 @@ pub fn validate_dag(dag: &DagDefinition) -> Result<(), DagValidationError> {
         return Err(DagValidationError::UnreachableNodes(unreachable));
     }
 
+    // 5. 条件式の静的検証 (フィールド妥当性・先祖参照・型整合性)
+    validate_node_conditions(dag, &adj)?;
+
     Ok(())
+}
+
+/// 条件値 (`serde_json::Value`) が有限な `f64` (または数値文字列) として解釈可能か判定する。
+fn is_finite_number_value(val: Option<&serde_json::Value>) -> bool {
+    let Some(v) = val else { return false };
+    if let Some(n) = v.as_f64() {
+        return n.is_finite();
+    }
+    if let Some(s) = v.as_str() {
+        return s.trim().parse::<f64>().is_ok_and(|f| f.is_finite());
+    }
+    false
+}
+
+/// 条件式を評価する対象の質問仕様を解決する。
+///
+/// `Inference` ノードの場合は自身の `question` を返し、
+/// `Branch` ノードの場合は直近の上流 `Inference` ノード群の質問仕様を探索・解決する。
+fn resolve_target_question<'a>(
+    node_id: &'a str,
+    node: &'a DagNode,
+    dag: &'a DagDefinition,
+    rev_adj: &HashMap<&str, Vec<&str>>,
+) -> Result<Option<&'a Question>, DagValidationError> {
+    if let Some(ref q) = node.question {
+        return Ok(Some(q));
+    }
+
+    let mut visited = HashSet::new();
+    let mut q = Vec::new();
+    if let Some(preds) = rev_adj.get(node_id) {
+        for &pred in preds {
+            q.push(pred);
+            visited.insert(pred);
+        }
+    }
+
+    let mut upstream_questions = Vec::new();
+    while let Some(curr) = q.pop() {
+        if let Some(curr_node) = dag.nodes.get(curr) {
+            if curr_node.node_type == DagNodeType::Inference {
+                if let Some(ref question) = curr_node.question {
+                    upstream_questions.push(question);
+                }
+            } else if let Some(preds) = rev_adj.get(curr) {
+                for &pred in preds {
+                    if visited.insert(pred) {
+                        q.push(pred);
+                    }
+                }
+            }
+        }
+    }
+
+    if upstream_questions.is_empty() {
+        return Err(DagValidationError::InvalidCondition {
+            node_id: node_id.to_string(),
+            field: "answer".to_string(),
+            reason: "上流に推論結果を出力する Inference ノードが存在しないため answer フィールドを評価できません。".to_string(),
+        });
+    }
+
+    Ok(Some(upstream_questions[0]))
+}
+
+/// 各ノードの条件式リスト (`conditions`) に対し、フィールド妥当性・先祖参照・型整合性を静的検証する。
+fn validate_node_conditions(
+    dag: &DagDefinition,
+    adj: &HashMap<&str, Vec<&str>>,
+) -> Result<(), DagValidationError> {
+    // 逆隣接リストの構築
+    let mut rev_adj: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (&u, neighbors) in adj {
+        for &v in neighbors {
+            rev_adj.entry(v).or_default().push(u);
+        }
+    }
+
+    // 先祖関係 (上流先行ノード集合) マップの構築
+    let mut ancestors: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for node_id in dag.nodes.keys().map(String::as_str) {
+        let mut anc_set = HashSet::new();
+        let mut q = vec![node_id];
+        while let Some(curr) = q.pop() {
+            if let Some(preds) = rev_adj.get(curr) {
+                for &pred in preds {
+                    if anc_set.insert(pred) {
+                        q.push(pred);
+                    }
+                }
+            }
+        }
+        ancestors.insert(node_id, anc_set);
+    }
+
+    // 各ノードの各条件式を静的検査
+    for (node_id, node) in &dag.nodes {
+        for cond in &node.conditions {
+            validate_single_condition(node_id, node, cond, dag, &ancestors, &rev_adj)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_single_condition(
+    node_id: &str,
+    node: &DagNode,
+    cond: &NodeCondition,
+    dag: &DagDefinition,
+    ancestors: &HashMap<&str, HashSet<&str>>,
+    rev_adj: &HashMap<&str, Vec<&str>>,
+) -> Result<(), DagValidationError> {
+    let field = ConditionField::parse(&cond.field);
+
+    match field {
+        ConditionField::Unknown => Err(DagValidationError::InvalidCondition {
+            node_id: node_id.to_string(),
+            field: cond.field.clone(),
+            reason: "未定義または構文不正なフィールド名です。".to_string(),
+        }),
+        ConditionField::ContextProperty {
+            node_id: ref_id,
+            prop,
+        } => {
+            let Some(ref_node) = dag.nodes.get(ref_id) else {
+                return Err(DagValidationError::InvalidCondition {
+                    node_id: node_id.to_string(),
+                    field: cond.field.clone(),
+                    reason: format!("参照先ノード '{ref_id}' が nodes マップ内に存在しません。"),
+                });
+            };
+            if ref_node.node_type != DagNodeType::Inference {
+                return Err(DagValidationError::InvalidCondition {
+                    node_id: node_id.to_string(),
+                    field: cond.field.clone(),
+                    reason: format!(
+                        "参照先ノード '{ref_id}' ({:?}) は推論結果を出力する Inference ノードである必要があります。",
+                        ref_node.node_type
+                    ),
+                });
+            }
+            if !ancestors
+                .get(node_id)
+                .is_some_and(|anc| anc.contains(ref_id))
+            {
+                return Err(DagValidationError::InvalidCondition {
+                    node_id: node_id.to_string(),
+                    field: cond.field.clone(),
+                    reason: format!(
+                        "参照先ノード '{ref_id}' は現在のノード '{node_id}' の上流 (先行実行パス) に存在する必要があります。"
+                    ),
+                });
+            }
+            match prop {
+                ContextProp::Confidence => {
+                    if cond.op == NodeConditionOp::In {
+                        return Err(DagValidationError::InvalidCondition {
+                            node_id: node_id.to_string(),
+                            field: cond.field.clone(),
+                            reason: "確信度プロパティに対して 'in' 演算子は使用できません。"
+                                .to_string(),
+                        });
+                    }
+                    if !is_finite_number_value(cond.value.as_ref()) {
+                        return Err(DagValidationError::InvalidCondition {
+                            node_id: node_id.to_string(),
+                            field: cond.field.clone(),
+                            reason: "確信度プロパティには有限数値 (または数値文字列) を指定する必要があります。".to_string(),
+                        });
+                    }
+                }
+                ContextProp::Value => {
+                    if !matches!(cond.op, NodeConditionOp::Eq | NodeConditionOp::Neq) {
+                        return Err(DagValidationError::InvalidCondition {
+                            node_id: node_id.to_string(),
+                            field: cond.field.clone(),
+                            reason: "コンテキスト値プロパティに対しては等価比較 (eq / neq) のみ使用できます。".to_string(),
+                        });
+                    }
+                    let is_scalar = match cond.value.as_ref() {
+                        Some(serde_json::Value::String(_)) | Some(serde_json::Value::Bool(_)) => {
+                            true
+                        }
+                        Some(serde_json::Value::Number(n)) => {
+                            n.as_f64().is_some_and(|f| f.is_finite())
+                        }
+                        _ => false,
+                    };
+                    if !is_scalar {
+                        return Err(DagValidationError::InvalidCondition {
+                            node_id: node_id.to_string(),
+                            field: cond.field.clone(),
+                            reason: "コンテキスト値プロパティにはスカラー値 (文字列、真偽値、有限数値) を指定する必要があります。".to_string(),
+                        });
+                    }
+                }
+            }
+            Ok(())
+        }
+        ConditionField::Confidence => {
+            if cond.op == NodeConditionOp::In {
+                return Err(DagValidationError::InvalidCondition {
+                    node_id: node_id.to_string(),
+                    field: cond.field.clone(),
+                    reason: "confidence フィールドに対して 'in' 演算子は使用できません。"
+                        .to_string(),
+                });
+            }
+            if !is_finite_number_value(cond.value.as_ref()) {
+                return Err(DagValidationError::InvalidCondition {
+                    node_id: node_id.to_string(),
+                    field: cond.field.clone(),
+                    reason: "confidence フィールドには有限数値 (または数値文字列) を指定する必要があります。".to_string(),
+                });
+            }
+            Ok(())
+        }
+        ConditionField::Route => {
+            if !matches!(cond.op, NodeConditionOp::Eq | NodeConditionOp::Neq) {
+                return Err(DagValidationError::InvalidCondition {
+                    node_id: node_id.to_string(),
+                    field: cond.field.clone(),
+                    reason: "route フィールドに対しては等価比較 (eq / neq) のみ使用できます。"
+                        .to_string(),
+                });
+            }
+            let is_valid_route = match cond.value.as_ref().and_then(|v| v.as_str()) {
+                Some(s) => matches!(s, "auto_execute" | "confirm_or_escalate" | "fallback"),
+                None => false,
+            };
+            if !is_valid_route {
+                return Err(DagValidationError::InvalidCondition {
+                    node_id: node_id.to_string(),
+                    field: cond.field.clone(),
+                    reason: "route フィールドには 'auto_execute', 'confirm_or_escalate', 'fallback' のいずれかの文字列を指定する必要があります。".to_string(),
+                });
+            }
+            Ok(())
+        }
+        ConditionField::Answer => {
+            let target_q = resolve_target_question(node_id, node, dag, rev_adj)?;
+            let q_type = target_q.map(|q| q.question_type);
+
+            match q_type {
+                Some(QuestionType::Choice) => {
+                    if matches!(
+                        cond.op,
+                        NodeConditionOp::Gt
+                            | NodeConditionOp::Gte
+                            | NodeConditionOp::Lt
+                            | NodeConditionOp::Lte
+                            | NodeConditionOp::ConfidenceGte
+                            | NodeConditionOp::ConfidenceLt
+                    ) {
+                        return Err(DagValidationError::InvalidCondition {
+                            node_id: node_id.to_string(),
+                            field: cond.field.clone(),
+                            reason: "大小比較演算子は Choice 型判定に対して無効です。".to_string(),
+                        });
+                    }
+                    match cond.op {
+                        NodeConditionOp::Eq | NodeConditionOp::Neq => {
+                            let Some(s) = cond.value.as_ref().and_then(|v| v.as_str()) else {
+                                return Err(DagValidationError::InvalidCondition {
+                                    node_id: node_id.to_string(),
+                                    field: cond.field.clone(),
+                                    reason:
+                                        "Choice 型の等価比較には文字列を指定する必要があります。"
+                                            .to_string(),
+                                });
+                            };
+                            if let Some(q) = target_q
+                                && let Some(Criteria::Map(ref map)) = q.criteria
+                                && !map.contains_key(s)
+                            {
+                                return Err(DagValidationError::InvalidCondition {
+                                    node_id: node_id.to_string(),
+                                    field: cond.field.clone(),
+                                    reason: format!(
+                                        "Choice 質問の criteria 定義に候補キー '{s}' が存在しません。"
+                                    ),
+                                });
+                            }
+                        }
+                        NodeConditionOp::In => {
+                            let Some(arr) = cond.value.as_ref().and_then(|v| v.as_array()) else {
+                                return Err(DagValidationError::InvalidCondition {
+                                    node_id: node_id.to_string(),
+                                    field: cond.field.clone(),
+                                    reason:
+                                        "Choice 型の 'in' 比較には配列を指定する必要があります。"
+                                            .to_string(),
+                                });
+                            };
+                            if arr.is_empty() {
+                                return Err(DagValidationError::InvalidCondition {
+                                    node_id: node_id.to_string(),
+                                    field: cond.field.clone(),
+                                    reason: "'in' 演算子には 1 つ以上の要素を含む配列を指定する必要があります。".to_string(),
+                                });
+                            }
+                            for item in arr {
+                                let Some(s) = item.as_str() else {
+                                    return Err(DagValidationError::InvalidCondition {
+                                        node_id: node_id.to_string(),
+                                        field: cond.field.clone(),
+                                        reason: "'in' 演算子の配列要素はすべて文字列である必要があります。".to_string(),
+                                    });
+                                };
+                                if let Some(q) = target_q
+                                    && let Some(Criteria::Map(ref map)) = q.criteria
+                                    && !map.contains_key(s)
+                                {
+                                    return Err(DagValidationError::InvalidCondition {
+                                        node_id: node_id.to_string(),
+                                        field: cond.field.clone(),
+                                        reason: format!(
+                                            "Choice 質問の criteria 定義に候補キー '{s}' が存在しません。"
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Some(QuestionType::Score) => {
+                    if matches!(
+                        cond.op,
+                        NodeConditionOp::In
+                            | NodeConditionOp::ConfidenceGte
+                            | NodeConditionOp::ConfidenceLt
+                    ) {
+                        return Err(DagValidationError::InvalidCondition {
+                            node_id: node_id.to_string(),
+                            field: cond.field.clone(),
+                            reason: "Score 型判定に対して 'in' 演算子または確信度専用演算子は使用できません。".to_string(),
+                        });
+                    }
+                    if !is_finite_number_value(cond.value.as_ref()) {
+                        return Err(DagValidationError::InvalidCondition {
+                            node_id: node_id.to_string(),
+                            field: cond.field.clone(),
+                            reason: "Score 型判定には有限数値 (または数値文字列) を指定する必要があります。".to_string(),
+                        });
+                    }
+                }
+                Some(QuestionType::Noul) => match cond.op {
+                    NodeConditionOp::Eq | NodeConditionOp::Neq => {
+                        let is_valid = match cond.value.as_ref() {
+                            Some(serde_json::Value::Bool(_)) => true,
+                            Some(serde_json::Value::String(s)) => {
+                                matches!(s.as_str(), "true" | "false")
+                                    || s.trim().parse::<f64>().is_ok_and(|f| f.is_finite())
+                            }
+                            Some(serde_json::Value::Number(n)) => {
+                                n.as_f64().is_some_and(|f| f.is_finite())
+                            }
+                            _ => false,
+                        };
+                        if !is_valid {
+                            return Err(DagValidationError::InvalidCondition {
+                                    node_id: node_id.to_string(),
+                                    field: cond.field.clone(),
+                                    reason: "Noul 型の等価比較には真偽値、'true'/'false' 文字列、または有限数値を指定する必要があります。".to_string(),
+                                });
+                        }
+                    }
+                    NodeConditionOp::Gt
+                    | NodeConditionOp::Gte
+                    | NodeConditionOp::Lt
+                    | NodeConditionOp::Lte => {
+                        if !is_finite_number_value(cond.value.as_ref()) {
+                            return Err(DagValidationError::InvalidCondition {
+                                node_id: node_id.to_string(),
+                                field: cond.field.clone(),
+                                reason: "Noul 型の大小比較には有限数値を指定する必要があります。"
+                                    .to_string(),
+                            });
+                        }
+                    }
+                    _ => {
+                        return Err(DagValidationError::InvalidCondition {
+                            node_id: node_id.to_string(),
+                            field: cond.field.clone(),
+                            reason: "Noul 型判定に対して不正な演算子です。".to_string(),
+                        });
+                    }
+                },
+                None => {}
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -462,5 +876,248 @@ mod tests {
         };
 
         assert!(validate_dag(&dag).is_ok());
+    }
+
+    #[test]
+    fn test_validate_dag_rejects_unknown_condition_field() {
+        let mut nodes = IndexMap::new();
+        nodes.insert(
+            "node1".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_noul("テスト？".to_string())),
+                conditions: vec![NodeCondition {
+                    field: "unknown_field".to_string(),
+                    op: NodeConditionOp::Eq,
+                    value: Some(serde_json::json!(true)),
+                    target_node: "node2".to_string(),
+                }],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        nodes.insert(
+            "node2".to_string(),
+            DagNode {
+                node_type: DagNodeType::Escalate,
+                question: None,
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+
+        let dag = DagDefinition {
+            dag_id: "unknown_field_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "node1".to_string(),
+            nodes,
+        };
+
+        let err = validate_dag(&dag).expect_err("未知フィールドは拒否されること。");
+        assert!(matches!(
+            err,
+            DagValidationError::InvalidCondition {
+                ref node_id,
+                ref field,
+                ..
+            } if node_id == "node1" && field == "unknown_field"
+        ));
+    }
+
+    #[test]
+    fn test_validate_dag_rejects_undefined_or_non_upstream_context_property() {
+        let mut nodes = IndexMap::new();
+        // node1 -> node2 -> node3
+        // node1 が node2 (下流) の出力を参照しようとするケース
+        nodes.insert(
+            "node1".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_noul("Q1".to_string())),
+                conditions: vec![NodeCondition {
+                    field: "node2.value".to_string(),
+                    op: NodeConditionOp::Eq,
+                    value: Some(serde_json::json!("true")),
+                    target_node: "node2".to_string(),
+                }],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        nodes.insert(
+            "node2".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_noul("Q2".to_string())),
+                conditions: vec![NodeCondition {
+                    field: "ghost.value".to_string(), // 未定義ノード
+                    op: NodeConditionOp::Eq,
+                    value: Some(serde_json::json!("true")),
+                    target_node: "node3".to_string(),
+                }],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        nodes.insert(
+            "node3".to_string(),
+            DagNode {
+                node_type: DagNodeType::Escalate,
+                question: None,
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+
+        let dag = DagDefinition {
+            dag_id: "context_ref_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "node1".to_string(),
+            nodes,
+        };
+
+        // node1 が下流 node2 を参照しているためエラー
+        let err1 = validate_dag(&dag).expect_err("下流ノード参照は拒否されること。");
+        assert!(matches!(
+            err1,
+            DagValidationError::InvalidCondition {
+                ref node_id,
+                ref field,
+                ..
+            } if node_id == "node1" && field == "node2.value"
+        ));
+    }
+
+    #[test]
+    fn test_validate_dag_rejects_condition_type_inconsistency() {
+        // 1. Confidence に対する In や非数値
+        let mut nodes = IndexMap::new();
+        nodes.insert(
+            "n1".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_noul("Q1".to_string())),
+                conditions: vec![NodeCondition {
+                    field: "confidence".to_string(),
+                    op: NodeConditionOp::In,
+                    value: Some(serde_json::json!([0.8])),
+                    target_node: "n2".to_string(),
+                }],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        nodes.insert(
+            "n2".to_string(),
+            DagNode {
+                node_type: DagNodeType::Escalate,
+                question: None,
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+
+        let dag = DagDefinition {
+            dag_id: "bad_conf_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "n1".to_string(),
+            nodes,
+        };
+        assert!(matches!(
+            validate_dag(&dag),
+            Err(DagValidationError::InvalidCondition { .. })
+        ));
+
+        // 2. Choice に対する大小比較
+        let mut criteria = IndexMap::new();
+        criteria.insert("opt1".to_string(), "選択肢1".to_string());
+        let mut nodes_choice = IndexMap::new();
+        nodes_choice.insert(
+            "c1".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_choice("質問".to_string(), criteria)),
+                conditions: vec![NodeCondition {
+                    field: "answer".to_string(),
+                    op: NodeConditionOp::Gt,
+                    value: Some(serde_json::json!(1.0)),
+                    target_node: "c2".to_string(),
+                }],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        nodes_choice.insert(
+            "c2".to_string(),
+            DagNode {
+                node_type: DagNodeType::Escalate,
+                question: None,
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        let dag_choice = DagDefinition {
+            dag_id: "bad_choice_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "c1".to_string(),
+            nodes: nodes_choice,
+        };
+        assert!(matches!(
+            validate_dag(&dag_choice),
+            Err(DagValidationError::InvalidCondition { .. })
+        ));
+
+        // 3. Route に対する不正なルート文字列
+        let mut nodes_route = IndexMap::new();
+        nodes_route.insert(
+            "r1".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_noul("Q".to_string())),
+                conditions: vec![NodeCondition {
+                    field: "route".to_string(),
+                    op: NodeConditionOp::Eq,
+                    value: Some(serde_json::json!("invalid_route_str")),
+                    target_node: "r2".to_string(),
+                }],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        nodes_route.insert(
+            "r2".to_string(),
+            DagNode {
+                node_type: DagNodeType::Escalate,
+                question: None,
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        let dag_route = DagDefinition {
+            dag_id: "bad_route_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "r1".to_string(),
+            nodes: nodes_route,
+        };
+        assert!(matches!(
+            validate_dag(&dag_route),
+            Err(DagValidationError::InvalidCondition { .. })
+        ));
     }
 }

@@ -95,6 +95,10 @@ pub enum RuntimeError {
     /// コア数理・型スキーマクレート由来のエラー。
     #[error("コアエラー: {0}。")]
     Core(#[from] sokuto_core::error::CoreError),
+
+    /// DAG 静的検証エラー。
+    #[error("DAG 静的検証エラー: {0}。")]
+    DagValidation(#[from] crate::dag::validator::DagValidationError),
 }
 
 /// ランタイム処理の標準結果型。

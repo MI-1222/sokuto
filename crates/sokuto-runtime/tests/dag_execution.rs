@@ -657,3 +657,146 @@ async fn test_escalation_diagnostics_aggregation() {
         "System 2 向け Guided CoT プロンプト案が集約されていること。"
     );
 }
+
+#[test]
+fn test_validate_dag_condition_rejections() {
+    use sokuto_runtime::dag::DagValidationError;
+
+    // 1. 未知フィールド (non_existent) の静的拒否
+    let mut nodes_unknown = IndexMap::new();
+    nodes_unknown.insert(
+        "q1".to_string(),
+        DagNode {
+            node_type: DagNodeType::Inference,
+            question: Some(Question::new_noul("質問".to_string())),
+            conditions: vec![NodeCondition {
+                field: "non_existent".to_string(),
+                op: NodeConditionOp::Eq,
+                value: Some(serde_json::json!(true)),
+                target_node: "term".to_string(),
+            }],
+            parallel_nodes: Vec::new(),
+            join_node: None,
+            reason: None,
+        },
+    );
+    nodes_unknown.insert(
+        "term".to_string(),
+        DagNode {
+            node_type: DagNodeType::Escalate,
+            question: None,
+            conditions: Vec::new(),
+            parallel_nodes: Vec::new(),
+            join_node: None,
+            reason: None,
+        },
+    );
+    let dag_unknown = DagDefinition {
+        dag_id: "unknown_field_test".to_string(),
+        timeout_ms: 100,
+        entry_node: "q1".to_string(),
+        nodes: nodes_unknown,
+    };
+    let err_unknown = validate_dag(&dag_unknown).expect_err("未知フィールドは拒否されること。");
+    assert!(matches!(
+        err_unknown,
+        DagValidationError::InvalidCondition {
+            ref node_id,
+            ref field,
+            ..
+        } if node_id == "q1" && field == "non_existent"
+    ));
+
+    // 2. 未定義ノード参照 (ghost.value) の静的拒否
+    let mut nodes_ghost = IndexMap::new();
+    nodes_ghost.insert(
+        "q1".to_string(),
+        DagNode {
+            node_type: DagNodeType::Inference,
+            question: Some(Question::new_noul("質問".to_string())),
+            conditions: vec![NodeCondition {
+                field: "ghost.value".to_string(),
+                op: NodeConditionOp::Eq,
+                value: Some(serde_json::json!("true")),
+                target_node: "term".to_string(),
+            }],
+            parallel_nodes: Vec::new(),
+            join_node: None,
+            reason: None,
+        },
+    );
+    nodes_ghost.insert(
+        "term".to_string(),
+        DagNode {
+            node_type: DagNodeType::Escalate,
+            question: None,
+            conditions: Vec::new(),
+            parallel_nodes: Vec::new(),
+            join_node: None,
+            reason: None,
+        },
+    );
+    let dag_ghost = DagDefinition {
+        dag_id: "ghost_ref_test".to_string(),
+        timeout_ms: 100,
+        entry_node: "q1".to_string(),
+        nodes: nodes_ghost,
+    };
+    let err_ghost = validate_dag(&dag_ghost).expect_err("未定義ノード参照は拒否されること。");
+    assert!(matches!(
+        err_ghost,
+        DagValidationError::InvalidCondition {
+            ref node_id,
+            ref field,
+            ..
+        } if node_id == "q1" && field == "ghost.value"
+    ));
+
+    // 3. 演算子・値型不整合 (Score に対する In 演算子) の静的拒否
+    let mut nodes_type = IndexMap::new();
+    nodes_type.insert(
+        "q1".to_string(),
+        DagNode {
+            node_type: DagNodeType::Inference,
+            question: Some(Question::new_score(
+                "スコア評価".to_string(),
+                vec!["1".to_string(), "2".to_string(), "3".to_string()],
+            )),
+            conditions: vec![NodeCondition {
+                field: "answer".to_string(),
+                op: NodeConditionOp::In,
+                value: Some(serde_json::json!([1, 2])),
+                target_node: "term".to_string(),
+            }],
+            parallel_nodes: Vec::new(),
+            join_node: None,
+            reason: None,
+        },
+    );
+    nodes_type.insert(
+        "term".to_string(),
+        DagNode {
+            node_type: DagNodeType::Escalate,
+            question: None,
+            conditions: Vec::new(),
+            parallel_nodes: Vec::new(),
+            join_node: None,
+            reason: None,
+        },
+    );
+    let dag_type = DagDefinition {
+        dag_id: "type_mismatch_test".to_string(),
+        timeout_ms: 100,
+        entry_node: "q1".to_string(),
+        nodes: nodes_type,
+    };
+    let err_type = validate_dag(&dag_type).expect_err("型不整合条件は拒否されること。");
+    assert!(matches!(
+        err_type,
+        DagValidationError::InvalidCondition {
+            ref node_id,
+            ref field,
+            ..
+        } if node_id == "q1" && field == "answer"
+    ));
+}

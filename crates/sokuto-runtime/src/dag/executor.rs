@@ -469,7 +469,7 @@ fn parse_condition_f64(value: Option<&serde_json::Value>) -> Option<f64> {
 
 /// コンテキストノード参照 (`node_id.prop`) で参照可能なプロパティ種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContextProp {
+pub(crate) enum ContextProp {
     /// 先行ノードの回答値 (`value` / `answer`)。
     Value,
     /// 先行ノードの確信度 (`confidence`)。
@@ -478,7 +478,7 @@ enum ContextProp {
 
 /// `NodeCondition.field` 文字列をパースした型安全な評価対象フィールド。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConditionField<'a> {
+pub(crate) enum ConditionField<'a> {
     /// 現在のノードの実効確信度 (`confidence`)。
     Confidence,
     /// 現在のノードのゲーティングルート (`route`)。
@@ -493,7 +493,7 @@ enum ConditionField<'a> {
 
 impl<'a> ConditionField<'a> {
     /// フィールド名文字列を `ConditionField` にパースする。
-    fn parse(field: &'a str) -> Self {
+    pub(crate) fn parse(field: &'a str) -> Self {
         match field {
             "confidence" => Self::Confidence,
             "route" => Self::Route,

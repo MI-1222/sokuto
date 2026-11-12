@@ -3,8 +3,9 @@
 //! 実行前の DAG 定義に対し、循環参照 (閉路)、未定義ノード参照、
 //! 型契約違反、到達不能ノードを Fast-Fail で静的検証する。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
+use indexmap::IndexMap;
 use sokuto_core::schema::{Criteria, Question, QuestionType};
 
 use crate::dag::executor::{ConditionField, ContextProp};
@@ -315,55 +316,108 @@ fn is_finite_number_value(val: Option<&serde_json::Value>) -> bool {
     false
 }
 
-/// 条件式を評価する対象の質問仕様を解決する。
+/// 条件式を評価する対象の上流推論ノード群の質問仕様を探索・解決する。
 ///
 /// `Inference` ノードの場合は自身の `question` を返し、
-/// `Branch` ノードの場合は直近の上流 `Inference` ノード群の質問仕様を探索・解決する。
-fn resolve_target_question<'a>(
+/// `Branch` ノードの場合は直近の上流 `Inference` ノード群の質問仕様を幅優先探索で解決する。
+///
+/// # 検証ルール
+/// 1. 直近の上流 `Inference` ノードが存在しない場合はエラー。
+/// 2. 上流に同一の並行ノード (`Parallel`) に由来する複数タスクが存在する場合、暗黙のフィールド参照は曖昧となるため、
+///    `node_id.value` (または `node_id.confidence`) 形式での明示指定を要求するエラーを返す。
+/// 3. 合流する複数の直近上流 `Inference` ノード間で質問タイプ (`question_type`) が不一致の場合はエラー。
+fn resolve_upstream_questions<'a>(
     node_id: &'a str,
     node: &'a DagNode,
+    field: &str,
     dag: &'a DagDefinition,
     rev_adj: &HashMap<&str, Vec<&str>>,
-) -> Result<Option<&'a Question>, DagValidationError> {
+) -> Result<IndexMap<&'a str, &'a Question>, DagValidationError> {
     if let Some(ref q) = node.question {
-        return Ok(Some(q));
+        let mut map = IndexMap::new();
+        map.insert(node_id, q);
+        return Ok(map);
     }
 
     let mut visited = HashSet::new();
-    let mut q = Vec::new();
+    let mut q = VecDeque::new();
     if let Some(preds) = rev_adj.get(node_id) {
         for &pred in preds {
-            q.push(pred);
-            visited.insert(pred);
+            if visited.insert(pred) {
+                q.push_back(pred);
+            }
         }
     }
 
-    let mut upstream_questions = Vec::new();
-    while let Some(curr) = q.pop() {
-        if let Some(curr_node) = dag.nodes.get(curr) {
+    let mut upstream_nodes: IndexMap<&'a str, &'a Question> = IndexMap::new();
+    while let Some(curr) = q.pop_front() {
+        if let Some((curr_key, curr_node)) = dag.nodes.get_key_value(curr) {
             if curr_node.node_type == DagNodeType::Inference {
                 if let Some(ref question) = curr_node.question {
-                    upstream_questions.push(question);
+                    upstream_nodes.insert(curr_key.as_str(), question);
                 }
+                // 直近の Inference ノードに到達したため、この経路の更なる上流探索は打ち切る。
             } else if let Some(preds) = rev_adj.get(curr) {
                 for &pred in preds {
                     if visited.insert(pred) {
-                        q.push(pred);
+                        q.push_back(pred);
                     }
                 }
             }
         }
     }
 
-    if upstream_questions.is_empty() {
+    if upstream_nodes.is_empty() {
         return Err(DagValidationError::InvalidCondition {
             node_id: node_id.to_string(),
-            field: "answer".to_string(),
-            reason: "上流に推論結果を出力する Inference ノードが存在しないため answer フィールドを評価できません。".to_string(),
+            field: field.to_string(),
+            reason: format!(
+                "上流に推論結果を出力する Inference ノードが存在しないため {field} フィールドを評価できません。"
+            ),
         });
     }
 
-    Ok(Some(upstream_questions[0]))
+    // 並行ノード (Parallel) 由来の複数タスクが同時に合流しているかチェック。
+    for p_node in dag.nodes.values() {
+        if p_node.node_type == DagNodeType::Parallel && p_node.parallel_nodes.len() > 1 {
+            let matched_count = p_node
+                .parallel_nodes
+                .iter()
+                .filter(|id| upstream_nodes.contains_key(id.as_str()))
+                .count();
+            if matched_count > 1 {
+                return Err(DagValidationError::InvalidCondition {
+                    node_id: node_id.to_string(),
+                    field: field.to_string(),
+                    reason: format!(
+                        "並行ノードからの合流ノードでは複数の推論結果が存在するため、暗黙の '{field}' フィールドは使用できません。'node_id.value' 形式で評価対象ノードを明示的に指定してください。"
+                    ),
+                });
+            }
+        }
+    }
+
+    // 合流する全上流 Inference ノード間で質問タイプ (question_type) が一致しているか検証。
+    let first_type = upstream_nodes.values().next().unwrap().question_type;
+    let all_same_type = upstream_nodes
+        .values()
+        .all(|q| q.question_type == first_type);
+    if !all_same_type {
+        let type_summary = upstream_nodes
+            .iter()
+            .map(|(id, q)| format!("'{id}'={:?}", q.question_type))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(DagValidationError::InvalidCondition {
+            node_id: node_id.to_string(),
+            field: field.to_string(),
+            reason: format!(
+                "合流する上流推論ノード間で質問タイプ (question_type) が一致していません ({type_summary})。'node_id.value' 形式で明示的に参照するか、合流する全ノードの質問タイプを統一してください。"
+            ),
+        });
+    }
+
+    Ok(upstream_nodes)
 }
 
 /// 各ノードの条件式リスト (`conditions`) に対し、フィールド妥当性・先祖参照・型整合性を静的検証する。
@@ -620,8 +674,9 @@ fn validate_single_condition(
             Ok(())
         }
         ConditionField::Answer => {
-            let target_q = resolve_target_question(node_id, node, dag, rev_adj)?;
-            let q_type = target_q.map(|q| q.question_type);
+            let upstream_nodes =
+                resolve_upstream_questions(node_id, node, &cond.field, dag, rev_adj)?;
+            let q_type = upstream_nodes.values().next().map(|q| q.question_type);
 
             match q_type {
                 Some(QuestionType::Choice) => {
@@ -651,17 +706,18 @@ fn validate_single_condition(
                                             .to_string(),
                                 });
                             };
-                            if let Some(q) = target_q
-                                && let Some(Criteria::Map(ref map)) = q.criteria
-                                && !map.contains_key(s)
-                            {
-                                return Err(DagValidationError::InvalidCondition {
-                                    node_id: node_id.to_string(),
-                                    field: cond.field.clone(),
-                                    reason: format!(
-                                        "Choice 質問の criteria 定義に候補キー '{s}' が存在しません。"
-                                    ),
-                                });
+                            for (up_id, q) in &upstream_nodes {
+                                if let Some(Criteria::Map(ref map)) = q.criteria
+                                    && !map.contains_key(s)
+                                {
+                                    return Err(DagValidationError::InvalidCondition {
+                                        node_id: node_id.to_string(),
+                                        field: cond.field.clone(),
+                                        reason: format!(
+                                            "Choice 質問 '{up_id}' の criteria 定義に候補キー '{s}' が存在しません。"
+                                        ),
+                                    });
+                                }
                             }
                         }
                         NodeConditionOp::In => {
@@ -689,17 +745,18 @@ fn validate_single_condition(
                                         reason: "'in' 演算子の配列要素はすべて文字列である必要があります。".to_string(),
                                     });
                                 };
-                                if let Some(q) = target_q
-                                    && let Some(Criteria::Map(ref map)) = q.criteria
-                                    && !map.contains_key(s)
-                                {
-                                    return Err(DagValidationError::InvalidCondition {
-                                        node_id: node_id.to_string(),
-                                        field: cond.field.clone(),
-                                        reason: format!(
-                                            "Choice 質問の criteria 定義に候補キー '{s}' が存在しません。"
-                                        ),
-                                    });
+                                for (up_id, q) in &upstream_nodes {
+                                    if let Some(Criteria::Map(ref map)) = q.criteria
+                                        && !map.contains_key(s)
+                                    {
+                                        return Err(DagValidationError::InvalidCondition {
+                                            node_id: node_id.to_string(),
+                                            field: cond.field.clone(),
+                                            reason: format!(
+                                                "Choice 質問 '{up_id}' の criteria 定義に候補キー '{s}' が存在しません。"
+                                            ),
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -1436,6 +1493,411 @@ mod tests {
                 ref placeholder,
                 ..
             } if node_id == "first" && placeholder == "second.value"
+        ));
+    }
+
+    #[test]
+    fn test_parallel_join_rejects_implicit_answer_condition() {
+        let mut nodes = IndexMap::new();
+        nodes.insert(
+            "par_entry".to_string(),
+            DagNode {
+                node_type: DagNodeType::Parallel,
+                question: None,
+                conditions: Vec::new(),
+                parallel_nodes: vec!["noul_task".to_string(), "choice_task".to_string()],
+                join_node: Some("join_branch".to_string()),
+                reason: None,
+            },
+        );
+        nodes.insert(
+            "noul_task".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_noul("真偽判定".to_string())),
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        let mut choice_criteria = IndexMap::new();
+        choice_criteria.insert("opt_a".to_string(), "選択肢A".to_string());
+        nodes.insert(
+            "choice_task".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_choice(
+                    "選択肢判定".to_string(),
+                    choice_criteria,
+                )),
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        nodes.insert(
+            "join_branch".to_string(),
+            DagNode {
+                node_type: DagNodeType::Branch,
+                question: None,
+                conditions: vec![NodeCondition {
+                    field: "answer".to_string(),
+                    op: NodeConditionOp::Eq,
+                    value: Some(serde_json::json!("opt_a")),
+                    target_node: "term".to_string(),
+                }],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        nodes.insert(
+            "term".to_string(),
+            DagNode {
+                node_type: DagNodeType::Escalate,
+                question: None,
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: Some("終端".to_string()),
+            },
+        );
+
+        let dag = DagDefinition {
+            dag_id: "parallel_implicit_answer_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "par_entry".to_string(),
+            nodes,
+        };
+
+        let err = validate_dag(&dag)
+            .expect_err("並行ノードからの合流における暗黙 answer 参照は拒否されること。");
+        assert!(matches!(
+            err,
+            DagValidationError::InvalidCondition {
+                ref node_id,
+                ref field,
+                ..
+            } if node_id == "join_branch" && field == "answer"
+        ));
+    }
+
+    #[test]
+    fn test_parallel_join_allows_explicit_context_property() {
+        let mut nodes = IndexMap::new();
+        nodes.insert(
+            "par_entry".to_string(),
+            DagNode {
+                node_type: DagNodeType::Parallel,
+                question: None,
+                conditions: Vec::new(),
+                parallel_nodes: vec!["noul_task".to_string(), "choice_task".to_string()],
+                join_node: Some("join_branch".to_string()),
+                reason: None,
+            },
+        );
+        nodes.insert(
+            "noul_task".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_noul("真偽判定".to_string())),
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        let mut choice_criteria = IndexMap::new();
+        choice_criteria.insert("opt_a".to_string(), "選択肢A".to_string());
+        nodes.insert(
+            "choice_task".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_choice(
+                    "選択肢判定".to_string(),
+                    choice_criteria,
+                )),
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        nodes.insert(
+            "join_branch".to_string(),
+            DagNode {
+                node_type: DagNodeType::Branch,
+                question: None,
+                conditions: vec![NodeCondition {
+                    field: "choice_task.value".to_string(),
+                    op: NodeConditionOp::Eq,
+                    value: Some(serde_json::json!("opt_a")),
+                    target_node: "term".to_string(),
+                }],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        nodes.insert(
+            "term".to_string(),
+            DagNode {
+                node_type: DagNodeType::Escalate,
+                question: None,
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: Some("終端".to_string()),
+            },
+        );
+
+        let dag = DagDefinition {
+            dag_id: "parallel_explicit_prop_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "par_entry".to_string(),
+            nodes,
+        };
+
+        assert!(
+            validate_dag(&dag).is_ok(),
+            "明示的な context プロパティ参照はバリデーションに合格すること。"
+        );
+    }
+
+    #[test]
+    fn test_branch_join_condition_type_consistency() {
+        // 1. 異種型合流 (Noul と Choice) での暗黙 answer 参照拒否
+        let mut nodes_hetero = IndexMap::new();
+        nodes_hetero.insert(
+            "root".to_string(),
+            DagNode {
+                node_type: DagNodeType::Branch,
+                question: None,
+                conditions: vec![
+                    NodeCondition {
+                        field: "confidence".to_string(),
+                        op: NodeConditionOp::ConfidenceGte,
+                        value: Some(serde_json::json!(0.5)),
+                        target_node: "path_noul".to_string(),
+                    },
+                    NodeCondition {
+                        field: "confidence".to_string(),
+                        op: NodeConditionOp::ConfidenceLt,
+                        value: Some(serde_json::json!(0.5)),
+                        target_node: "path_choice".to_string(),
+                    },
+                ],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        nodes_hetero.insert(
+            "path_noul".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_noul("真偽".to_string())),
+                conditions: vec![NodeCondition {
+                    field: "confidence".to_string(),
+                    op: NodeConditionOp::ConfidenceGte,
+                    value: Some(serde_json::json!(0.0)),
+                    target_node: "join_node".to_string(),
+                }],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        let mut criteria = IndexMap::new();
+        criteria.insert("yes".to_string(), "はい".to_string());
+        nodes_hetero.insert(
+            "path_choice".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_choice("選択".to_string(), criteria)),
+                conditions: vec![NodeCondition {
+                    field: "confidence".to_string(),
+                    op: NodeConditionOp::ConfidenceGte,
+                    value: Some(serde_json::json!(0.0)),
+                    target_node: "join_node".to_string(),
+                }],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        nodes_hetero.insert(
+            "join_node".to_string(),
+            DagNode {
+                node_type: DagNodeType::Branch,
+                question: None,
+                conditions: vec![NodeCondition {
+                    field: "answer".to_string(),
+                    op: NodeConditionOp::Eq,
+                    value: Some(serde_json::json!("yes")),
+                    target_node: "term".to_string(),
+                }],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        nodes_hetero.insert(
+            "term".to_string(),
+            DagNode {
+                node_type: DagNodeType::Escalate,
+                question: None,
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: Some("終端".to_string()),
+            },
+        );
+
+        let dag_hetero = DagDefinition {
+            dag_id: "hetero_join_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "root".to_string(),
+            nodes: nodes_hetero,
+        };
+        let err = validate_dag(&dag_hetero).expect_err("異種型の合流は拒否されること。");
+        assert!(matches!(
+            err,
+            DagValidationError::InvalidCondition {
+                ref node_id,
+                ref field,
+                ..
+            } if node_id == "join_node" && field == "answer"
+        ));
+
+        // 2. 同種型合流 (Choice と Choice) で全 criteria に存在するキーの検証合格
+        let mut nodes_homo = IndexMap::new();
+        nodes_homo.insert(
+            "root".to_string(),
+            DagNode {
+                node_type: DagNodeType::Branch,
+                question: None,
+                conditions: vec![
+                    NodeCondition {
+                        field: "confidence".to_string(),
+                        op: NodeConditionOp::ConfidenceGte,
+                        value: Some(serde_json::json!(0.5)),
+                        target_node: "choice_a".to_string(),
+                    },
+                    NodeCondition {
+                        field: "confidence".to_string(),
+                        op: NodeConditionOp::ConfidenceLt,
+                        value: Some(serde_json::json!(0.5)),
+                        target_node: "choice_b".to_string(),
+                    },
+                ],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        let mut crit_a = IndexMap::new();
+        crit_a.insert("approved".to_string(), "承認".to_string());
+        crit_a.insert("rejected".to_string(), "却下".to_string());
+        nodes_homo.insert(
+            "choice_a".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_choice("A判定".to_string(), crit_a)),
+                conditions: vec![NodeCondition {
+                    field: "confidence".to_string(),
+                    op: NodeConditionOp::ConfidenceGte,
+                    value: Some(serde_json::json!(0.0)),
+                    target_node: "join_node".to_string(),
+                }],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        let mut crit_b = IndexMap::new();
+        crit_b.insert("approved".to_string(), "承認".to_string());
+        crit_b.insert("escalated".to_string(), "上位判断".to_string());
+        nodes_homo.insert(
+            "choice_b".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_choice("B判定".to_string(), crit_b)),
+                conditions: vec![NodeCondition {
+                    field: "confidence".to_string(),
+                    op: NodeConditionOp::ConfidenceGte,
+                    value: Some(serde_json::json!(0.0)),
+                    target_node: "join_node".to_string(),
+                }],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        nodes_homo.insert(
+            "join_node".to_string(),
+            DagNode {
+                node_type: DagNodeType::Branch,
+                question: None,
+                conditions: vec![NodeCondition {
+                    field: "answer".to_string(),
+                    op: NodeConditionOp::Eq,
+                    value: Some(serde_json::json!("approved")),
+                    target_node: "term".to_string(),
+                }],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        nodes_homo.insert(
+            "term".to_string(),
+            DagNode {
+                node_type: DagNodeType::Escalate,
+                question: None,
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: Some("終端".to_string()),
+            },
+        );
+
+        let dag_homo = DagDefinition {
+            dag_id: "homo_join_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "root".to_string(),
+            nodes: nodes_homo,
+        };
+        assert!(
+            validate_dag(&dag_homo).is_ok(),
+            "全上流 Choice ノードの criteria に存在する共通キーの評価は合格すること。"
+        );
+
+        // 3. 片方の上流 Choice ノードにしか存在しないキー ('rejected') は拒否されること
+        let mut nodes_homo_missing = dag_homo.nodes.clone();
+        nodes_homo_missing.get_mut("join_node").unwrap().conditions = vec![NodeCondition {
+            field: "answer".to_string(),
+            op: NodeConditionOp::Eq,
+            value: Some(serde_json::json!("rejected")),
+            target_node: "term".to_string(),
+        }];
+        let dag_missing_key = DagDefinition {
+            dag_id: "homo_missing_key_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "root".to_string(),
+            nodes: nodes_homo_missing,
+        };
+        let err_missing = validate_dag(&dag_missing_key)
+            .expect_err("片方の上流に存在しないキーの評価は拒否されること。");
+        assert!(matches!(
+            err_missing,
+            DagValidationError::InvalidCondition {
+                ref node_id,
+                ref field,
+                ..
+            } if node_id == "join_node" && field == "answer"
         ));
     }
 }

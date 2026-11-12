@@ -9,6 +9,7 @@
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::borrow::{Borrow, BorrowMut};
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::ptr::NonNull;
@@ -72,21 +73,23 @@ impl<T: Copy> AlignedBuffer64<T> {
             "ZST はサポートされていません。"
         );
 
-        if len == 0 {
-            return Self {
-                ptr: NonNull::dangling(),
-                len: 0,
-                capacity: 0,
-                layout: Layout::from_size_align(0, 64)
-                    .expect("64バイトアライメントレイアウトの作成に失敗しました。"),
-            };
-        }
-
+        let align = std::mem::align_of::<T>().max(64);
         let size = len
             .checked_mul(std::mem::size_of::<T>())
             .expect("メモリ確保サイズがオーバーフローしました。");
-        let layout = Layout::from_size_align(size, 64)
+        let layout = Layout::from_size_align(size, align)
             .expect("64バイトアライメントレイアウトの作成に失敗しました。");
+
+        if len == 0 {
+            let empty_align =
+                NonZeroUsize::new(align).expect("アライメント値は非ゼロである必要があります。");
+            return Self {
+                ptr: NonNull::without_provenance(empty_align),
+                len: 0,
+                capacity: 0,
+                layout,
+            };
+        }
 
         // SAFETY: 有効なレイアウトと非ゼロサイズを検証済みであり、直後にゼロ初期化メモリとして確保する。
         let raw_ptr = unsafe { alloc_zeroed(layout) as *mut T };
@@ -130,23 +133,16 @@ impl<T: Copy> Deref for AlignedBuffer64<T> {
     type Target = [T];
 
     fn deref(&self) -> &Self::Target {
-        if self.len == 0 {
-            &[]
-        } else {
-            // SAFETY: 有効な割り当て領域と要素数を保持している。
-            unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
-        }
+        // SAFETY: `len == 0` 時も `ptr` は非ヌルかつ `align_of::<T>()` 以上 (64バイト境界) に整列しているため、
+        // スライス生成は常に安全である。
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 }
 
 impl<T: Copy> DerefMut for AlignedBuffer64<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        if self.len == 0 {
-            &mut []
-        } else {
-            // SAFETY: 排他的借用下で有効な割り当て領域と要素数を保持している。
-            unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
-        }
+        // SAFETY: 排他的借用下で、`len == 0` 時も `ptr` は非ヌルかつ `align_of::<T>()` 以上に整列している。
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 }
 
@@ -1509,15 +1505,32 @@ mod tests {
 
     #[test]
     fn test_aligned_buffer64_empty() {
-        let buf = AlignedBuffer64::<f32>::with_capacity_zeroed(0);
+        let mut buf = AlignedBuffer64::<f32>::with_capacity_zeroed(0);
         assert_eq!(buf.len(), 0);
         assert!(buf.is_empty());
+        assert!(buf.is_aligned_64());
+        assert!(is_aligned_64(buf.as_ptr()));
+        assert!(is_aligned_64(buf.as_mut_ptr()));
         assert_eq!(&buf[..], &[] as &[f32]);
 
         let empty_slice: [f32; 0] = [];
         let buf_from_empty = AlignedBuffer64::from_slice(&empty_slice);
         assert_eq!(buf_from_empty.len(), 0);
         assert!(buf_from_empty.is_empty());
+        assert!(buf_from_empty.is_aligned_64());
+        assert!(is_aligned_64(buf_from_empty.as_ptr()));
+
+        // 64バイト超のアライメント要件を持つ型でも、型のアライメントと 64B 境界の双方を満たすこと
+        #[repr(align(128))]
+        #[derive(Clone, Copy)]
+        struct OverAligned([u8; 128]);
+        let over_buf = AlignedBuffer64::<OverAligned>::with_capacity_zeroed(0);
+        assert!(over_buf.is_aligned_64());
+        assert_eq!((over_buf.as_ptr() as usize) % 128, 0);
+        let over_buf_nonempty = AlignedBuffer64::<OverAligned>::with_capacity_zeroed(1);
+        assert!(over_buf_nonempty.is_aligned_64());
+        assert_eq!((over_buf_nonempty.as_ptr() as usize) % 128, 0);
+        assert_eq!(over_buf_nonempty[0].0[0], 0);
     }
 
     #[test]

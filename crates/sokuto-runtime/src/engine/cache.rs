@@ -325,6 +325,17 @@ pub enum CachedTensorPayload {
     },
 }
 
+impl CachedTensorPayload {
+    /// ペイロードの保持形式に対応する [`CacheCompressionMode`] を返す。
+    pub fn compression_mode(&self) -> CacheCompressionMode {
+        match self {
+            Self::Raw(_) => CacheCompressionMode::None,
+            Self::Fp16(_) => CacheCompressionMode::Fp16,
+            Self::Int8Symmetric { .. } => CacheCompressionMode::Int8Symmetric,
+        }
+    }
+}
+
 impl fmt::Debug for CachedTensorPayload {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -351,8 +362,6 @@ pub struct CachedStateFeatures {
     pub payload: CachedTensorPayload,
     /// テンソルが占有する実メモリバイト数（`moka` の `weigher` に使用）。
     pub byte_size: usize,
-    /// 採用された圧縮モード。
-    pub compression_mode: CacheCompressionMode,
     /// `State` の有効トークンアテンションマスク列 (`[batch_size, seq_len]`)。
     pub state_mask: Vec<i64>,
     /// キャッシュされた State 原文テキスト（または先頭抜粋）。
@@ -426,7 +435,6 @@ impl CachedStateFeatures {
             shape,
             payload: CachedTensorPayload::Raw(Arc::new(ort_value)),
             byte_size,
-            compression_mode: CacheCompressionMode::None,
             state_mask,
             state_text,
         })
@@ -523,7 +531,6 @@ impl CachedStateFeatures {
                     shape,
                     payload: CachedTensorPayload::Raw(Arc::new(tensor.into_dyn())),
                     byte_size,
-                    compression_mode: mode,
                     state_mask,
                     state_text,
                 })
@@ -536,7 +543,6 @@ impl CachedStateFeatures {
                     shape,
                     payload: CachedTensorPayload::Fp16(Arc::new(compressed)),
                     byte_size,
-                    compression_mode: mode,
                     state_mask,
                     state_text,
                 })
@@ -553,12 +559,16 @@ impl CachedStateFeatures {
                         scales: Arc::new(scales),
                     },
                     byte_size,
-                    compression_mode: mode,
                     state_mask,
                     state_text,
                 })
             }
         }
+    }
+
+    /// テンソルペイロードの圧縮モードを取得する。
+    pub fn compression_mode(&self) -> CacheCompressionMode {
+        self.payload.compression_mode()
     }
 
     /// State 原文テキストを設定するビルダーメソッド。

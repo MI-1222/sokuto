@@ -29,7 +29,7 @@ fn test_cached_state_features_dimensions() {
     assert_eq!(entry.batch_size(), 2);
     assert_eq!(entry.seq_len(), 32);
     assert_eq!(entry.hidden_size(), 128);
-    assert_eq!(entry.compression_mode, CacheCompressionMode::None);
+    assert_eq!(entry.compression_mode(), CacheCompressionMode::None);
     assert_eq!(entry.state_mask, mask);
 }
 
@@ -124,7 +124,7 @@ fn test_8_4_3_fp16_and_int8_compression_fidelity() {
     )
     .expect("FP16 エントリの作成に失敗しました。");
 
-    assert_eq!(fp16_entry.compression_mode, CacheCompressionMode::Fp16);
+    assert_eq!(fp16_entry.compression_mode(), CacheCompressionMode::Fp16);
     // `FP16` は `f32` の半分のメモリサイズ (要素数 * 2バイト)。
     assert_eq!(fp16_entry.byte_size, total_elements * 2);
 
@@ -162,7 +162,7 @@ fn test_8_4_3_fp16_and_int8_compression_fidelity() {
     .expect("INT8 エントリの作成に失敗しました。");
 
     assert_eq!(
-        int8_entry.compression_mode,
+        int8_entry.compression_mode(),
         CacheCompressionMode::Int8Symmetric
     );
     // `INT8` は約75%削減 (要素数 * 1バイト + トークン数 * 4バイト)。

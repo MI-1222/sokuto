@@ -20,9 +20,8 @@ pub use cache::{
 pub use coarse::{
     CandidateEmbeddingCache, CoarseScorer, CoarseToFineConfig, DEFAULT_COARSE_THRESHOLD,
     DEFAULT_NEGATIVE_KEYS, DEFAULT_TOP_M_CANDIDATES, EmbeddingCoarseScorer, FilteredCandidates,
-    HierarchicalCoarseScorer, LexicalCoarseScorer, ModelDrivenCoarseScorer, filter_top_candidates,
-    is_negative_candidate, reconstruct_and_gate_answer, reconstruct_choice_answer,
-    reconstruct_probabilities,
+    LexicalCoarseScorer, filter_top_candidates, is_negative_candidate, reconstruct_and_gate_answer,
+    reconstruct_choice_answer, reconstruct_probabilities,
 };
 pub use config::{ExecutionProvider, OptimizationLevel, SessionConfig};
 pub use escalation::{

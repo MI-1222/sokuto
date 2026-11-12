@@ -11,7 +11,6 @@ use sokuto_core::gating::GatingConfig;
 use sokuto_core::math::composite_confidence_iter;
 use sokuto_core::schema::{Answer, AnswerPayload, Question, QuestionType};
 
-use crate::engine::InferenceEngine;
 use crate::engine::gating::apply_gating_to_answer_with_energy;
 use crate::error::{Result, RuntimeError};
 use crate::tokenizer::JevTokenizer;
@@ -254,90 +253,6 @@ pub trait CoarseScorer {
         query: &str,
         candidates: &IndexMap<String, String>,
     ) -> Result<Vec<f32>>;
-}
-
-/// 文脈対応型・階層大分類スコアリングインターフェース。
-///
-/// 単純な静的類似度ではなく、入力 State と文脈全体を反映して
-/// 大分類クラスタごとの確率・確信度スコアを算出する。
-pub trait HierarchicalCoarseScorer {
-    /// State、指示文、および大分類候補群を受け取り、各大分類の確率・確信度マップを算出する。
-    ///
-    /// # 引数
-    /// - `state`: 入力文脈テキスト。
-    /// - `instructions`: 質問指示文。
-    /// - `coarse_categories`: 大分類のキーおよび説明文マップ。
-    ///
-    /// # 戻り値
-    /// 各大分類キーと算出された確率値のマッピング。
-    fn score_coarse(
-        &self,
-        state: &str,
-        instructions: &str,
-        coarse_categories: &IndexMap<String, String>,
-    ) -> Result<IndexMap<String, f64>>;
-}
-
-/// ModernBERT モデルの第 1 パスフォワード推論を直接駆動するモデル駆動型大分類スコアラー。
-///
-/// 外部の検索モデルや静的埋め込みインデックスを必要とせず、
-/// 同一の言語モデル重みを活用して高精度な大分類確信度分布を出力する。
-pub struct ModelDrivenCoarseScorer<'a> {
-    engine: &'a InferenceEngine,
-    tokenizer: &'a JevTokenizer,
-    calib_config: Option<&'a sokuto_core::contract::calibration::CalibrationConfig>,
-}
-
-impl<'a> ModelDrivenCoarseScorer<'a> {
-    /// 推論エンジンおよびトークナイザー参照からモデル駆動型スコアラーを生成する。
-    pub fn new(engine: &'a InferenceEngine, tokenizer: &'a JevTokenizer) -> Self {
-        Self {
-            engine,
-            tokenizer,
-            calib_config: None,
-        }
-    }
-
-    /// 較正温度設定を適用する。
-    pub fn with_calibration(
-        mut self,
-        calib_config: &'a sokuto_core::contract::calibration::CalibrationConfig,
-    ) -> Self {
-        self.calib_config = Some(calib_config);
-        self
-    }
-}
-
-impl<'a> HierarchicalCoarseScorer for ModelDrivenCoarseScorer<'a> {
-    fn score_coarse(
-        &self,
-        state: &str,
-        instructions: &str,
-        coarse_categories: &IndexMap<String, String>,
-    ) -> Result<IndexMap<String, f64>> {
-        let default_calib = sokuto_core::contract::calibration::CalibrationConfig::default();
-        let calib = self.calib_config.unwrap_or(&default_calib);
-
-        let question = Question {
-            question_type: QuestionType::Choice,
-            instructions: instructions.to_string(),
-            criteria: Some(sokuto_core::schema::Criteria::Map(
-                coarse_categories.clone(),
-            )),
-        };
-
-        let answer =
-            self.engine
-                .predict_single_question(self.tokenizer, state, &question, calib)?;
-
-        match answer.payload {
-            AnswerPayload::Choice { probabilities, .. }
-            | AnswerPayload::Score { probabilities, .. } => Ok(probabilities),
-            _ => Err(RuntimeError::InvalidQuestion(
-                "大分類推論結果に確率分布が含まれていません。".to_string(),
-            )),
-        }
-    }
 }
 
 /// トークナイザーのサブワード語彙を活用した外部モデル不要の語彙スコアラー。

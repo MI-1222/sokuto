@@ -55,6 +55,43 @@ static SCORE_PREFIX_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     .expect("Score プレフィックス剥離正規表現のコンパイルに成功すること。")
 });
 
+/// 二重否定パターンのシグネチャ一覧。
+static DOUBLE_NEGATION_PATTERNS: &[&str] = &[
+    "ないわけではない",
+    "ないわけでもない",
+    "なくはない",
+    "なくもない",
+    "ないことはない",
+    "ないこともない",
+    "ないとはいえない",
+    "ないとは言えない",
+    "ざるを得ない",
+];
+
+/// 推量確認の否定疑問語尾一覧(体言や形容動詞語幹に接続し、肯定命題へ正規化する)
+static PRESUMPTIVE_NEGATIVE_ENDINGS: &[&str] = &[
+    "ではないでしょうか",
+    "じゃないでしょうか",
+    "ではないですか",
+    "じゃないですか",
+    "ではないか",
+    "じゃないか",
+];
+
+/// 否定述語パターンのシグネチャ一覧(否定極性を非破壊で維持する)
+static NEGATIVE_PREDICATE_PATTERNS: &[&str] = &[
+    "されていない",
+    "していない",
+    "できていない",
+    "となっていない",
+    "ていない",
+    "ではない",
+    "じゃない",
+    "いない",
+    "ない",
+    "ません",
+];
+
 /// Noul 正準プロンプトテンプレートのプレフィックス。
 pub const NOUL_CANONICAL_TEMPLATE_PREFIX: &str = "前提テキストの情報のみに基づいて、言明「";
 
@@ -210,23 +247,36 @@ pub fn sanitize_score_criteria(criteria: &Criteria) -> (Criteria, bool) {
 /// - `初期不良か？`, `規約違反` のような簡潔な疑問文・体言止めを、
 ///   `前提テキストの情報のみに基づいて、言明「{statement}」が真実であるか評価せよ。` へ整形する。
 /// - すでに正準テンプレートを含む場合は二重ラップを行わず、冪等性を厳格に保証する。
+/// - 二重否定構文(「〜ないわけではない」等)や否定述語(「〜されていない」等)の文構造を破壊せず維持する。
+/// - 推量確認の否定疑問(「〜ではないか？」等)は肯定命題へ正規化し、真偽極性の反転を防止する。
 pub fn normalize_noul_instruction<'a>(instruction: &'a str) -> Cow<'a, str> {
     let trimmed = instruction.trim();
     if trimmed.is_empty() {
         return Cow::Borrowed(instruction);
     }
 
-    // 冪等性ガード: すでに正準テンプレートのシグネチャを含む場合はスキップする。
+    // 1. 冪等性ガード: すでに正準テンプレートまたは完結した判定指示を含む場合はスキップする。
     if trimmed.contains("言明「")
         || trimmed.contains("が真実であるか")
         || trimmed.contains("前提テキストの情報のみに基づいて")
         || trimmed.contains("真偽を判定")
         || trimmed.contains("妥当であるか判定")
+        || trimmed.contains("該当するか判定")
+        || trimmed.contains("であるか評価")
+        || trimmed.contains("か確認せよ")
     {
         return Cow::Borrowed(instruction);
     }
 
-    // 末尾の記号類を UTF-8 セーフに除去する。
+    // 2. 元の入力が疑問文(疑問符または疑問終助詞)であるかを判定する。
+    let is_question = trimmed.ends_with('?')
+        || trimmed.ends_with('？')
+        || trimmed.ends_with('か')
+        || trimmed.ends_with('カ')
+        || trimmed.ends_with("でしょうか")
+        || trimmed.ends_with("ですか");
+
+    // 末尾の記号類(約物)を UTF-8 セーフに除去する。
     let mut stmt = trimmed;
     while let Some(stripped) = stmt
         .strip_suffix('?')
@@ -238,12 +288,100 @@ pub fn normalize_noul_instruction<'a>(instruction: &'a str) -> Cow<'a, str> {
         stmt = stripped.trim();
     }
 
-    // 末尾の疑問助詞をトリムする (初期不良か -> 初期不良, 規約違反ですか -> 規約違反)。
+    if stmt.is_empty() {
+        return Cow::Borrowed(instruction);
+    }
+
+    // 3. 二重否定構文の検出と非破壊保護(最優先分岐)
+    // 二重否定の内部を改変せず、付随する末尾の疑問マーカーのみを除去して係り受けを保持する。
+    if DOUBLE_NEGATION_PATTERNS
+        .iter()
+        .any(|pat| stmt.contains(pat))
+    {
+        let question_markers = ["でしょうか", "ですか", "か"];
+        for marker in question_markers {
+            if let Some(stripped) = stmt.strip_suffix(marker) {
+                let candidate = stripped.trim();
+                if !candidate.is_empty() {
+                    stmt = candidate;
+                    break;
+                }
+            }
+        }
+        return Cow::Owned(format!(
+            "{NOUL_CANONICAL_TEMPLATE_PREFIX}{stmt}{NOUL_CANONICAL_TEMPLATE_SUFFIX}"
+        ));
+    }
+
+    // 4. 「否定疑問(推量確認)」と「否定述語の疑問」の分離処理。
+    // パターン A: 体言・形容動詞語幹 ＋ 推量確認の否定疑問(例: 「初期不良ではないか？」→「初期不良」)。
+    if is_question {
+        let mut handled_presumptive = false;
+        for ending in PRESUMPTIVE_NEGATIVE_ENDINGS {
+            if let Some(stripped) = stmt.strip_suffix(ending) {
+                let candidate = stripped.trim();
+                if !candidate.is_empty()
+                    && !candidate.ends_with("ないの")
+                    && !candidate.ends_with("ないん")
+                {
+                    stmt = candidate;
+                    handled_presumptive = true;
+                    break;
+                }
+            }
+        }
+        if handled_presumptive {
+            return Cow::Owned(format!(
+                "{NOUL_CANONICAL_TEMPLATE_PREFIX}{stmt}{NOUL_CANONICAL_TEMPLATE_SUFFIX}"
+            ));
+        }
+    }
+
+    // パターン B: 述語自体の否定(例: 「発送されていないか」→「発送されていない」)
+    let question_markers = ["でしょうか", "ですか", "か"];
+    let mut handled_negative_predicate = false;
+    for marker in question_markers {
+        if let Some(stripped) = stmt.strip_suffix(marker) {
+            let before_question = stripped.trim();
+            if !before_question.is_empty()
+                && NEGATIVE_PREDICATE_PATTERNS
+                    .iter()
+                    .any(|pat| before_question.ends_with(pat))
+            {
+                stmt = before_question;
+                handled_negative_predicate = true;
+                break;
+            }
+        }
+    }
+    if handled_negative_predicate {
+        return Cow::Owned(format!(
+            "{NOUL_CANONICAL_TEMPLATE_PREFIX}{stmt}{NOUL_CANONICAL_TEMPLATE_SUFFIX}"
+        ));
+    }
+
+    // 疑問語尾を伴わない否定述語(例: 「規約に違反していない。」、「利用できない。」)
+    if NEGATIVE_PREDICATE_PATTERNS
+        .iter()
+        .any(|pat| stmt.ends_with(pat))
+    {
+        return Cow::Owned(format!(
+            "{NOUL_CANONICAL_TEMPLATE_PREFIX}{stmt}{NOUL_CANONICAL_TEMPLATE_SUFFIX}"
+        ));
+    }
+
+    // 5. 肯定疑問語尾の剥離と誤剥離ガード。
     let endings_to_strip = ["でしょうか", "であるか", "ですか", "である", "か"];
     for ending in endings_to_strip {
+        if ending == "か" && (stmt.ends_with("かどうか") || stmt.ends_with("何処か")) {
+            continue;
+        }
         if let Some(stripped) = stmt.strip_suffix(ending) {
             let candidate = stripped.trim();
             if !candidate.is_empty() {
+                if ending == "か" && (candidate == "何" || candidate == "誰") {
+                    continue;
+                }
                 stmt = candidate;
                 break;
             }
@@ -429,5 +567,53 @@ mod tests {
         let res = normalize_noul_instruction(canonical);
         assert!(matches!(res, Cow::Borrowed(_)));
         assert_eq!(res, canonical);
+
+        // 3. 否定述語の非破壊保持
+        assert_eq!(
+            normalize_noul_instruction("商品はまだ発送されていないか？"),
+            "前提テキストの情報のみに基づいて、言明「商品はまだ発送されていない」が真実であるか評価せよ。"
+        );
+        assert_eq!(
+            normalize_noul_instruction("承認されていないですか？"),
+            "前提テキストの情報のみに基づいて、言明「承認されていない」が真実であるか評価せよ。"
+        );
+        assert_eq!(
+            normalize_noul_instruction("規約に違反していない。"),
+            "前提テキストの情報のみに基づいて、言明「規約に違反していない」が真実であるか評価せよ。"
+        );
+        assert_eq!(
+            normalize_noul_instruction("商品はまだ届いていませんか？"),
+            "前提テキストの情報のみに基づいて、言明「商品はまだ届いていません」が真実であるか評価せよ。"
+        );
+
+        // 4. 推量否定疑問の極性保護 (肯定命題への復元)
+        assert_eq!(
+            normalize_noul_instruction("初期不良ではないか？"),
+            "前提テキストの情報のみに基づいて、言明「初期不良」が真実であるか評価せよ。"
+        );
+        assert_eq!(
+            normalize_noul_instruction("規約違反ではないでしょうか？"),
+            "前提テキストの情報のみに基づいて、言明「規約違反」が真実であるか評価せよ。"
+        );
+        assert_eq!(
+            normalize_noul_instruction("対象外ではない。"),
+            "前提テキストの情報のみに基づいて、言明「対象外ではない」が真実であるか評価せよ。"
+        );
+
+        // 5. 二重否定の構文保護
+        assert_eq!(
+            normalize_noul_instruction("解約しないわけではないか？"),
+            "前提テキストの情報のみに基づいて、言明「解約しないわけではない」が真実であるか評価せよ。"
+        );
+        assert_eq!(
+            normalize_noul_instruction("利用できないこともない。"),
+            "前提テキストの情報のみに基づいて、言明「利用できないこともない」が真実であるか評価せよ。"
+        );
+
+        // 6. 誤剥離ガード (複合疑問表現・語幹末尾の保護)
+        assert_eq!(
+            normalize_noul_instruction("返品対象かどうか？"),
+            "前提テキストの情報のみに基づいて、言明「返品対象かどうか」が真実であるか評価せよ。"
+        );
     }
 }

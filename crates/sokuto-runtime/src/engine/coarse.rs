@@ -488,13 +488,10 @@ pub fn filter_top_candidates(
     let mut selected_map = IndexMap::with_capacity(selected_indices.len());
     let mut excluded_keys = Vec::with_capacity(total_candidates - selected_indices.len());
 
-    let mut selected_idx_set = std::collections::HashSet::with_capacity(selected_indices.len());
-    for &idx in &selected_indices {
-        selected_idx_set.insert(idx);
-    }
-
+    let mut selected_iter = selected_indices.iter().copied().peekable();
     for (orig_idx, (key, desc)) in candidates.iter().enumerate() {
-        if selected_idx_set.contains(&orig_idx) {
+        if selected_iter.peek() == Some(&orig_idx) {
+            selected_iter.next();
             selected_map.insert(key.clone(), desc.clone());
         } else {
             excluded_keys.push(key.clone());
@@ -686,6 +683,10 @@ mod tests {
         // 出現順が維持されていること (card_lost, loan_apply, other)
         let keys: Vec<&String> = result.selected.keys().collect();
         assert_eq!(keys, vec!["card_lost", "loan_apply", "other"]);
+        assert_eq!(
+            result.excluded_keys,
+            vec!["card_issue".to_string(), "loan_repay".to_string()]
+        );
     }
 
     #[test]

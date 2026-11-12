@@ -5,11 +5,14 @@
 //! 1 次粗スクリーニング (Coarse) と 2 次精密決定 (Fine) を連携させる機構を提供する。
 
 use indexmap::IndexMap;
+use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_core::contract::model_spec::MAX_NUM_OPTIONS;
+use sokuto_core::gating::GatingConfig;
 use sokuto_core::math::composite_confidence_iter;
 use sokuto_core::schema::{Answer, AnswerPayload, Question, QuestionType};
 
 use crate::engine::InferenceEngine;
+use crate::engine::gating::apply_gating_to_answer_with_energy;
 use crate::error::{Result, RuntimeError};
 use crate::tokenizer::JevTokenizer;
 
@@ -609,6 +612,42 @@ pub fn reconstruct_choice_answer(answer: &mut Answer, original_keys: &[String]) 
     Ok(())
 }
 
+/// 縮小候補空間で得られた Choice 型 `Answer` を全候補空間 (`original_keys`) へ復元して複合確信度を再計算し、
+/// 自由エネルギー値に基づくゲーティング判定および監査メタデータを適用する統合ヘルパー。
+///
+/// # 引数
+/// - `answer`: 縮小空間での評価結果 (可変参照)。
+/// - `original_keys`: リクエストされた全候補キーの順序付きスライス。
+/// - `energy`: 正規化ヘルムホルツ自由エネルギー値 (任意)。
+/// - `state`: 文脈テキスト (エスカレーションプロンプト構築用、任意)。
+/// - `question_id`: 質問識別子 (エスカレーションプロンプト構築用、任意)。
+/// - `question`: 全候補を含む元の質問定義 (任意)。
+/// - `gating_config`: 明示的なゲーティング設定 (任意)。
+/// - `calib_config`: モデルのキャリブレーション設定。
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_and_gate_answer(
+    answer: &mut Answer,
+    original_keys: &[String],
+    energy: Option<f64>,
+    state: Option<&str>,
+    question_id: Option<&str>,
+    question: Option<&Question>,
+    gating_config: Option<&GatingConfig>,
+    calib_config: &CalibrationConfig,
+) -> Result<()> {
+    reconstruct_choice_answer(answer, original_keys)?;
+    apply_gating_to_answer_with_energy(
+        answer,
+        energy,
+        state,
+        question_id,
+        question,
+        gating_config,
+        calib_config,
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -795,5 +834,51 @@ mod tests {
             (actual_conf - sub_conf).abs() > 1e-3,
             "縮小空間 (M=4) と全候補空間 (K=77) で正規化エントロピーが変わるため確信度も更新されること。"
         );
+    }
+
+    #[test]
+    fn test_reconstruct_and_gate_answer_recomputes_confidence_and_applies_gating() {
+        let original_keys: Vec<String> = (0..10).map(|i| format!("cat_{i}")).collect();
+        let candidates: IndexMap<String, String> = original_keys
+            .iter()
+            .map(|k| (k.clone(), format!("候補 {k}")))
+            .collect();
+        let orig_question = Question::new_choice("分類してください。", candidates);
+
+        let mut sub_probs = IndexMap::new();
+        sub_probs.insert("cat_1".to_string(), 0.90);
+        sub_probs.insert("cat_2".to_string(), 0.10);
+        let sub_conf = sokuto_core::math::composite_confidence_iter(sub_probs.values()).unwrap();
+        let mut answer = Answer::choice("cat_1", sub_probs, sub_conf);
+
+        let gating_cfg = GatingConfig::default();
+        let calib_cfg = CalibrationConfig::default();
+
+        // 既定の OOD エネルギー閾値 (-1.0) を上回る高エネルギー (-0.2) を与えた場合、
+        // 全候補空間への復元＋確信度再計算と同時に OOD 安全弁 Fallback が発動すること
+        reconstruct_and_gate_answer(
+            &mut answer,
+            &original_keys,
+            Some(-0.2),
+            Some("テスト文脈"),
+            Some("q_coarse"),
+            Some(&orig_question),
+            Some(&gating_cfg),
+            &calib_cfg,
+        )
+        .unwrap();
+
+        let full_probs = answer.probabilities().unwrap();
+        assert_eq!(full_probs.len(), 10);
+        let expected_conf =
+            sokuto_core::math::composite_confidence_iter(full_probs.values()).unwrap();
+        assert!((answer.confidence().unwrap() - expected_conf).abs() < 1e-12);
+
+        let gating = answer
+            .gating
+            .as_ref()
+            .expect("gating メタデータが付与されること。");
+        assert!(gating.is_ood);
+        assert_eq!(gating.route, sokuto_core::gating::DecisionRoute::Fallback);
     }
 }

@@ -22,7 +22,7 @@ use ort::value::TensorRef;
 
 use crate::engine::coarse::{
     CoarseScorer, CoarseToFineConfig, LexicalCoarseScorer, filter_top_candidates,
-    reconstruct_choice_answer,
+    reconstruct_and_gate_answer,
 };
 use crate::engine::config::{ExecutionProvider, SessionConfig, auto_intra_threads};
 use crate::engine::gating::{apply_gating_to_answer_with_energy, calculate_choice_energy};
@@ -509,20 +509,18 @@ impl InferenceEngine {
         let mut answer = evaluate_question(&sub_question, &sub_logits, calib_config)
             .map_err(RuntimeError::Core)?;
 
-        // 5. 全候補空間に対する確率マップの再構成および複合確信度の再計算
-        reconstruct_choice_answer(&mut answer, &original_keys)?;
-
-        // 6. ゲーティング判定の適用 (全候補空間基準の確信度と正規化自由エネルギーに基づき監査メタデータを付与)
+        // 5. 全候補空間に対する確率マップの再構成・複合確信度の再計算およびゲーティング判定の適用
         let energy = calculate_choice_energy(&sub_question, &sub_logits, calib_config);
-        apply_gating_to_answer_with_energy(
+        reconstruct_and_gate_answer(
             &mut answer,
+            &original_keys,
             energy,
             Some(state),
             None,
             Some(question),
             gating_config,
             calib_config,
-        );
+        )?;
 
         Ok(answer)
     }

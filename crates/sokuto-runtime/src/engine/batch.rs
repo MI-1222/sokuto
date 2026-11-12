@@ -11,7 +11,7 @@ use sokuto_core::schema::{Answer, Question, QuestionType};
 
 use crate::engine::coarse::{
     CoarseScorer, CoarseToFineConfig, LexicalCoarseScorer, filter_top_candidates,
-    reconstruct_choice_answer,
+    reconstruct_and_gate_answer,
 };
 use crate::engine::gating::{apply_gating_to_answer_with_energy, calculate_choice_energy};
 use crate::engine::session::InferenceEngine;
@@ -486,24 +486,18 @@ impl InferenceEngine {
             self.evaluate_batch_questions(tokenizer, state, &processed_questions, calib_config)?;
 
         // スクリーニングされた質問の確率マップ・複合確信度を全候補空間に復元し、ゲーティングを再適用
-        for (q_key, original_keys) in &original_keys_map {
-            if let Some(answer) = answers.get_mut(q_key)
-                && answer.is_choice()
-            {
-                reconstruct_choice_answer(answer, original_keys)?;
-                let orig_q = questions.get(q_key);
-                let energy = answer.gating.as_ref().and_then(|g| g.energy);
-                apply_gating_to_answer_with_energy(
-                    answer,
-                    energy,
-                    Some(state),
-                    Some(q_key),
-                    orig_q,
-                    None,
-                    calib_config,
-                );
-            }
-        }
+        let ctx = BatchEvalContext {
+            state,
+            calib_config,
+            gating_config: None,
+        };
+        reconstruct_and_gate_batch_answers(
+            &ctx,
+            questions,
+            &original_keys_map,
+            None,
+            &mut answers,
+        )?;
 
         Ok(answers)
     }
@@ -707,24 +701,13 @@ impl InferenceEngine {
         }
 
         // 4. スクリーニングされた質問の確率マップ・複合確信度を全候補空間に復元し、ゲーティングを適用
-        for (q_key, original_keys) in &original_keys_map {
-            if let Some(answer) = answers.get_mut(q_key)
-                && answer.is_choice()
-            {
-                reconstruct_choice_answer(answer, original_keys)?;
-                let orig_q = questions.get(q_key);
-                let energy = coarse_energies.get(q_key).copied().flatten();
-                apply_gating_to_answer_with_energy(
-                    answer,
-                    energy,
-                    Some(state),
-                    Some(q_key),
-                    orig_q,
-                    gating_config,
-                    calib_config,
-                );
-            }
-        }
+        reconstruct_and_gate_batch_answers(
+            &ctx,
+            questions,
+            &original_keys_map,
+            Some(&coarse_energies),
+            &mut answers,
+        )?;
 
         Ok(answers)
     }
@@ -837,6 +820,44 @@ struct BatchEvalContext<'a> {
     state: &'a str,
     calib_config: &'a CalibrationConfig,
     gating_config: Option<&'a GatingConfig>,
+}
+
+/// 粗密探索で縮小推論された各質問の結果を全候補空間へ復元し、複合確信度の再計算とゲーティングを適用する。
+///
+/// # 引数
+/// - `ctx`: 状態テキスト・較正設定・ゲーティング設定を保持する評価コンテキスト。
+/// - `questions`: 元の全候補を含む質問定義マップ。
+/// - `original_keys_map`: 粗密スクリーニング対象となった質問の元候補キー配列マップ。
+/// - `energies`: 事前算出された自由エネルギーマップ (`None` の場合は各 `Answer` 既存の `gating.energy` を引き継ぐ)。
+/// - `answers`: 復元・ゲーティング反映先の回答マップ。
+fn reconstruct_and_gate_batch_answers(
+    ctx: &BatchEvalContext<'_>,
+    questions: &IndexMap<String, Question>,
+    original_keys_map: &IndexMap<String, Vec<String>>,
+    energies: Option<&IndexMap<String, Option<f64>>>,
+    answers: &mut IndexMap<String, Answer>,
+) -> Result<()> {
+    for (q_key, original_keys) in original_keys_map {
+        if let Some(answer) = answers.get_mut(q_key)
+            && answer.is_choice()
+        {
+            let energy = match energies {
+                Some(map) => map.get(q_key).copied().flatten(),
+                None => answer.gating.as_ref().and_then(|g| g.energy),
+            };
+            reconstruct_and_gate_answer(
+                answer,
+                original_keys,
+                energy,
+                Some(ctx.state),
+                Some(q_key),
+                questions.get(q_key),
+                ctx.gating_config,
+                ctx.calib_config,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// 単一質問の有効ロジットから決定プリミティブを解決し、エネルギー算出とゲーティングを適用する。

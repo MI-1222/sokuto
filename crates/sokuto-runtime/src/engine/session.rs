@@ -670,6 +670,9 @@ pub(crate) fn create_session_builder(
     }
 
     if let Some(ref opt_path) = config.optimized_model_path {
+        if let Some(parent) = opt_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         builder = builder
             .with_optimized_model_path(opt_path)
             .map_err(|e| RuntimeError::OrtConfig(e.to_string()))?;

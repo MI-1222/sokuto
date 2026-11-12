@@ -13,6 +13,7 @@ use crate::engine::coarse::{
     CoarseScorer, CoarseToFineConfig, LexicalCoarseScorer, filter_top_candidates,
     reconstruct_and_gate_answer,
 };
+use crate::engine::config::effective_single_model_chunk_size;
 use crate::engine::gating::{
     calculate_choice_energy_with_config, evaluate_and_gate_answer_with_buf,
 };
@@ -263,12 +264,11 @@ impl InferenceEngine {
             gating_config,
         };
 
-        if let Some(effective_chunk_size) = chunk_size
-            .map(|c| c.max(1))
-            .filter(|&c| effective_questions.len() > c)
-        {
-            let state_ids = tokenizer.encode_state(state)?;
-            for sub_questions in iter_map_chunks(effective_questions, effective_chunk_size) {
+        let state_ids = tokenizer.encode_state(state)?;
+        let effective_chunk_size = effective_single_model_chunk_size(chunk_size, state_ids.len());
+
+        if let Some(chunk_limit) = effective_chunk_size.filter(|&c| effective_questions.len() > c) {
+            for sub_questions in iter_map_chunks(effective_questions, chunk_limit) {
                 let batch = tokenizer.encode_batch_with_pretokenized_state(
                     &state_ids,
                     &sub_questions,
@@ -285,7 +285,11 @@ impl InferenceEngine {
                 )?;
             }
         } else {
-            let batch = tokenizer.encode_batch_questions(state, effective_questions)?;
+            let batch = tokenizer.encode_batch_with_pretokenized_state(
+                &state_ids,
+                effective_questions,
+                tokenizer.max_sequence_length(),
+            )?;
             self.execute_batch_chunk(
                 &ctx,
                 &batch,
@@ -473,15 +477,23 @@ impl InferenceEngine {
         questions: &IndexMap<String, Question>,
         chunk_size: usize,
     ) -> Result<IndexMap<String, Vec<f64>>> {
-        let chunk_size = chunk_size.max(1);
-        if questions.len() <= chunk_size {
-            return self.forward_batch_questions(tokenizer, state, questions);
+        let state_ids = tokenizer.encode_state(state)?;
+        let effective_chunk = effective_single_model_chunk_size(Some(chunk_size), state_ids.len())
+            .unwrap_or(chunk_size)
+            .max(1);
+
+        if questions.len() <= effective_chunk {
+            let batch = tokenizer.encode_batch_with_pretokenized_state(
+                &state_ids,
+                questions,
+                tokenizer.max_sequence_length(),
+            )?;
+            return self.forward_batch_tokenized(&batch);
         }
 
-        let state_ids = tokenizer.encode_state(state)?;
         let mut results = IndexMap::with_capacity(questions.len());
 
-        for sub_questions in iter_map_chunks(questions, chunk_size) {
+        for sub_questions in iter_map_chunks(questions, effective_chunk) {
             let batch = tokenizer.encode_batch_with_pretokenized_state(
                 &state_ids,
                 &sub_questions,
@@ -1453,5 +1465,51 @@ mod tests {
         assert_eq!(opts.chunk_size, Some(8));
         assert!(opts.coarse_config.is_some());
         assert!(opts.coarse_scorer.is_some());
+    }
+
+    #[test]
+    fn test_single_model_long_state_chunk_limiting() {
+        use crate::engine::config::{
+            SINGLE_MODEL_LONG_STATE_MAX_CHUNK, SINGLE_MODEL_LONG_STATE_THRESHOLD,
+            effective_single_model_chunk_size,
+        };
+
+        // 短文時 (閾値以下) は要求サイズが維持されること。
+        let short_len = SINGLE_MODEL_LONG_STATE_THRESHOLD;
+        assert_eq!(effective_single_model_chunk_size(None, short_len), None);
+        assert_eq!(
+            effective_single_model_chunk_size(Some(16), short_len),
+            Some(16)
+        );
+
+        // 長文時 (閾値超え) は最大 4 に制限されること。
+        let long_len = SINGLE_MODEL_LONG_STATE_THRESHOLD + 1;
+        assert_eq!(
+            effective_single_model_chunk_size(None, long_len),
+            Some(SINGLE_MODEL_LONG_STATE_MAX_CHUNK)
+        );
+        assert_eq!(
+            effective_single_model_chunk_size(Some(16), long_len),
+            Some(SINGLE_MODEL_LONG_STATE_MAX_CHUNK)
+        );
+        assert_eq!(
+            effective_single_model_chunk_size(Some(2), long_len),
+            Some(2)
+        );
+
+        // 極長文時 (> 1536) は最大 2 に制限されること。
+        let very_long_len = 1600;
+        assert_eq!(
+            effective_single_model_chunk_size(None, very_long_len),
+            Some(2)
+        );
+        assert_eq!(
+            effective_single_model_chunk_size(Some(8), very_long_len),
+            Some(2)
+        );
+        assert_eq!(
+            effective_single_model_chunk_size(Some(1), very_long_len),
+            Some(1)
+        );
     }
 }

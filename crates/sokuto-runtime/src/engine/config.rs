@@ -25,6 +25,34 @@ pub fn auto_intra_threads(pool_size: usize, max_cap: usize) -> usize {
     per_session.clamp(1, max_cap)
 }
 
+/// 単一モデルフォールバック時に長文とみなす State トークン数閾値。
+pub const SINGLE_MODEL_LONG_STATE_THRESHOLD: usize = 512;
+
+/// 単一モデルフォールバック時の長文マイクロバッチ上限チャンクサイズ。
+pub const SINGLE_MODEL_LONG_STATE_MAX_CHUNK: usize = 4;
+
+/// State トークン長に応じて単一モデル推論時の実効チャンクサイズを制限する。
+///
+/// 長文入力時(`state_tokens > SINGLE_MODEL_LONG_STATE_THRESHOLD`)において、
+/// 巨大なパディング行列による L3 キャッシュスラッシングおよびメモリ消費の急増を抑えるため、
+/// マイクロバッチ分割サイズを段階的に引き下げる。
+#[inline]
+pub fn effective_single_model_chunk_size(
+    requested_chunk: Option<usize>,
+    state_tokens: usize,
+) -> Option<usize> {
+    if state_tokens > SINGLE_MODEL_LONG_STATE_THRESHOLD {
+        let cap = if state_tokens > 1536 {
+            2
+        } else {
+            SINGLE_MODEL_LONG_STATE_MAX_CHUNK
+        };
+        Some(requested_chunk.map_or(cap, |c| c.max(1).min(cap)))
+    } else {
+        requested_chunk.map(|c| c.max(1))
+    }
+}
+
 /// 利用可能な Execution Provider (実行バックエンド) の指定。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ExecutionProvider {
@@ -235,6 +263,30 @@ impl SessionConfig {
         self.optimized_model_path = Some(path.into());
         self
     }
+
+    /// 最適化済みモデルグラフのディスクキャッシュを安全に自動設定するビルダーメソッド。
+    ///
+    /// `optimized_model_path` が未指定の場合に、書き込み可能な一時ディレクトリ
+    /// (`std::env::temp_dir()` 配下)にモデル識別ハッシュ付きのファイルパスを自動生成する。
+    /// Docker 等の読み取り専用 (`:ro`) マウント環境でも安全に動作し、ディレクトリ生成に失敗した場合は
+    /// キャッシュを有効化せず安全にスキップする。
+    pub fn with_auto_graph_cache(mut self, model_path: &std::path::Path) -> Self {
+        if self.optimized_model_path.is_some() {
+            return self;
+        }
+
+        let file_stem = model_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("model");
+        let path_hash = xxhash_rust::xxh3::xxh3_64(model_path.to_string_lossy().as_bytes());
+        let cache_dir = std::env::temp_dir().join("sokuto_graph_cache");
+        if std::fs::create_dir_all(&cache_dir).is_ok() {
+            let cache_file = cache_dir.join(format!("{file_stem}_{path_hash:016x}.onnx"));
+            self.optimized_model_path = Some(cache_file);
+        }
+        self
+    }
 }
 
 #[cfg(test)]
@@ -308,5 +360,41 @@ mod tests {
         assert_eq!(format!("{}", ExecutionProvider::CUDA), "CUDA");
         assert_eq!(format!("{}", ExecutionProvider::TensorRT), "TensorRT");
         assert_eq!(format!("{}", ExecutionProvider::CPU), "CPU");
+    }
+
+    #[test]
+    fn test_effective_single_model_chunk_size() {
+        // 短文時 (<= 512 トークン): 指定値がそのまま反映されること。
+        assert_eq!(effective_single_model_chunk_size(None, 100), None);
+        assert_eq!(effective_single_model_chunk_size(Some(8), 512), Some(8));
+        assert_eq!(effective_single_model_chunk_size(Some(0), 200), Some(1));
+
+        // 中長文時 (513..=1536 トークン): 最大 4 に制限されること。
+        assert_eq!(effective_single_model_chunk_size(None, 513), Some(4));
+        assert_eq!(effective_single_model_chunk_size(Some(16), 1000), Some(4));
+        assert_eq!(effective_single_model_chunk_size(Some(2), 1000), Some(2));
+
+        // 超長文時 (> 1536 トークン): 最大 2 に制限されること。
+        assert_eq!(effective_single_model_chunk_size(None, 1537), Some(2));
+        assert_eq!(effective_single_model_chunk_size(Some(8), 2000), Some(2));
+        assert_eq!(effective_single_model_chunk_size(Some(1), 2000), Some(1));
+    }
+
+    #[test]
+    fn test_with_auto_graph_cache() {
+        let model_path = std::path::Path::new("/dummy/model.onnx");
+        let cfg = SessionConfig::default().with_auto_graph_cache(model_path);
+
+        assert!(cfg.optimized_model_path.is_some());
+        let path = cfg.optimized_model_path.unwrap();
+        assert!(path.to_string_lossy().contains("model_"));
+        assert!(path.to_string_lossy().ends_with(".onnx"));
+
+        // 明示的に指定済みの場合は上書きされないこと。
+        let custom_path = std::path::PathBuf::from("/custom/opt.onnx");
+        let cfg2 = SessionConfig::default()
+            .with_optimized_model_path(&custom_path)
+            .with_auto_graph_cache(model_path);
+        assert_eq!(cfg2.optimized_model_path, Some(custom_path));
     }
 }

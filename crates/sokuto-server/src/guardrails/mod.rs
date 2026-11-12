@@ -195,53 +195,108 @@ impl GuardrailPipeline {
         report.estimated_tokens = estimated_tokens;
 
         // 2. State の正規化 (文字列への展開と前処理)
-        // 算術集計サマリーの事前計算 (元の Value から集計)
-        let arithmetic_summary = compute_arithmetic_summary(&req.state, &self.config.arithmetic);
+        let is_state_empty = match &req.state {
+            Value::Null => true,
+            Value::String(s) => s.trim().is_empty(),
+            _ => false,
+        };
 
-        // 構造化 JSON の線形化 (または通常文字列展開)
-        let mut raw_state = linearize_state_value(&req.state, &self.config.linearizer)
-            .unwrap_or_else(|| match &req.state {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            });
+        if is_state_empty {
+            // 空 State の場合は算術集計や基準時刻のメタデータ追記を行わず空文字を維持する。
+            req.state = Value::String(String::new());
+        } else {
+            // 算術集計サマリーの事前計算 (元の Value から集計)
+            let arithmetic_summary =
+                compute_arithmetic_summary(&req.state, &self.config.arithmetic);
 
-        // 境界縮約窓の適用 (長文に対する Early-Exit 窓走査)
-        let window_res = extract_head_tail_window(&raw_state, &self.config.window);
-        if window_res.was_truncated {
-            raw_state = window_res.window_text.into_owned();
-            report.window_truncated = true;
+            // 構造化 JSON の線形化 (または通常文字列展開)
+            let mut raw_state = linearize_state_value(&req.state, &self.config.linearizer)
+                .unwrap_or_else(|| match &req.state {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                });
+
+            // 境界縮約窓の適用 (長文に対する Early-Exit 窓走査)
+            let window_res = extract_head_tail_window(&raw_state, &self.config.window);
+            if window_res.was_truncated {
+                raw_state = window_res.window_text.into_owned();
+                report.window_truncated = true;
+            }
+
+            // State 文字列のサニタイズ、縮約、日時正規化
+            let state_sanitized = sanitize_text(&raw_state, &self.config.sanitizer);
+            let state_compacted = compact_text(&state_sanitized, &self.config.compactor);
+            let state_temporal = normalize_temporal(&state_compacted, now, &self.config.temporal);
+
+            raw_state = state_temporal.into_owned();
+
+            // 算術集計サマリーの付加
+            if let Some(summary) = arithmetic_summary {
+                raw_state.push_str(&summary);
+                report.added_arithmetic_summary = true;
+            }
+
+            // 基準時刻メタデータの付加
+            if self.config.temporal.attach_reference_time {
+                append_reference_time_metadata(
+                    &mut raw_state,
+                    now,
+                    self.config.temporal.timezone_offset_hours,
+                );
+                report.added_reference_time = true;
+            }
+
+            // 正規化後の State を req に再格納
+            req.state = Value::String(raw_state);
         }
-
-        // State 文字列のサニタイズ、縮約、日時正規化
-        let state_sanitized = sanitize_text(&raw_state, &self.config.sanitizer);
-        let state_compacted = compact_text(&state_sanitized, &self.config.compactor);
-        let state_temporal = normalize_temporal(&state_compacted, now, &self.config.temporal);
-
-        raw_state = state_temporal.into_owned();
-
-        // 算術集計サマリーの付加
-        if let Some(summary) = arithmetic_summary {
-            raw_state.push_str(&summary);
-            report.added_arithmetic_summary = true;
-        }
-
-        // 基準時刻メタデータの付加
-        if self.config.temporal.attach_reference_time {
-            append_reference_time_metadata(
-                &mut raw_state,
-                now,
-                self.config.temporal.timezone_offset_hours,
-            );
-            report.added_reference_time = true;
-        }
-
-        // 正規化後の State を req に再格納
-        req.state = Value::String(raw_state);
 
         // 3. 各 Question (Instructions, Criteria) の正規化
-        let mut normalized_questions = IndexMap::with_capacity(req.questions.len());
+        req.questions = self.normalize_questions(&req.questions, now);
 
-        for (q_key, question) in &req.questions {
+        Ok(report)
+    }
+
+    /// 質問側のガードレール (Fast-Fail, リソース制限, サニタイズ) のみを実施し、State へのメタデータ追記をバイパスする。
+    ///
+    /// 空 State オフロードリクエスト (`X-State-Hash` によるキャッシュ照合) 時に使用する。
+    pub fn process_questions_only(
+        &self,
+        req: &mut SystemOneRequest,
+        ref_time: Option<DateTime<Utc>>,
+    ) -> Result<PreprocessReport, ServerError> {
+        if !self.config.enabled {
+            return Ok(PreprocessReport::default());
+        }
+
+        let now = ref_time.unwrap_or_else(Utc::now);
+        let mut report = PreprocessReport::default();
+
+        // 0. 決定論的 Fast-Fail 走査 (質問側のみ)
+        for question in req.questions.values() {
+            if let Err(violation) = self.fast_fail_scanner.scan(&question.instructions) {
+                return Err(ServerError::GuardrailViolation(violation.rule));
+            }
+        }
+
+        // 1. 物理 OOM 防壁 (L1/L2 Fast-Fail)
+        let (_, estimated_tokens) = validate_limits(req, &self.config.limits)?;
+        report.estimated_tokens = estimated_tokens;
+
+        // 2. 各 Question (Instructions, Criteria) の正規化
+        req.questions = self.normalize_questions(&req.questions, now);
+
+        Ok(report)
+    }
+
+    /// 各 Question の Instructions および Criteria に対する正規化処理を実行する。
+    fn normalize_questions(
+        &self,
+        questions: &IndexMap<String, Question>,
+        now: DateTime<Utc>,
+    ) -> IndexMap<String, Question> {
+        let mut normalized_questions = IndexMap::with_capacity(questions.len());
+
+        for (q_key, question) in questions {
             // Instructions の正規化
             let inst_sanitized = sanitize_text(&question.instructions, &self.config.sanitizer);
             let inst_compacted = compact_text(&inst_sanitized, &self.config.compactor);
@@ -299,9 +354,7 @@ impl GuardrailPipeline {
             normalized_questions.insert(q_key.clone(), new_question);
         }
 
-        req.questions = normalized_questions;
-
-        Ok(report)
+        normalized_questions
     }
 
     /// 推論完了後のレスポンス (Answer 群) に対し、後処理ガードレールを適用する。
@@ -578,5 +631,60 @@ mod tests {
         assert!(state_str.contains("- customer.score: 95"));
         assert!(state_str.contains("- customer.tier: VIP"));
         assert!(state_str.contains("- history: [order1, order2]"));
+    }
+
+    #[test]
+    fn test_pipeline_empty_state_bypass() {
+        let pipeline = GuardrailPipeline::default();
+        let ref_time = Utc.with_ymd_and_hms(2026, 9, 22, 10, 0, 0).unwrap();
+
+        let mut questions = IndexMap::new();
+        questions.insert(
+            "q1".to_string(),
+            Question::new_choice(
+                "3日前の状態 [OP]".to_string(),
+                IndexMap::from([("yes".to_string(), "はい".to_string())]),
+            ),
+        );
+
+        // 1. Value::Null の場合
+        let mut req_null = SystemOneRequest::new(Value::Null, questions.clone());
+        let res_null = pipeline.process(&mut req_null, Some(ref_time));
+        assert!(res_null.is_ok());
+        assert_eq!(req_null.state, Value::String(String::new()));
+        let q1_null = req_null.questions.get("q1").unwrap();
+        assert!(q1_null.instructions.contains("3日前 (2026-09-19)"));
+
+        // 2. 空白文字列の場合
+        let mut req_empty_str = SystemOneRequest::new("   ".to_string(), questions);
+        let res_empty_str = pipeline.process(&mut req_empty_str, Some(ref_time));
+        assert!(res_empty_str.is_ok());
+        assert_eq!(req_empty_str.state, Value::String(String::new()));
+    }
+
+    #[test]
+    fn test_pipeline_process_questions_only() {
+        let pipeline = GuardrailPipeline::default();
+        let ref_time = Utc.with_ymd_and_hms(2026, 9, 22, 10, 0, 0).unwrap();
+
+        let mut questions = IndexMap::new();
+        questions.insert(
+            "q_noul".to_string(),
+            Question::new_noul("初期不良か？".to_string()),
+        );
+
+        let mut req = SystemOneRequest::new(Value::Null, questions);
+        let res = pipeline.process_questions_only(&mut req, Some(ref_time));
+        assert!(res.is_ok());
+
+        // State は変更されず Null のままであること
+        assert_eq!(req.state, Value::Null);
+
+        // Question 側は正常に正規化されていること
+        let q_noul = req.questions.get("q_noul").unwrap();
+        assert_eq!(
+            q_noul.instructions,
+            "前提テキストの情報のみに基づいて、言明「初期不良」が真実であるか評価せよ。"
+        );
     }
 }

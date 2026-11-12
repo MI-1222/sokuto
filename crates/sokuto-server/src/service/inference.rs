@@ -86,8 +86,21 @@ impl InferenceService {
     ) -> Result<InferenceOutput, ServerError> {
         let original_questions = req.questions.clone();
 
-        // 1. ガードレール前処理
-        self.state.guardrail_pipeline.process(&mut req, None)?;
+        // 1. ガードレール適用前に空 State オフロード判定を実施
+        let is_raw_state_empty = match &req.state {
+            Value::Null => true,
+            Value::String(s) => s.trim().is_empty(),
+            _ => false,
+        };
+
+        if is_raw_state_empty {
+            // 空 State 時はメタデータ追記をバイパスし、質問側のガードレール検証のみ実行
+            self.state
+                .guardrail_pipeline
+                .process_questions_only(&mut req, None)?;
+        } else {
+            self.state.guardrail_pipeline.process(&mut req, None)?;
+        }
 
         let question_count = req.questions.len();
 

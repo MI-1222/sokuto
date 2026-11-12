@@ -30,6 +30,7 @@ use sokuto_core::contract::model_spec::{
 };
 use sokuto_core::gating::GatingConfig;
 use sokuto_core::schema::{Answer, Question};
+use unicode_normalization::{IsNormalized, UnicodeNormalization, is_nfc_quick};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::engine::config::{ExecutionProvider, SessionConfig};
@@ -750,12 +751,20 @@ impl StateCacheManager {
 
     /// `State` テキストから `xxHash3` (64-bit) ハッシュキーを高速算出する。
     ///
+    /// Unicode NFC 正規化を行い、NFD/NFC 間の正準等価性を保証する。
+    /// 既に NFC 形式である通常の文字列に対してはゼロアロケーションで高速通過する。
     /// `AVX2`、`AVX-512`、`ARM NEON` 命令により、8kトークンのテキストでも1μs未満で完了する。
     ///
     /// # 引数
     /// - `state_text`: `State` 原文テキスト。
     pub fn compute_key(state_text: &str) -> u64 {
-        xxh3_64(state_text.as_bytes())
+        match is_nfc_quick(state_text.chars()) {
+            IsNormalized::Yes => xxh3_64(state_text.as_bytes()),
+            IsNormalized::No | IsNormalized::Maybe => {
+                let normalized: String = state_text.nfc().collect();
+                xxh3_64(normalized.as_bytes())
+            }
+        }
     }
 
     /// 指定されたキーの特徴量を取得する。
@@ -1475,6 +1484,21 @@ mod tests {
         assert_eq!(key1, key2);
         assert_ne!(key1, key3);
         assert_ne!(key1, 0);
+    }
+
+    #[test]
+    fn test_compute_key_unicode_nfc_normalization() {
+        // NFC 形式（結合済み文字）と NFD 形式（基底文字 + 結合用濁点）の等価性検証。
+        let nfc_text = "がっこう";
+        let nfd_text = "か\u{3099}っこう";
+
+        assert_ne!(nfc_text.as_bytes(), nfd_text.as_bytes());
+
+        let key_nfc = StateCacheManager::compute_key(nfc_text);
+        let key_nfd = StateCacheManager::compute_key(nfd_text);
+
+        assert_eq!(key_nfc, key_nfd);
+        assert_ne!(key_nfc, 0);
     }
 
     #[test]

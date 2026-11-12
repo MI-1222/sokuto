@@ -21,6 +21,7 @@ futures-util = { workspace = true }
 moka = { workspace = true }
 xxhash-rust = { workspace = true }
 half = { workspace = true }
+unicode-normalization = "0.1"
 
 [features]
 default = []

@@ -337,3 +337,38 @@ fn test_state_mask_padding_preservation_and_batch_replication() {
         vec![1i64; 2 * seq_len]
     );
 }
+
+#[test]
+fn test_state_cache_manager_nfc_nfd_normalization_cache_hit() {
+    let manager = StateCacheManager::new(1024 * 1024, 60, CacheCompressionMode::None);
+
+    let nfc_text = "がっこう";
+    let nfd_text = "か\u{3099}っこう";
+
+    let key_nfc = StateCacheManager::compute_key(nfc_text);
+    let key_nfd = StateCacheManager::compute_key(nfd_text);
+
+    assert_eq!(key_nfc, key_nfd);
+
+    let shape = vec![1, 4, 16];
+    let raw_data = vec![0.1f32; 4 * 16];
+    let mask = vec![1i64; 4];
+    let features = Arc::new(
+        CachedStateFeatures::new_compressed(
+            key_nfc,
+            shape,
+            &raw_data,
+            CacheCompressionMode::None,
+            mask,
+        )
+        .expect("キャッシュエントリ作成に成功。"),
+    );
+
+    manager.insert(key_nfc, features);
+
+    // NFD テキストから計算したキーでキャッシュヒットすることを検証。
+    assert!(manager.contains_key(key_nfd));
+    let hit = manager.get(key_nfd);
+    assert!(hit.is_some());
+    assert_eq!(hit.unwrap().hash_key, key_nfc);
+}

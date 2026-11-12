@@ -321,6 +321,11 @@ impl AppState {
                     );
                 }
             }
+        } else {
+            tracing::warn!(
+                "デュアルセッションモデル (state_encoder.onnx / query_evaluator.onnx) が '{}' に存在しないため、単一モデルフォールバックモードで起動します（State 中間特徴量キャッシュは無効化されます）。",
+                dir.display()
+            );
         }
 
         self

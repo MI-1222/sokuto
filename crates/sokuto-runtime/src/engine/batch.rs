@@ -223,28 +223,33 @@ impl InferenceEngine {
             coarse_scorer,
         } = options;
 
+        if let Some(coarse_cfg) = coarse_config {
+            coarse_cfg.validate()?;
+        }
+
+        if questions.is_empty() {
+            return Ok(IndexMap::new());
+        }
+
         let mut prepared_coarse = None;
         let mut coarse_state = None;
 
         if let Some(coarse_cfg) = coarse_config {
-            coarse_cfg.validate()?;
-            if !questions.is_empty() {
-                let fallback_scorer;
-                let scorer: &dyn CoarseScorer = match coarse_scorer {
-                    Some(s) => s,
-                    None => {
-                        fallback_scorer = LexicalCoarseScorer::new(tokenizer);
-                        &fallback_scorer
-                    }
-                };
-                let prepared = prepare_coarse_questions(state, questions, coarse_cfg, scorer)?;
-                let energies = IndexMap::with_capacity(prepared.original_keys_map.len());
-                coarse_state = Some(CoarseRuntimeState {
-                    original_keys_map: prepared.original_keys_map,
-                    energies,
-                });
-                prepared_coarse = Some(prepared.processed_questions);
-            }
+            let fallback_scorer;
+            let scorer: &dyn CoarseScorer = match coarse_scorer {
+                Some(s) => s,
+                None => {
+                    fallback_scorer = LexicalCoarseScorer::new(tokenizer);
+                    &fallback_scorer
+                }
+            };
+            let prepared = prepare_coarse_questions(state, questions, coarse_cfg, scorer)?;
+            let energies = IndexMap::with_capacity(prepared.original_keys_map.len());
+            coarse_state = Some(CoarseRuntimeState {
+                original_keys_map: prepared.original_keys_map,
+                energies,
+            });
+            prepared_coarse = Some(prepared.processed_questions);
         }
 
         let effective_questions = prepared_coarse.as_ref().unwrap_or(questions);
@@ -678,11 +683,6 @@ impl InferenceEngine {
         gating_config: Option<&GatingConfig>,
         scorer: &S,
     ) -> Result<IndexMap<String, Answer>> {
-        coarse_config.validate()?;
-        if questions.is_empty() {
-            return Ok(IndexMap::new());
-        }
-
         self.evaluate_batch_questions_with_options(
             tokenizer,
             state,
@@ -746,11 +746,6 @@ impl InferenceEngine {
         chunk_size: usize,
         gating_config: Option<&GatingConfig>,
     ) -> Result<IndexMap<String, Answer>> {
-        coarse_config.validate()?;
-        if questions.is_empty() {
-            return Ok(IndexMap::new());
-        }
-
         self.evaluate_batch_questions_with_options(
             tokenizer,
             state,
@@ -1666,5 +1661,101 @@ mod tests {
         let err_unknown_key = validate_hierarchical_questions(&questions_invalid_key, &mapping)
             .expect_err("オントロジー外のキーは拒否されること。");
         assert!(matches!(err_unknown_key, RuntimeError::InvalidQuestion(_)));
+    }
+
+    #[test]
+    fn test_evaluate_batch_questions_empty_returns_ok() {
+        let engine = InferenceEngine::empty_for_test();
+        let tokenizer = JevTokenizer::empty_for_test();
+        let empty_questions = IndexMap::new();
+        let calib = CalibrationConfig::default();
+        let coarse_cfg = CoarseToFineConfig::default();
+
+        // 1. evaluate_batch_questions
+        let res = engine.evaluate_batch_questions(&tokenizer, "state", &empty_questions, &calib);
+        assert!(res.is_ok());
+        assert!(res.unwrap().is_empty());
+
+        // 2. evaluate_batch_questions_with_options
+        let res_opts = engine.evaluate_batch_questions_with_options(
+            &tokenizer,
+            "state",
+            &empty_questions,
+            &calib,
+            BatchInferenceOptions::default().with_coarse_to_fine(&coarse_cfg),
+        );
+        assert!(res_opts.is_ok());
+        assert!(res_opts.unwrap().is_empty());
+
+        // 3. evaluate_batch_questions_chunked
+        let res_chunked = engine.evaluate_batch_questions_chunked(
+            &tokenizer,
+            "state",
+            &empty_questions,
+            &calib,
+            4,
+        );
+        assert!(res_chunked.is_ok());
+        assert!(res_chunked.unwrap().is_empty());
+
+        // 4. evaluate_batch_questions_coarse_to_fine
+        let res_c2f = engine.evaluate_batch_questions_coarse_to_fine(
+            &tokenizer,
+            "state",
+            &empty_questions,
+            &calib,
+            &coarse_cfg,
+        );
+        assert!(res_c2f.is_ok());
+        assert!(res_c2f.unwrap().is_empty());
+
+        // 5. evaluate_batch_questions_coarse_to_fine_chunked
+        let res_c2f_chunked = engine.evaluate_batch_questions_coarse_to_fine_chunked(
+            &tokenizer,
+            "state",
+            &empty_questions,
+            &calib,
+            &coarse_cfg,
+            4,
+        );
+        assert!(res_c2f_chunked.is_ok());
+        assert!(res_c2f_chunked.unwrap().is_empty());
+
+        // 6. evaluate_batch_questions_hierarchical
+        let mapping = HierarchicalMapping::banking77();
+        let res_hierarchical = engine.evaluate_batch_questions_hierarchical(
+            &tokenizer,
+            "state",
+            &empty_questions,
+            &mapping,
+            &calib,
+            HierarchicalRouterConfig::default(),
+            None,
+        );
+        assert!(res_hierarchical.is_ok());
+        assert!(res_hierarchical.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_evaluate_batch_questions_empty_with_invalid_coarse_config_fails() {
+        let engine = InferenceEngine::empty_for_test();
+        let tokenizer = JevTokenizer::empty_for_test();
+        let empty_questions = IndexMap::new();
+        let calib = CalibrationConfig::default();
+
+        let invalid_coarse_cfg = CoarseToFineConfig {
+            top_m: 0, // 無効設定 (top_m は 1 以上必須)。
+            ..Default::default()
+        };
+
+        let res = engine.evaluate_batch_questions_with_options(
+            &tokenizer,
+            "state",
+            &empty_questions,
+            &calib,
+            BatchInferenceOptions::default().with_coarse_to_fine(&invalid_coarse_cfg),
+        );
+        assert!(res.is_err());
+        assert!(matches!(res.unwrap_err(), RuntimeError::InvalidQuestion(_)));
     }
 }

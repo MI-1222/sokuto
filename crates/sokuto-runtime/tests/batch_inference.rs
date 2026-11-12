@@ -461,3 +461,34 @@ fn test_chunked_batch_inference_parity() {
         assert_eq!(expected_ans, actual_ans);
     }
 }
+
+#[test]
+fn test_batch_questions_empty_consistency() {
+    let model_dir = default_model_dir();
+    let model_path = model_dir.join("model.onnx");
+    let tokenizer_path = model_dir.join("tokenizer.json");
+    if !model_path.exists() || !tokenizer_path.exists() {
+        eprintln!("スキップ: モデルまたはトークナイザーが存在しません。");
+        return;
+    }
+
+    let tokenizer = JevTokenizer::from_file(&tokenizer_path).expect("トークナイザーのロード失敗。");
+    let engine =
+        InferenceEngine::new(&model_path, SessionConfig::cpu_only()).expect("モデルロード失敗。");
+
+    let calib_config = CalibrationConfig::default();
+    let state = "ユーザーからのフィードバック: テスト用共通文脈。";
+    let empty_questions = IndexMap::new();
+
+    // 1. 通常一括バッチ推論で空質問が渡された場合に Ok で空マップが返ること。
+    let full_batch_answers = engine
+        .evaluate_batch_questions(&tokenizer, state, &empty_questions, &calib_config)
+        .expect("空質問の一括推論に成功。");
+    assert!(full_batch_answers.is_empty());
+
+    // 2. チャンク推論で空質問が渡された場合に Ok で空マップが返ること。
+    let chunked_answers = engine
+        .evaluate_batch_questions_chunked(&tokenizer, state, &empty_questions, &calib_config, 2)
+        .expect("空質問のチャンク推論に成功。");
+    assert!(chunked_answers.is_empty());
+}

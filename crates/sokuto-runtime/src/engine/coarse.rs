@@ -325,7 +325,9 @@ impl CoarseScorer for LexicalCoarseScorer<'_> {
             *query_counts.entry(id).or_insert(0usize) += 1;
         }
 
+        let query_len_sq: f32 = query_counts.values().map(|c| (c * c) as f32).sum();
         let mut scores = Vec::with_capacity(count);
+        let mut cand_counts = std::collections::HashMap::with_capacity(query_ids.len());
 
         for (key, desc) in candidates {
             // キー名と説明文を合わせてテキスト化
@@ -342,7 +344,7 @@ impl CoarseScorer for LexicalCoarseScorer<'_> {
                 continue;
             }
 
-            let mut cand_counts = std::collections::HashMap::with_capacity(cand_ids.len());
+            cand_counts.clear();
             for &id in cand_ids {
                 *cand_counts.entry(id).or_insert(0usize) += 1;
             }
@@ -356,7 +358,6 @@ impl CoarseScorer for LexicalCoarseScorer<'_> {
             }
 
             let cand_len_sq: f32 = cand_counts.values().map(|c| (c * c) as f32).sum();
-            let query_len_sq: f32 = query_counts.values().map(|c| (c * c) as f32).sum();
 
             let norm = (cand_len_sq * query_len_sq).sqrt();
             let score = if norm > 1e-12 {

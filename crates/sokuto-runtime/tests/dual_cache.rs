@@ -336,6 +336,16 @@ fn test_state_mask_padding_preservation_and_batch_replication() {
         empty_mask_entry.state_mask_for_batch(2),
         vec![1i64; 2 * seq_len]
     );
+
+    // 長さ不一致マスク指定時はエラーとなることの検証。
+    let mismatched_result = CachedStateFeatures::new_compressed(
+        key,
+        vec![1, seq_len, hidden_size],
+        &data,
+        CacheCompressionMode::None,
+        vec![1i64; seq_len - 1],
+    );
+    assert!(mismatched_result.is_err());
 }
 
 #[test]

@@ -360,6 +360,31 @@ pub struct CachedStateFeatures {
     pub state_text: Option<String>,
 }
 
+/// `State` 有効トークンマスクの長さを検証し、空の場合は全有効 (`1`) で初期化する。
+fn validate_and_normalize_state_mask(
+    shape: &[usize],
+    mut state_mask: Vec<i64>,
+) -> Result<Vec<i64>> {
+    let total_tokens = if shape.len() >= 2 {
+        shape[0] * shape[1]
+    } else {
+        0
+    };
+    if state_mask.is_empty() {
+        if total_tokens > 0 {
+            state_mask.resize(total_tokens, 1i64);
+        }
+        Ok(state_mask)
+    } else if shape.len() < 2 || state_mask.len() != total_tokens {
+        Err(RuntimeError::InvalidTensorData(format!(
+            "state_mask 長さ ({}) が期待値 ({total_tokens}) と一致しません。",
+            state_mask.len()
+        )))
+    } else {
+        Ok(state_mask)
+    }
+}
+
 impl CachedStateFeatures {
     /// 非圧縮の生 `Value` からキャッシュエントリを生成する。
     ///
@@ -369,17 +394,23 @@ impl CachedStateFeatures {
     /// - `ort_value`: ONNX Runtimeの出力 `Value`。
     /// - `byte_size`: 占有バイト数。
     /// - `state_mask`: `State` 有効トークンマスク列。空の場合は全トークン有効 (`1`) として補完される。
+    ///
+    /// # エラー
+    /// - `state_mask` が非空かつ要素数が `shape[0] * shape[1]` と一致しない場合は [`RuntimeError::InvalidTensorData`] を返す。
     pub fn new_raw(
         hash_key: u64,
         shape: Vec<usize>,
         ort_value: Value,
         byte_size: usize,
         state_mask: Vec<i64>,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::new_raw_with_text(hash_key, shape, ort_value, byte_size, state_mask, None)
     }
 
     /// 非圧縮の生 `Value` と State 原文テキストからキャッシュエントリを生成する。
+    ///
+    /// # エラー
+    /// - `state_mask` が非空かつ要素数が `shape[0] * shape[1]` と一致しない場合は [`RuntimeError::InvalidTensorData`] を返す。
     pub fn new_raw_with_text(
         hash_key: u64,
         shape: Vec<usize>,
@@ -387,18 +418,10 @@ impl CachedStateFeatures {
         byte_size: usize,
         state_mask: Vec<i64>,
         state_text: Option<String>,
-    ) -> Self {
-        let total_tokens = if shape.len() >= 2 {
-            shape[0] * shape[1]
-        } else {
-            0
-        };
-        let mut state_mask = state_mask;
-        if state_mask.is_empty() && total_tokens > 0 {
-            state_mask.resize(total_tokens, 1i64);
-        }
+    ) -> Result<Self> {
+        let state_mask = validate_and_normalize_state_mask(&shape, state_mask)?;
 
-        Self {
+        Ok(Self {
             hash_key,
             shape,
             payload: CachedTensorPayload::Raw(Arc::new(ort_value)),
@@ -406,7 +429,7 @@ impl CachedStateFeatures {
             compression_mode: CacheCompressionMode::None,
             state_mask,
             state_text,
-        }
+        })
     }
 
     /// 明示指定された文脈テキストとキャッシュ保持テキストから、ゲーティング用の有効文脈を解決する。
@@ -425,6 +448,10 @@ impl CachedStateFeatures {
     /// - `raw_slice`: 展開済み `f32` スライス。
     /// - `mode`: 圧縮モード。
     /// - `state_mask`: `State` 有効トークンマスク列。空の場合は全トークン有効 (`1`) として補完される。
+    ///
+    /// # エラー
+    /// - `shape` が 3 次元未満の場合は [`RuntimeError::ModelContractViolation`] を返す。
+    /// - `state_mask` が非空かつ要素数が `shape[0] * shape[1]` と一致しない場合は [`RuntimeError::InvalidTensorData`] を返す。
     pub fn new_compressed(
         hash_key: u64,
         shape: Vec<usize>,
@@ -436,6 +463,10 @@ impl CachedStateFeatures {
     }
 
     /// `f32` スライスと State 原文テキストを指定された圧縮モードで変換してキャッシュエントリを生成する。
+    ///
+    /// # エラー
+    /// - `shape` が 3 次元未満の場合は [`RuntimeError::ModelContractViolation`] を返す。
+    /// - `state_mask` が非空かつ要素数が `shape[0] * shape[1]` と一致しない場合は [`RuntimeError::InvalidTensorData`] を返す。
     pub fn new_compressed_with_text(
         hash_key: u64,
         shape: Vec<usize>,
@@ -452,15 +483,7 @@ impl CachedStateFeatures {
             )));
         };
 
-        let total_tokens = if shape.len() >= 2 {
-            shape[0] * shape[1]
-        } else {
-            0
-        };
-        let mut state_mask = state_mask;
-        if state_mask.is_empty() && total_tokens > 0 {
-            state_mask.resize(total_tokens, 1i64);
-        }
+        let state_mask = validate_and_normalize_state_mask(&shape, state_mask)?;
 
         match mode {
             CacheCompressionMode::None => {
@@ -1041,7 +1064,7 @@ impl DualSessionEngine {
                 byte_size,
                 attention_mask.to_vec(),
                 state_text_owned,
-            ))
+            )?)
         } else {
             Arc::new(CachedStateFeatures::new_compressed_with_text(
                 key,
@@ -1748,7 +1771,8 @@ mod tests {
             raw_val.into(),
             raw_data.len() * std::mem::size_of::<f32>(),
             custom_state_mask,
-        );
+        )
+        .expect("Raw キャッシュエントリの作成に成功すること。");
 
         let raw_b2 = raw_features
             .as_ort_value_for_batch(2)
@@ -1812,7 +1836,8 @@ mod tests {
             zero_batch_val.into(),
             0,
             vec![],
-        );
+        )
+        .expect("空バッチキャッシュエントリの作成に成功すること。");
         assert!(matches!(
             zero_batch_features.as_ort_value_for_batch(2),
             Err(RuntimeError::ModelContractViolation(_))
@@ -1825,7 +1850,8 @@ mod tests {
         ))
         .expect("Value の作成に成功すること。");
         let empty_shape_features =
-            CachedStateFeatures::new_raw(key, vec![], empty_shape_val.into(), 0, vec![]);
+            CachedStateFeatures::new_raw(key, vec![], empty_shape_val.into(), 0, vec![])
+                .expect("空形状キャッシュエントリの作成に成功すること。");
         assert!(matches!(
             empty_shape_features.as_ort_value_for_batch(1),
             Err(RuntimeError::ModelContractViolation(_))
@@ -1840,7 +1866,8 @@ mod tests {
             zero_seq_val.into(),
             0,
             vec![],
-        );
+        )
+        .expect("ゼロ系列長キャッシュエントリの作成に成功すること。");
         assert!(matches!(
             zero_seq_features.as_ort_value_for_batch(2),
             Err(RuntimeError::InvalidTensorData(_))
@@ -1856,10 +1883,117 @@ mod tests {
             mismatched_val.into(),
             2 * hidden_size * std::mem::size_of::<f32>(),
             vec![1; seq_len],
-        );
+        )
+        .expect("データ長不一致キャッシュエントリの作成に成功すること。");
         assert!(matches!(
             mismatched_features.as_ort_value_for_batch(2),
             Err(RuntimeError::InvalidTensorData(_))
         ));
+    }
+
+    #[test]
+    fn test_cached_state_features_validates_state_mask_length() {
+        let key = StateCacheManager::compute_key("state-mask-len-validation-test");
+        let seq_len = 4;
+        let hidden_size = 8;
+        let shape = vec![1, seq_len, hidden_size];
+        let raw_data: Vec<f32> = vec![0.5f32; seq_len * hidden_size];
+
+        // 1. 要素数不足の state_mask 指定時に InvalidTensorData が返ること。
+        let short_mask = vec![1i64; seq_len - 1];
+        let val1 = Value::from_array((shape.clone(), raw_data.clone()))
+            .expect("Value の作成に成功すること。");
+        let raw_short_err = CachedStateFeatures::new_raw(
+            key,
+            shape.clone(),
+            val1.into(),
+            raw_data.len() * std::mem::size_of::<f32>(),
+            short_mask.clone(),
+        );
+        assert!(matches!(
+            raw_short_err,
+            Err(RuntimeError::InvalidTensorData(_))
+        ));
+
+        let comp_short_err = CachedStateFeatures::new_compressed(
+            key,
+            shape.clone(),
+            &raw_data,
+            CacheCompressionMode::Fp16,
+            short_mask,
+        );
+        assert!(matches!(
+            comp_short_err,
+            Err(RuntimeError::InvalidTensorData(_))
+        ));
+
+        // 2. 要素数超過の state_mask 指定時に InvalidTensorData が返ること。
+        let long_mask = vec![1i64; seq_len + 1];
+        let val2 = Value::from_array((shape.clone(), raw_data.clone()))
+            .expect("Value の作成に成功すること。");
+        let raw_long_err = CachedStateFeatures::new_raw(
+            key,
+            shape.clone(),
+            val2.into(),
+            raw_data.len() * std::mem::size_of::<f32>(),
+            long_mask.clone(),
+        );
+        assert!(matches!(
+            raw_long_err,
+            Err(RuntimeError::InvalidTensorData(_))
+        ));
+
+        let comp_long_err = CachedStateFeatures::new_compressed(
+            key,
+            shape.clone(),
+            &raw_data,
+            CacheCompressionMode::Int8Symmetric,
+            long_mask,
+        );
+        assert!(matches!(
+            comp_long_err,
+            Err(RuntimeError::InvalidTensorData(_))
+        ));
+
+        // 3. 空の state_mask 指定時は全トークン有効 (1i64) で自動補完されること。
+        let val3 = Value::from_array((shape.clone(), raw_data.clone()))
+            .expect("Value の作成に成功すること。");
+        let raw_empty_mask = CachedStateFeatures::new_raw(
+            key,
+            shape.clone(),
+            val3.into(),
+            raw_data.len() * std::mem::size_of::<f32>(),
+            vec![],
+        )
+        .expect("空マスク時は自動補完されて成功すること。");
+        assert_eq!(raw_empty_mask.state_mask, vec![1i64; seq_len]);
+
+        let comp_empty_mask = CachedStateFeatures::new_compressed(
+            key,
+            shape.clone(),
+            &raw_data,
+            CacheCompressionMode::None,
+            vec![],
+        )
+        .expect("空マスク時は自動補完されて成功すること。");
+        assert_eq!(comp_empty_mask.state_mask, vec![1i64; seq_len]);
+
+        // 4. 正しい要素数のマスク(パディング 0 含む)がそのまま保持されること。
+        let valid_mask = vec![1i64, 1, 0, 0];
+        let val4 = Value::from_array((shape.clone(), raw_data.clone()))
+            .expect("Value の作成に成功すること。");
+        let raw_valid = CachedStateFeatures::new_raw(
+            key,
+            shape.clone(),
+            val4.into(),
+            raw_data.len() * std::mem::size_of::<f32>(),
+            valid_mask.clone(),
+        )
+        .expect("正常マスク時は成功すること。");
+        assert_eq!(raw_valid.state_mask, valid_mask);
+        assert_eq!(
+            raw_valid.state_mask_for_batch(2),
+            vec![1, 1, 0, 0, 1, 1, 0, 0]
+        );
     }
 }

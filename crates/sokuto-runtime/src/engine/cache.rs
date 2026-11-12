@@ -105,13 +105,8 @@ impl<T: Copy> AlignedBuffer64<T> {
     /// # 引数
     /// - `slice`: 複製元スライス。
     pub fn from_slice(slice: &[T]) -> Self {
-        let buf = Self::with_capacity_zeroed(slice.len());
-        if !slice.is_empty() {
-            // SAFETY: `buf` の長さは `slice.len()` と完全に一致しており、重なり合わない有効なポインタである。
-            unsafe {
-                std::ptr::copy_nonoverlapping(slice.as_ptr(), buf.ptr.as_ptr(), slice.len());
-            }
-        }
+        let mut buf = Self::with_capacity_zeroed(slice.len());
+        buf.copy_from_slice(slice);
         buf
     }
 

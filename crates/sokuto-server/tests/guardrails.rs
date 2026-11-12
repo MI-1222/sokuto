@@ -570,3 +570,37 @@ async fn test_guardrail_state_batch_sanitization_and_cache_hash() {
     );
     assert!(resp.answers.contains_key("intent"));
 }
+
+/// 構造化 JSON State の階層パス線形化(- customer.tier: VIP 等)の独立回帰テスト。
+#[test]
+fn test_guardrail_structured_json_state_linearization() {
+    use sokuto_server::guardrails::GuardrailPipeline;
+
+    let pipeline = GuardrailPipeline::default();
+
+    let mut questions = IndexMap::new();
+    questions.insert(
+        "q1".to_string(),
+        Question::new_choice(
+            "顧客ステータス判定".to_string(),
+            IndexMap::from([("vip".to_string(), "VIP".to_string())]),
+        ),
+    );
+
+    let state_json = json!({
+        "customer": {
+            "tier": "VIP",
+            "active": true
+        },
+        "tags": ["premium", "jp"]
+    });
+
+    let mut req = SystemOneRequest::new(state_json, questions);
+    let res = pipeline.process(&mut req, None);
+    assert!(res.is_ok());
+
+    let state_str = req.state.as_str().unwrap();
+    assert!(state_str.contains("- customer.active: true"));
+    assert!(state_str.contains("- customer.tier: VIP"));
+    assert!(state_str.contains("- tags: [premium, jp]"));
+}

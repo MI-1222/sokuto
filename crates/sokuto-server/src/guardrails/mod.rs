@@ -14,6 +14,7 @@ pub mod bimodal;
 pub mod compactor;
 pub mod fast_fail;
 pub mod limits;
+pub mod linearizer;
 pub mod multitask;
 pub mod nli;
 pub mod proxy;
@@ -41,6 +42,7 @@ pub use crate::guardrails::fast_fail::{
     FastFailConfig, FastFailScanner, GuardrailAction, GuardrailViolation,
 };
 use crate::guardrails::limits::{LimitsConfig, validate_limits};
+pub use crate::guardrails::linearizer::{LinearizerConfig, linearize_state_value};
 pub use crate::guardrails::multitask::{
     MARKER_INJECTION, MARKER_PII, MARKER_TOXICITY, MultiTaskScanResult, MultiTaskScannerConfig,
     build_multitask_prompt, compute_free_energy, evaluate_multitask_logits, sigmoid,
@@ -93,6 +95,8 @@ pub struct GuardrailConfig {
     pub arithmetic: ArithmeticConfig,
     /// 二峰性 (バイモーダル) 分布検出設定。
     pub bimodal: BimodalConfig,
+    /// 構造化 JSON State 線形化設定。
+    pub linearizer: LinearizerConfig,
 }
 
 impl Default for GuardrailConfig {
@@ -111,6 +115,7 @@ impl Default for GuardrailConfig {
             temporal: TemporalConfig::default(),
             arithmetic: ArithmeticConfig::default(),
             bimodal: BimodalConfig::default(),
+            linearizer: LinearizerConfig::default(),
         }
     }
 }
@@ -190,10 +195,15 @@ impl GuardrailPipeline {
         report.estimated_tokens = estimated_tokens;
 
         // 2. State の正規化 (文字列への展開と前処理)
-        let mut raw_state = match &req.state {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        };
+        // 算術集計サマリーの事前計算 (元の Value から集計)
+        let arithmetic_summary = compute_arithmetic_summary(&req.state, &self.config.arithmetic);
+
+        // 構造化 JSON の線形化 (または通常文字列展開)
+        let mut raw_state = linearize_state_value(&req.state, &self.config.linearizer)
+            .unwrap_or_else(|| match &req.state {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            });
 
         // 境界縮約窓の適用 (長文に対する Early-Exit 窓走査)
         let window_res = extract_head_tail_window(&raw_state, &self.config.window);
@@ -201,9 +211,6 @@ impl GuardrailPipeline {
             raw_state = window_res.window_text.into_owned();
             report.window_truncated = true;
         }
-
-        // 算術集計サマリーの事前計算 (元の Value から集計)
-        let arithmetic_summary = compute_arithmetic_summary(&req.state, &self.config.arithmetic);
 
         // State 文字列のサニタイズ、縮約、日時正規化
         let state_sanitized = sanitize_text(&raw_state, &self.config.sanitizer);
@@ -537,5 +544,39 @@ mod tests {
         assert_eq!(q1.instructions, "がっこうの判定");
         let criteria_map = q1.criteria.as_ref().unwrap().as_map().unwrap();
         assert_eq!(criteria_map.get("げんい").unwrap(), "べんこう");
+    }
+
+    #[test]
+    fn test_pipeline_state_linearization() {
+        let pipeline = GuardrailPipeline::default();
+
+        let mut questions = IndexMap::new();
+        questions.insert(
+            "q1".to_string(),
+            Question::new_choice(
+                "顧客ランクを判定せよ。".to_string(),
+                IndexMap::from([
+                    ("vip".to_string(), "VIP顧客".to_string()),
+                    ("normal".to_string(), "一般顧客".to_string()),
+                ]),
+            ),
+        );
+
+        let json_state = json!({
+            "customer": {
+                "tier": "VIP",
+                "score": 95
+            },
+            "history": ["order1", "order2"]
+        });
+        let mut req = SystemOneRequest::new(json_state, questions);
+
+        let res = pipeline.process(&mut req, None);
+        assert!(res.is_ok());
+
+        let state_str = req.state.as_str().unwrap();
+        assert!(state_str.contains("- customer.score: 95"));
+        assert!(state_str.contains("- customer.tier: VIP"));
+        assert!(state_str.contains("- history: [order1, order2]"));
     }
 }

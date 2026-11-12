@@ -15,7 +15,6 @@ use sokuto_core::schema::{Answer, Criteria, Question, QuestionType};
 
 use crate::engine::InferenceEngine;
 use crate::engine::cache::{CachedStateFeatures, DualSessionEngine};
-use crate::engine::coarse::{HierarchicalCoarseScorer, ModelDrivenCoarseScorer};
 use crate::engine::escalation::build_rich_escalation_prompt;
 use crate::engine::gating::{calculate_choice_energy_with_config, resolve_gating_config};
 use crate::error::{Result, RuntimeError};
@@ -172,7 +171,7 @@ impl HierarchicalResult {
     }
 }
 
-/// 粗密階層ルーティングで使用する推論エンジンバックエンド。
+/// 粗密階層ルーティングで使用する推論エンジンバックエンド (後方互換用列挙型)。
 pub enum HierarchicalEngine<'a> {
     /// 単一 ONNX モデルによる通常推論エンジン。
     Single(&'a InferenceEngine),
@@ -185,16 +184,119 @@ pub enum HierarchicalEngine<'a> {
     },
 }
 
+/// 粗密階層ルーティングにおける二段階推論バックエンドの抽象化トレイト。
+///
+/// [`CoarseToFineRouter`] へ静的ディスパッチ (ゼロコスト抽象化) により推論能力を供給する。
+/// 第 1 パス (大分類確率推論) および第 2 パス (細分類生ロジット推論) を提供し、
+/// 単一セッション・デュアルセッション・テスト用モック等を統一的に差し替え可能にする。
+pub trait HierarchicalPredictor {
+    /// 第 1 パス (大分類) の各カテゴリの確率分布を推論する。
+    ///
+    /// デフォルト実装では大分類用の `Choice` 質問を構築し、[`Self::forward_fine_raw`] で取得した
+    /// 未正規化生ロジットに対して `calib` の温度スケーリング付き Softmax を適用して確率マップを生成する。
+    ///
+    /// # 引数
+    /// - `state`: 推論対象のコンテキストテキスト。
+    /// - `instructions`: 質問の判定指示文。
+    /// - `categories`: 大分類の識別子と説明文の順序付きマップ。
+    /// - `calib`: モデルの較正温度設定。
+    ///
+    /// # 戻り値
+    /// 各大分類キーに対応する較正済み確率マップ。
+    fn predict_coarse_probabilities(
+        &self,
+        state: &str,
+        instructions: &str,
+        categories: &IndexMap<String, String>,
+        calib: &CalibrationConfig,
+    ) -> Result<IndexMap<String, f64>> {
+        let coarse_question = Question {
+            question_type: QuestionType::Choice,
+            instructions: instructions.to_string(),
+            criteria: Some(Criteria::Map(categories.clone())),
+        };
+        let raw_logits = self.forward_fine_raw(state, &coarse_question)?;
+        let base_temp = calib.get_temperature(QuestionType::Choice, categories.len());
+        let probs = temperature_scaled_softmax(&raw_logits, base_temp)?;
+        if probs.len() != categories.len() {
+            return Err(RuntimeError::InvalidQuestion(format!(
+                "第 1 パスの出力ロジット数 ({}) が大分類数 ({}) と一致しません。",
+                probs.len(),
+                categories.len()
+            )));
+        }
+        let mut map = IndexMap::with_capacity(categories.len());
+        for (i, key) in categories.keys().enumerate() {
+            map.insert(key.clone(), probs[i]);
+        }
+        Ok(map)
+    }
+
+    /// 質問定義に対する未正規化生ロジット列 (`Vec<f64>`) を推論する。
+    ///
+    /// # 引数
+    /// - `state`: 推論対象のコンテキストテキスト。
+    /// - `question`: 評価対象の質問仕様。
+    ///
+    /// # 戻り値
+    /// 各選択肢に対応する未正規化生ロジット配列。
+    fn forward_fine_raw(&self, state: &str, question: &Question) -> Result<Vec<f64>>;
+}
+
+impl<P: HierarchicalPredictor + ?Sized> HierarchicalPredictor for &P {
+    fn predict_coarse_probabilities(
+        &self,
+        state: &str,
+        instructions: &str,
+        categories: &IndexMap<String, String>,
+        calib: &CalibrationConfig,
+    ) -> Result<IndexMap<String, f64>> {
+        (**self).predict_coarse_probabilities(state, instructions, categories, calib)
+    }
+
+    fn forward_fine_raw(&self, state: &str, question: &Question) -> Result<Vec<f64>> {
+        (**self).forward_fine_raw(state, question)
+    }
+}
+
+impl HierarchicalPredictor for (&InferenceEngine, &JevTokenizer) {
+    fn forward_fine_raw(&self, state: &str, question: &Question) -> Result<Vec<f64>> {
+        self.0.forward_question_raw(self.1, state, question)
+    }
+}
+
+impl HierarchicalPredictor for (&DualSessionEngine, &CachedStateFeatures, &JevTokenizer) {
+    fn forward_fine_raw(&self, _state: &str, question: &Question) -> Result<Vec<f64>> {
+        self.0.forward_question_raw(self.2, self.1, question)
+    }
+}
+
+impl HierarchicalPredictor for (HierarchicalEngine<'_>, &JevTokenizer) {
+    fn forward_fine_raw(&self, state: &str, question: &Question) -> Result<Vec<f64>> {
+        match &self.0 {
+            HierarchicalEngine::Single(engine) => {
+                engine.forward_question_raw(self.1, state, question)
+            }
+            HierarchicalEngine::Dual {
+                engine,
+                cached_state,
+            } => engine.forward_question_raw(self.1, cached_state, question),
+        }
+    }
+}
+
 /// 粗密二段階階層ルーティングを実行するオーケストレータ。
-pub struct CoarseToFineRouter<'a> {
-    backend: HierarchicalEngine<'a>,
-    tokenizer: &'a JevTokenizer,
+pub struct CoarseToFineRouter<'a, P = (&'a InferenceEngine, &'a JevTokenizer)>
+where
+    P: HierarchicalPredictor,
+{
+    predictor: P,
     mapping: &'a HierarchicalMapping,
     calib_config: &'a CalibrationConfig,
     config: HierarchicalRouterConfig,
 }
 
-impl<'a> CoarseToFineRouter<'a> {
+impl<'a> CoarseToFineRouter<'a, (&'a InferenceEngine, &'a JevTokenizer)> {
     /// 新しいルーターインスタンスを単一推論エンジンから生成する。
     pub fn new(
         engine: &'a InferenceEngine,
@@ -203,15 +305,20 @@ impl<'a> CoarseToFineRouter<'a> {
         calib_config: &'a CalibrationConfig,
         config: HierarchicalRouterConfig,
     ) -> Result<Self> {
-        Self::with_backend(
-            HierarchicalEngine::Single(engine),
-            tokenizer,
-            mapping,
-            calib_config,
-            config,
-        )
+        Self::with_predictor((engine, tokenizer), mapping, calib_config, config)
     }
+}
 
+impl<'a>
+    CoarseToFineRouter<
+        'a,
+        (
+            &'a DualSessionEngine,
+            &'a CachedStateFeatures,
+            &'a JevTokenizer,
+        ),
+    >
+{
     /// キャッシュ済み中間特徴量を保持するデュアルセッションエンジンから新しいルーターインスタンスを生成する。
     pub fn new_dual(
         engine: &'a DualSessionEngine,
@@ -221,22 +328,32 @@ impl<'a> CoarseToFineRouter<'a> {
         calib_config: &'a CalibrationConfig,
         config: HierarchicalRouterConfig,
     ) -> Result<Self> {
-        Self::with_backend(
-            HierarchicalEngine::Dual {
-                engine,
-                cached_state,
-            },
-            tokenizer,
+        Self::with_predictor(
+            (engine, cached_state, tokenizer),
             mapping,
             calib_config,
             config,
         )
     }
+}
 
-    /// 任意の推論バックエンドからルーターインスタンスを生成する。
+impl<'a> CoarseToFineRouter<'a, (HierarchicalEngine<'a>, &'a JevTokenizer)> {
+    /// 任意の推論バックエンド (`HierarchicalEngine`) からルーターインスタンスを生成する。
     pub fn with_backend(
         backend: HierarchicalEngine<'a>,
         tokenizer: &'a JevTokenizer,
+        mapping: &'a HierarchicalMapping,
+        calib_config: &'a CalibrationConfig,
+        config: HierarchicalRouterConfig,
+    ) -> Result<Self> {
+        Self::with_predictor((backend, tokenizer), mapping, calib_config, config)
+    }
+}
+
+impl<'a, P: HierarchicalPredictor> CoarseToFineRouter<'a, P> {
+    /// 任意の [`HierarchicalPredictor`] 実装から新しいルーターインスタンスを生成する。
+    pub fn with_predictor(
+        predictor: P,
         mapping: &'a HierarchicalMapping,
         calib_config: &'a CalibrationConfig,
         config: HierarchicalRouterConfig,
@@ -255,8 +372,7 @@ impl<'a> CoarseToFineRouter<'a> {
         }
 
         Ok(Self {
-            backend,
-            tokenizer,
+            predictor,
             mapping,
             calib_config,
             config,
@@ -266,10 +382,10 @@ impl<'a> CoarseToFineRouter<'a> {
     /// 階層ルーティング推論を実行する。
     ///
     /// # パイプライン
-    /// 1. **第 1 パス (大分類推論 & Dirichlet 較正)**: `ModelDrivenCoarseScorer` で大分類確率を算出し、設定に応じて ODIR Dirichlet 較正を適用。
+    /// 1. **第 1 パス (大分類推論 & Dirichlet 較正)**: [`HierarchicalPredictor::predict_coarse_probabilities`] で大分類確率を算出し、設定に応じて ODIR Dirichlet 較正を適用。
     /// 2. **Early-Exit 判定**: 複合確信度 $S_{\text{coarse}} < \tau_{\text{escalate}}$ の場合、即時脱出。
     /// 3. **Soft-Beam 判定**: Top-Margin $M_{\text{coarse}} < \tau_{\text{beam}}$ の場合、Top-1 と Top-2 配下の候補をマージ。
-    /// 4. **第 2 パス (細分類推論 & 生ロジット取得)**: マージされた候補群に対して生ロジットを直接抽出。
+    /// 4. **第 2 パス (細分類推論 & 生ロジット取得)**: [`HierarchicalPredictor::forward_fine_raw`] でマージされた候補群に対して生ロジットを直接抽出。
     /// 5. **温度調整 & 確率結合**: エントロピー連動温度・ベース温度を生ロジットへ直接適用 (1 回の Softmax) し、大分類確率と減衰周辺化結合。
     /// 6. **受け皿候補バイアス**: $P(\text{その他}) \ge \tau_{\text{catchall}}$ 判定。
     /// 7. **全候補空間 Gating 再計算**: 全細分類候補空間基準で Gating メタデータを正規化。
@@ -280,36 +396,12 @@ impl<'a> CoarseToFineRouter<'a> {
         gating_config: Option<&GatingConfig>,
     ) -> Result<HierarchicalResult> {
         // --- Step 1: 第 1 パス (大分類推論 & Dirichlet 較正) ---
-        let coarse_probabilities = match self.backend {
-            HierarchicalEngine::Single(single_engine) => {
-                let coarse_scorer = ModelDrivenCoarseScorer::new(single_engine, self.tokenizer)
-                    .with_calibration(self.calib_config);
-                coarse_scorer.score_coarse(state, instructions, &self.mapping.coarse_categories)?
-            }
-            HierarchicalEngine::Dual {
-                engine,
-                cached_state,
-            } => {
-                let coarse_question = Question {
-                    question_type: QuestionType::Choice,
-                    instructions: instructions.to_string(),
-                    criteria: Some(sokuto_core::schema::Criteria::Map(
-                        self.mapping.coarse_categories.clone(),
-                    )),
-                };
-                let raw_logits =
-                    engine.forward_question_raw(self.tokenizer, cached_state, &coarse_question)?;
-                let base_temp = self
-                    .calib_config
-                    .get_temperature(QuestionType::Choice, self.mapping.coarse_categories.len());
-                let probs = temperature_scaled_softmax(&raw_logits, base_temp)?;
-                let mut map = IndexMap::with_capacity(self.mapping.coarse_categories.len());
-                for (i, key) in self.mapping.coarse_categories.keys().enumerate() {
-                    map.insert(key.clone(), probs[i]);
-                }
-                map
-            }
-        };
+        let coarse_probabilities = self.predictor.predict_coarse_probabilities(
+            state,
+            instructions,
+            &self.mapping.coarse_categories,
+            self.calib_config,
+        )?;
 
         // ODIR 正則化 Dirichlet 較正の適用 (設定されている場合)
         let coarse_probabilities = if let Some(ref calibrator) = self.config.coarse_calibrator {
@@ -414,15 +506,14 @@ impl<'a> CoarseToFineRouter<'a> {
         };
 
         // Softmax 前の生ロジットを直接抽出 (二重 Softmax & 疑似ロジット対数逆算の歪みを根絶)
-        let raw_logits = match self.backend {
-            HierarchicalEngine::Single(single_engine) => {
-                single_engine.forward_question_raw(self.tokenizer, state, &fine_question)?
-            }
-            HierarchicalEngine::Dual {
-                engine,
-                cached_state,
-            } => engine.forward_question_raw(self.tokenizer, cached_state, &fine_question)?,
-        };
+        let raw_logits = self.predictor.forward_fine_raw(state, &fine_question)?;
+        if raw_logits.len() != fine_candidates.len() {
+            return Err(RuntimeError::InvalidQuestion(format!(
+                "第 2 パスの出力ロジット数 ({}) が細分類候補数 ({}) と一致しません。",
+                raw_logits.len(),
+                fine_candidates.len()
+            )));
+        }
 
         // --- Step 5: 温度調整 & 確率結合 ---
         let fine_temperature =
@@ -1351,5 +1442,192 @@ mod tests {
         let override_conf = compute_final_answer_confidence(&override_probs, true, 0.0)
             .expect("昇格時確信度の算出に成功すること。");
         assert!((override_conf - 0.0).abs() < 1e-12);
+    }
+
+    /// `forward_fine_raw` のみを実装し、第 1 パスのデフォルト実装も検証するモック。
+    struct MockRawPredictor {
+        coarse_logits: Vec<f64>,
+        fine_logits: Vec<f64>,
+        coarse_called: std::cell::Cell<bool>,
+        fine_call_count: std::cell::Cell<usize>,
+    }
+
+    impl HierarchicalPredictor for MockRawPredictor {
+        fn forward_fine_raw(&self, _state: &str, _question: &Question) -> Result<Vec<f64>> {
+            if !self.coarse_called.get() {
+                self.coarse_called.set(true);
+                Ok(self.coarse_logits.clone())
+            } else {
+                self.fine_call_count.set(self.fine_call_count.get() + 1);
+                Ok(self.fine_logits.clone())
+            }
+        }
+    }
+
+    /// 第 1 パス確率を直接返すモック。
+    struct MockDirectCoarsePredictor {
+        coarse_probs: IndexMap<String, f64>,
+        fine_logits: Vec<f64>,
+        fine_call_count: std::cell::Cell<usize>,
+    }
+
+    impl HierarchicalPredictor for MockDirectCoarsePredictor {
+        fn predict_coarse_probabilities(
+            &self,
+            _state: &str,
+            _instructions: &str,
+            _categories: &IndexMap<String, String>,
+            _calib: &CalibrationConfig,
+        ) -> Result<IndexMap<String, f64>> {
+            Ok(self.coarse_probs.clone())
+        }
+
+        fn forward_fine_raw(&self, _state: &str, _question: &Question) -> Result<Vec<f64>> {
+            self.fine_call_count.set(self.fine_call_count.get() + 1);
+            Ok(self.fine_logits.clone())
+        }
+    }
+
+    fn build_test_mapping() -> HierarchicalMapping {
+        let mut builder = HierarchicalMapping::builder("MockDomain");
+        builder.add_category(
+            "c1",
+            "クラスタ1",
+            vec![("c1_f1", "細分類1-1"), ("c1_f2", "細分類1-2")],
+        );
+        builder.add_category(
+            "c2",
+            "クラスタ2",
+            vec![("c2_f1", "細分類2-1"), ("c2_f2", "細分類2-2")],
+        );
+        builder.add_category(
+            "c3",
+            "クラスタ3",
+            vec![("c3_f1", "細分類3-1"), ("c3_f2", "細分類3-2")],
+        );
+        builder.add_category(
+            "c4",
+            "クラスタ4",
+            vec![("c4_f1", "細分類4-1"), ("c4_f2", "細分類4-2")],
+        );
+        builder
+            .build()
+            .expect("テスト用マッピング構築に成功すること。")
+    }
+
+    #[test]
+    fn test_route_with_mock_predictor_normal_and_soft_beam() {
+        let mapping = build_test_mapping();
+        let calib = CalibrationConfig::default();
+
+        // 1. Top-1 が圧倒的 (c1=6.0) な通常パス: Soft-Beam は発動せず c1 配下の 2 候補のみ評価
+        let normal_predictor = MockRawPredictor {
+            coarse_logits: vec![6.0, 0.0, 0.0, 0.0],
+            fine_logits: vec![0.5, 4.0],
+            coarse_called: std::cell::Cell::new(false),
+            fine_call_count: std::cell::Cell::new(0),
+        };
+        let router = CoarseToFineRouter::with_predictor(
+            &normal_predictor,
+            &mapping,
+            &calib,
+            HierarchicalRouterConfig::default(),
+        )
+        .expect("ルーター構築に成功すること。");
+
+        let res = router
+            .route("入力コンテキスト", "分類してください。", None)
+            .expect("通常推論に成功すること。");
+        assert!(!res.trace().early_exit_triggered);
+        assert!(!res.trace().soft_beam_triggered);
+        assert_eq!(res.trace().selected_coarse_clusters, vec!["c1"]);
+        assert_eq!(res.trace().evaluated_fine_count, 2);
+        assert_eq!(res.answer().as_choice(), Some("c1_f2"));
+        assert_eq!(res.answer().probabilities().unwrap().len(), 8);
+        assert_eq!(normal_predictor.fine_call_count.get(), 1);
+
+        // 2. Top-1 と Top-2 が僅差 (c1=5.0, c2=4.3, c3=0.0, c4=0.0) のケース:
+        //    P(c1)~=0.662, P(c2)~=0.329 で margin < 0.35 かつ composite_confidence >= 0.25 となり Soft-Beam 発動
+        let beam_predictor = MockRawPredictor {
+            coarse_logits: vec![5.0, 4.3, 0.0, 0.0],
+            fine_logits: vec![0.0, 0.0, 5.0, 0.0],
+            coarse_called: std::cell::Cell::new(false),
+            fine_call_count: std::cell::Cell::new(0),
+        };
+        let beam_router = CoarseToFineRouter::with_predictor(
+            &beam_predictor,
+            &mapping,
+            &calib,
+            HierarchicalRouterConfig::default(),
+        )
+        .expect("Soft-Beam ルーター構築に成功すること。");
+
+        let beam_res = beam_router
+            .route("入力コンテキスト", "分類してください。", None)
+            .expect("Soft-Beam 推論に成功すること。");
+        assert!(!beam_res.trace().early_exit_triggered);
+        assert!(beam_res.trace().soft_beam_triggered);
+        assert_eq!(beam_res.trace().selected_coarse_clusters, vec!["c1", "c2"]);
+        assert_eq!(beam_res.trace().evaluated_fine_count, 4);
+        assert_eq!(beam_res.answer().as_choice(), Some("c2_f1"));
+        assert_eq!(beam_predictor.fine_call_count.get(), 1);
+    }
+
+    #[test]
+    fn test_route_with_mock_predictor_early_exit_skips_fine_pass() {
+        let mapping = build_test_mapping();
+        let calib = CalibrationConfig::default();
+
+        let mut coarse_probs = IndexMap::new();
+        coarse_probs.insert("c1".to_string(), 0.25);
+        coarse_probs.insert("c2".to_string(), 0.25);
+        coarse_probs.insert("c3".to_string(), 0.25);
+        coarse_probs.insert("c4".to_string(), 0.25);
+
+        let predictor = MockDirectCoarsePredictor {
+            coarse_probs,
+            fine_logits: vec![1.0, 0.0],
+            fine_call_count: std::cell::Cell::new(0),
+        };
+        let router = CoarseToFineRouter::with_predictor(
+            &predictor,
+            &mapping,
+            &calib,
+            HierarchicalRouterConfig::default(),
+        )
+        .expect("ルーター構築に成功すること。");
+
+        let res = router
+            .route("曖昧なコンテキスト", "分類してください。", None)
+            .expect("Early-Exit 推論に成功すること。");
+        assert!(res.trace().early_exit_triggered);
+        assert_eq!(res.trace().evaluated_fine_count, 0);
+        assert_eq!(predictor.fine_call_count.get(), 0);
+    }
+
+    #[test]
+    fn test_route_with_mock_predictor_logit_length_mismatch_returns_error() {
+        let mapping = build_test_mapping();
+        let calib = CalibrationConfig::default();
+
+        let predictor = MockRawPredictor {
+            coarse_logits: vec![6.0, 0.0, 0.0, 0.0],
+            // c1 配下は 2 候補だが 1 要素しか返さない不正モック
+            fine_logits: vec![1.0],
+            coarse_called: std::cell::Cell::new(false),
+            fine_call_count: std::cell::Cell::new(0),
+        };
+        let router = CoarseToFineRouter::with_predictor(
+            predictor,
+            &mapping,
+            &calib,
+            HierarchicalRouterConfig::default(),
+        )
+        .expect("ルーター構築に成功すること。");
+
+        let err = router
+            .route("コンテキスト", "分類してください。", None)
+            .expect_err("ロジット数不一致時はエラーを返すこと。");
+        assert!(matches!(err, RuntimeError::InvalidQuestion(_)));
     }
 }

@@ -38,6 +38,19 @@ pub const DEFAULT_NEGATIVE_KEYS: &[&str] = &[
     "対象外",
 ];
 
+/// 「該当なし」とみなすデフォルトのネガティブ候補説明文フレーズセット。
+///
+/// 通常の独立した業務カテゴリとなり得る一般的な問い合わせ表現 (例: "その他のお問い合わせ", "general inquiry", "other inquiry")
+/// は意図しない優先保護 (Pinning) によるスロット占有を防ぐため含めず、明示的なメタ除外・対象外フレーズに限定する。
+pub const DEFAULT_NEGATIVE_PHRASES: &[&str] = &[
+    "none of the above",
+    "out of scope",
+    "not applicable",
+    "上記のいずれにも該当しない",
+    "該当なし",
+    "サポート外",
+];
+
 /// 粗密 2 段階探索の設定構造体。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoarseToFineConfig {
@@ -49,6 +62,8 @@ pub struct CoarseToFineConfig {
     pub preserve_negative: bool,
     /// ネガティブ候補として判定するキー名のリスト。
     pub negative_keys: Vec<String>,
+    /// ネガティブ候補として判定する説明文フレーズのリスト。
+    pub negative_phrases: Vec<String>,
 }
 
 impl Default for CoarseToFineConfig {
@@ -58,6 +73,10 @@ impl Default for CoarseToFineConfig {
             top_m: DEFAULT_TOP_M_CANDIDATES,
             preserve_negative: true,
             negative_keys: DEFAULT_NEGATIVE_KEYS
+                .iter()
+                .map(|&s| s.to_string())
+                .collect(),
+            negative_phrases: DEFAULT_NEGATIVE_PHRASES
                 .iter()
                 .map(|&s| s.to_string())
                 .collect(),
@@ -119,7 +138,8 @@ impl CoarseToFineConfig {
     }
 }
 
-/// 候補キーおよび説明文が「該当なし / その他」などのネガティブ候補であるかを判定する。
+/// 候補キーおよび説明文が「該当なし / その他」などのネガティブ候補であるかを
+/// 指定されたネガティブキーおよびフレーズに基づいて判定する。
 ///
 /// 閉域分類バイアスによる誤分類を防止するため、類似度に関わらず保護対象とする。
 ///
@@ -127,7 +147,13 @@ impl CoarseToFineConfig {
 /// - `key`: 候補識別子。
 /// - `description`: 候補の説明文。
 /// - `negative_keys`: 登録済みネガティブキー一覧。
-pub fn is_negative_candidate(key: &str, description: &str, negative_keys: &[String]) -> bool {
+/// - `negative_phrases`: 登録済みネガティブ説明文フレーズ一覧。
+pub fn is_negative_candidate_with_phrases(
+    key: &str,
+    description: &str,
+    negative_keys: &[String],
+    negative_phrases: &[String],
+) -> bool {
     let lower_key = key.trim().to_lowercase();
     if negative_keys
         .iter()
@@ -137,21 +163,23 @@ pub fn is_negative_candidate(key: &str, description: &str, negative_keys: &[Stri
     }
 
     let lower_desc = description.trim().to_lowercase();
-    let negative_desc_phrases = [
-        "none of the above",
-        "out of scope",
-        "not applicable",
-        "other inquiry",
-        "general inquiry",
-        "上記のいずれにも該当しない",
-        "該当なし",
-        "その他のお問い合わせ",
-        "サポート外",
-    ];
-
-    negative_desc_phrases
+    negative_phrases
         .iter()
-        .any(|phrase| lower_desc.contains(phrase))
+        .any(|phrase| lower_desc.contains(&phrase.to_lowercase()))
+}
+
+/// 候補キーおよび説明文が「該当なし / その他」などのネガティブ候補であるかを既定のフレーズを用いて判定する。
+///
+/// # 引数
+/// - `key`: 候補識別子。
+/// - `description`: 候補の説明文。
+/// - `negative_keys`: 登録済みネガティブキー一覧。
+pub fn is_negative_candidate(key: &str, description: &str, negative_keys: &[String]) -> bool {
+    let default_phrases: Vec<String> = DEFAULT_NEGATIVE_PHRASES
+        .iter()
+        .map(|&s| s.to_string())
+        .collect();
+    is_negative_candidate_with_phrases(key, description, negative_keys, &default_phrases)
 }
 
 /// 事前エンコードされた候補埋め込みベクトルを保持・照会するキャッシュ。
@@ -330,8 +358,14 @@ impl CoarseScorer for LexicalCoarseScorer<'_> {
         let mut cand_counts = std::collections::HashMap::with_capacity(query_ids.len());
 
         for (key, desc) in candidates {
-            // キー名と説明文を合わせてテキスト化
-            let candidate_text = format!("{key} {desc}");
+            // 説明文が存在する場合は説明文のみをエンコードし、空の場合のみキー名をフォールバックとして使用する。
+            // 英語内部キーの混入によるサブワード分母ノルムの不自然な膨張・スコア歪曲を防止する。
+            let trimmed_desc = desc.trim();
+            let candidate_text = if !trimmed_desc.is_empty() {
+                trimmed_desc
+            } else {
+                key.trim()
+            };
             let cand_encoding = self
                 .tokenizer
                 .inner()
@@ -464,7 +498,14 @@ pub fn filter_top_candidates(
         Vec::with_capacity(total_candidates);
 
     for (orig_idx, (key, desc)) in candidates.iter().enumerate() {
-        if config.preserve_negative && is_negative_candidate(key, desc, &config.negative_keys) {
+        if config.preserve_negative
+            && is_negative_candidate_with_phrases(
+                key,
+                desc,
+                &config.negative_keys,
+                &config.negative_phrases,
+            )
+        {
             pinned_indices.push(orig_idx);
         } else {
             candidate_entries.push((orig_idx, key, desc));
@@ -691,6 +732,27 @@ mod tests {
             &neg_keys
         ));
         assert!(!is_negative_candidate("card_lost", "カード紛失", &neg_keys));
+
+        // 独立業務カテゴリとなり得る一般的な問い合わせ表現が誤ってネガティブ保護されないこと
+        assert!(!is_negative_candidate(
+            "general_inquiry",
+            "その他のお問い合わせ",
+            &neg_keys
+        ));
+        assert!(!is_negative_candidate(
+            "faq_general",
+            "general inquiry",
+            &neg_keys
+        ));
+
+        // 明示的な negative_phrases 指定による保護の検証
+        let custom_phrases = vec!["その他のお問い合わせ".to_string()];
+        assert!(is_negative_candidate_with_phrases(
+            "general_inquiry",
+            "その他のお問い合わせ",
+            &neg_keys,
+            &custom_phrases
+        ));
     }
 
     #[test]
@@ -730,6 +792,7 @@ mod tests {
             top_m: 3, // 3 件のみ選抜
             preserve_negative: true,
             negative_keys: vec!["other".to_string()],
+            ..Default::default()
         };
 
         // 非ネガティブ候補 (0, 1, 2, 3) に対するモックスコア
@@ -798,6 +861,7 @@ mod tests {
             top_m: 3,
             preserve_negative: true,
             negative_keys: (0..5).map(|i| format!("none_{i}")).collect(),
+            ..Default::default()
         };
 
         let scorer = MockScorer {
@@ -905,6 +969,7 @@ mod tests {
             top_m: 2,
             preserve_negative: false,
             negative_keys: vec![],
+            ..Default::default()
         };
 
         let mut three_candidates = IndexMap::new();
@@ -961,6 +1026,7 @@ mod tests {
             top_m: 3,
             preserve_negative: false,
             negative_keys: Vec::new(),
+            ..Default::default()
         };
 
         // 1. 短いスライス (空および不足) を返却した場合はエラーとなること

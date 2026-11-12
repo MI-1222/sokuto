@@ -1256,6 +1256,7 @@ mod tests {
             top_m: 2,
             preserve_negative: false,
             negative_keys: vec![],
+            ..Default::default()
         };
 
         let PreparedCoarseBatch {

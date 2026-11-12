@@ -130,6 +130,7 @@ fn test_negative_preservation_when_similarity_is_zero() {
         top_m: 16,
         preserve_negative: true,
         negative_keys: vec!["none_of_the_above".to_string()],
+        ..Default::default()
     };
 
     let scorer = LexicalCoarseScorer::new(&tokenizer);
@@ -491,6 +492,7 @@ fn test_excessive_negative_candidates_strict_top_m_bound() {
         top_m: 16,
         preserve_negative: true,
         negative_keys: (0..25).map(|i| format!("none_{i:02}")).collect(),
+        ..Default::default()
     };
 
     let scorer = LexicalCoarseScorer::new(&tokenizer);
@@ -499,4 +501,87 @@ fn test_excessive_negative_candidates_strict_top_m_bound() {
     // ネガティブ候補が 25 件あっても、厳密に top_m (16) 件に収まっていること
     assert_eq!(filtered.selected.len(), 16);
     assert_eq!(filtered.excluded_keys.len(), 35 - 16);
+}
+
+#[test]
+fn test_lexical_coarse_scorer_desc_priority_and_no_key_norm_inflation() {
+    let tokenizer = match init_default_tokenizer() {
+        Some(t) => t,
+        None => return,
+    };
+
+    let scorer = LexicalCoarseScorer::new(&tokenizer);
+
+    // 1. 長大な英語内部キーを持つが説明文は同一の候補
+    let candidates = [
+        (
+            "internal_uuid_bank_account_balance_inquiry_001_very_long_id",
+            "口座残高の確認",
+        ),
+        ("b", "口座残高の確認"),
+        ("fallback_key_atm", ""), // 空説明文: キー名がフォールバック
+    ];
+
+    let scores = scorer
+        .score_candidates("口座の残高を確認したい", &candidates)
+        .expect("スコアリングに成功。");
+
+    // 長い英語キーを持っても説明文のみでエンコードされるため、スコアが等しいこと
+    assert!(
+        (scores[0] - scores[1]).abs() < 1e-6,
+        "英語内部キーの混入による分母ノルム膨張が発生していないこと。"
+    );
+    assert!(scores[0] > 0.3, "妥当なコサイン類似度が得られること。");
+
+    // 2. 空説明文のフォールバック動作
+    let fallback_scores = scorer
+        .score_candidates("atm", &candidates)
+        .expect("スコアリングに成功。");
+    assert!(
+        fallback_scores[2] > 0.0,
+        "説明文が空の場合はキー名が照合対象としてフォールバックされること。"
+    );
+}
+
+#[test]
+fn test_general_inquiry_not_pinned_by_default() {
+    let tokenizer = match init_default_tokenizer() {
+        Some(t) => t,
+        None => return,
+    };
+
+    let mut candidates = IndexMap::new();
+    // 35 件の候補を作成
+    for i in 0..33 {
+        candidates.insert(format!("cat_{i:02}"), format!("業務カテゴリ {i}"));
+    }
+    // 一般的な問い合わせカテゴリ(独立カテゴリとして扱われるべきもの)
+    candidates.insert(
+        "general_inquiry".to_string(),
+        "その他のお問い合わせ".to_string(),
+    );
+    // 明示的なメタ除外候補
+    candidates.insert("none".to_string(), "該当なし".to_string());
+
+    let config = CoarseToFineConfig {
+        threshold: 30,
+        top_m: 5,
+        preserve_negative: true,
+        ..Default::default()
+    };
+
+    let scorer = LexicalCoarseScorer::new(&tokenizer);
+    // クエリは特定の業務カテゴリに合致
+    let filtered = filter_top_candidates("業務カテゴリ 01 の手続き", &candidates, &config, &scorer)
+        .expect("フィルタリングに成功。");
+
+    // "none" はデフォルト設定でネガティブ保護される
+    assert!(filtered.selected.contains_key("none"));
+
+    // "general_inquiry" ("その他のお問い合わせ") はデフォルトではネガティブ候補として保護されず、
+    // 類似度が低ければ Top-5 に残らないこと(不当な Pinning が発生しないこと)
+    assert!(
+        !filtered.selected.contains_key("general_inquiry"),
+        "その他のお問い合わせがネガティブ候補として不当に Pinning されないこと。"
+    );
 }

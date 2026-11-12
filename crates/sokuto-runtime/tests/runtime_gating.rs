@@ -259,6 +259,7 @@ fn test_coarse_to_fine_gating_and_reconstruction() {
         top_m: 3,
         preserve_negative: false,
         negative_keys: Vec::new(),
+        ..Default::default()
     };
 
     let gating_config = GatingConfig {

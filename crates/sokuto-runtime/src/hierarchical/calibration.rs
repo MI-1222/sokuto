@@ -114,6 +114,10 @@ impl DirichletCalibrator {
 
 /// 確率分布からシャノンエントロピーおよび正規化エントロピー $\tilde{H} \in [0, 1]$ を計算する。
 ///
+/// 内部で `sokuto_core::math::normalized_entropy` に委譲して非有限値・負値検査と特異点ガードを適用し、
+/// 正規化エントロピー $\tilde{H}$ と $\tilde{H} \cdot \ln K$ として復元したシャノンエントロピーを返す。
+/// 空配列や不正値が含まれる場合は `(0.0, 0.0)` にフォールバックする。
+///
 /// # 引数
 /// - `probs`: 確率スライス (総和がおおむね 1.0 であること)。
 ///
@@ -125,21 +129,13 @@ pub fn compute_normalized_entropy(probs: &[f64]) -> (f64, f64) {
         return (0.0, 0.0);
     }
 
-    let mut entropy = 0.0;
-    for &p in probs {
-        if p > EPSILON {
-            entropy -= p * p.ln();
+    match sokuto_core::math::normalized_entropy(probs) {
+        Ok(normalized) => {
+            let max_entropy = (k as f64).ln();
+            (normalized * max_entropy, normalized)
         }
+        Err(_) => (0.0, 0.0),
     }
-
-    let max_entropy = (k as f64).ln();
-    let normalized = if max_entropy > EPSILON {
-        (entropy / max_entropy).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-
-    (entropy, normalized)
 }
 
 /// 大分類の正規化エントロピーに基づいて、第 2 パス (細分類) に適用する動的温度を算出する。
@@ -282,13 +278,21 @@ mod tests {
     fn test_entropy_computation() {
         // 確信分布 (エントロピー最小)
         let certain = vec![1.0, 0.0, 0.0];
-        let (_, norm_certain) = compute_normalized_entropy(&certain);
+        let (shannon_certain, norm_certain) = compute_normalized_entropy(&certain);
+        assert!(shannon_certain < 1e-5);
         assert!(norm_certain < 1e-5);
 
         // 一様分布 (エントロピー最大)
         let uniform = vec![1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0];
-        let (_, norm_uniform) = compute_normalized_entropy(&uniform);
+        let (shannon_uniform, norm_uniform) = compute_normalized_entropy(&uniform);
+        assert!((shannon_uniform - 3.0_f64.ln()).abs() < 1e-4);
         assert!((norm_uniform - 1.0).abs() < 1e-4);
+
+        // 空配列・単一要素・不正値 (NaN / 負値) に対するフォールバック
+        assert_eq!(compute_normalized_entropy(&[]), (0.0, 0.0));
+        assert_eq!(compute_normalized_entropy(&[1.0]), (0.0, 0.0));
+        assert_eq!(compute_normalized_entropy(&[0.5, f64::NAN]), (0.0, 0.0));
+        assert_eq!(compute_normalized_entropy(&[-0.1, 1.1]), (0.0, 0.0));
     }
 
     #[test]

@@ -271,19 +271,25 @@ pub fn decompress_int8_symmetric_to_f32(
     hidden_size: usize,
     dst: &mut [f32],
 ) {
+    assert!(hidden_size > 0, "hidden_sizeは1以上である必要があります。");
     assert_eq!(src.len(), dst.len(), "展開元と先の要素数が一致しません。");
+    assert_eq!(
+        src.len() % hidden_size,
+        0,
+        "データ長はhidden_sizeの倍数である必要があります。"
+    );
     assert_eq!(
         src.len() / hidden_size,
         scales.len(),
         "トークン数とスケール数が一致しません。"
     );
 
-    for (token_idx, (q_chunk, &scale)) in
-        src.chunks_exact(hidden_size).zip(scales.iter()).enumerate()
+    for (q_chunk, (dst_chunk, &scale)) in src
+        .chunks_exact(hidden_size)
+        .zip(dst.chunks_exact_mut(hidden_size).zip(scales.iter()))
     {
-        let offset = token_idx * hidden_size;
-        for (i, &q) in q_chunk.iter().enumerate() {
-            dst[offset + i] = (q as f32) * scale;
+        for (&q, d) in q_chunk.iter().zip(dst_chunk.iter_mut()) {
+            *d = (q as f32) * scale;
         }
     }
 }

@@ -424,7 +424,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_score_duplicate_labels() {
-        // ラベルに重複がある場合はインデックス文字列 ("0", "1", "2") がキーとなる検証。
+        // ラベルに重複がある場合は DuplicateCriteriaLabel エラーとなる検証。
         let criteria = Criteria::List(vec![
             "同じ".to_string(),
             "同じ".to_string(),
@@ -432,13 +432,11 @@ mod tests {
         ]);
 
         let logits = vec![1.0, 2.0, 3.0];
-        let answer = evaluate_score(&logits, &criteria, 1.0).unwrap();
-        let probs = answer.probabilities().unwrap();
-
-        assert_eq!(probs.len(), 3);
-        assert!(probs.contains_key("0"));
-        assert!(probs.contains_key("1"));
-        assert!(probs.contains_key("2"));
+        let err = evaluate_score(&logits, &criteria, 1.0).unwrap_err();
+        assert!(matches!(
+            err,
+            CoreError::DuplicateCriteriaLabel { label, .. } if label == "同じ"
+        ));
     }
 
     #[test]

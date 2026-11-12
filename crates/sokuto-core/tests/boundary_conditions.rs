@@ -404,8 +404,8 @@ mod deterministic_and_contract {
     }
 
     #[test]
-    fn test_score_duplicate_and_empty_label_fallback() {
-        // 重複ラベルや空文字ラベルが存在する場合、キー衝突を防ぐためインデックス文字列へフォールバックされる。
+    fn test_score_duplicate_and_empty_label_rejection() {
+        // 重複ラベルや空文字ラベルが存在する場合、縮退を防止して CoreError を返却することを検証。
         let logits = vec![1.0, 2.0, 3.0];
 
         // 1. 完全重複
@@ -414,12 +414,11 @@ mod deterministic_and_contract {
             "同じ".to_string(),
             "同じ".to_string(),
         ]);
-        let ans_dup_all = evaluate_score(&logits, &crit_dup_all, 1.0).unwrap();
-        let probs_all = ans_dup_all.probabilities().unwrap();
-        assert_eq!(probs_all.len(), 3);
-        assert!(probs_all.contains_key("0"));
-        assert!(probs_all.contains_key("1"));
-        assert!(probs_all.contains_key("2"));
+        let err_dup_all = evaluate_score(&logits, &crit_dup_all, 1.0).unwrap_err();
+        assert!(matches!(
+            err_dup_all,
+            CoreError::DuplicateCriteriaLabel { label, .. } if label == "同じ"
+        ));
 
         // 2. 部分重複
         let crit_dup_part = Criteria::List(vec![
@@ -427,22 +426,26 @@ mod deterministic_and_contract {
             "Mid".to_string(),
             "Low".to_string(),
         ]);
-        let ans_dup_part = evaluate_score(&logits, &crit_dup_part, 1.0).unwrap();
-        let probs_part = ans_dup_part.probabilities().unwrap();
-        assert_eq!(probs_part.len(), 3);
-        assert!(probs_part.contains_key("0"));
-        assert!(probs_part.contains_key("1"));
-        assert!(probs_part.contains_key("2"));
+        let err_dup_part = evaluate_score(&logits, &crit_dup_part, 1.0).unwrap_err();
+        assert!(matches!(
+            err_dup_part,
+            CoreError::DuplicateCriteriaLabel { label, .. } if label == "Low"
+        ));
 
         // 3. 空文字混入
         let crit_empty =
             Criteria::List(vec!["".to_string(), "Mid".to_string(), "High".to_string()]);
-        let ans_empty = evaluate_score(&logits, &crit_empty, 1.0).unwrap();
-        let probs_empty = ans_empty.probabilities().unwrap();
-        assert_eq!(probs_empty.len(), 3);
-        assert!(probs_empty.contains_key("0"));
-        assert!(probs_empty.contains_key("1"));
-        assert!(probs_empty.contains_key("2"));
+        let err_empty = evaluate_score(&logits, &crit_empty, 1.0).unwrap_err();
+        assert!(matches!(err_empty, CoreError::EmptyCriteriaLabel { .. }));
+
+        // 空白のみ混入
+        let crit_whitespace = Criteria::List(vec![
+            "   ".to_string(),
+            "Mid".to_string(),
+            "High".to_string(),
+        ]);
+        let err_ws = evaluate_score(&logits, &crit_whitespace, 1.0).unwrap_err();
+        assert!(matches!(err_ws, CoreError::EmptyCriteriaLabel { .. }));
 
         // 4. 重複も空文字もない正常系では元のラベルがそのまま使用される。
         let crit_normal = Criteria::List(vec![

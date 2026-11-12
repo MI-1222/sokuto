@@ -119,7 +119,8 @@ impl Criteria {
         }
     }
 
-    /// Map 形式の参照を取得し、Choice 型の候補数境界 (`MIN_NUM_OPTIONS..=MAX_NUM_OPTIONS`) を検証する。
+    /// Map 形式の参照を取得し、Choice 型の候補数境界 (`MIN_NUM_OPTIONS..=MAX_NUM_OPTIONS`)、
+    /// 空文字・空白のみラベルの禁止、および重複検査を検証する。
     ///
     /// # 引数
     /// - `question_id`: 質問識別子(任意)。エラー発生時に診断メッセージへ反映される。
@@ -127,6 +128,8 @@ impl Criteria {
     /// # エラー
     /// - `Criteria::List` の場合は [`CoreError::InvalidCriteriaType`] を返却する。
     /// - 候補数が仕様範囲外の場合は [`CoreError::InvalidChoiceCount`] を返却する。
+    /// - キーまたは説明文が空文字・空白のみの場合は [`CoreError::EmptyCriteriaLabel`] を返却する。
+    /// - キーまたは説明文に重複が存在する場合は [`CoreError::DuplicateCriteriaLabel`] を返却する。
     pub fn validate_choice_map(
         &self,
         question_id: Option<&str>,
@@ -139,10 +142,39 @@ impl Criteria {
                 count,
             });
         }
+        for (i, (key, desc)) in map.iter().enumerate() {
+            let trimmed_key = key.trim();
+            if trimmed_key.is_empty() {
+                return Err(CoreError::EmptyCriteriaLabel {
+                    question_id: question_id.map(str::to_string),
+                });
+            }
+            let trimmed_desc = desc.trim();
+            if trimmed_desc.is_empty() {
+                return Err(CoreError::EmptyCriteriaLabel {
+                    question_id: question_id.map(str::to_string),
+                });
+            }
+            for (other_key, other_desc) in map.iter().skip(i + 1) {
+                if trimmed_key == other_key.trim() {
+                    return Err(CoreError::DuplicateCriteriaLabel {
+                        question_id: question_id.map(str::to_string),
+                        label: key.clone(),
+                    });
+                }
+                if trimmed_desc == other_desc.trim() {
+                    return Err(CoreError::DuplicateCriteriaLabel {
+                        question_id: question_id.map(str::to_string),
+                        label: desc.clone(),
+                    });
+                }
+            }
+        }
         Ok(map)
     }
 
-    /// List 形式の参照を取得し、Score 型の段階数境界 (`MIN_SCORE_LEVELS..=MAX_SCORE_LEVELS`) を検証する。
+    /// List 形式の参照を取得し、Score 型の段階数境界 (`MIN_SCORE_LEVELS..=MAX_SCORE_LEVELS`)、
+    /// 空文字・空白のみラベルの禁止、および重複検査を検証する。
     ///
     /// # 引数
     /// - `question_id`: 質問識別子(任意)。エラー発生時に診断メッセージへ反映される。
@@ -150,6 +182,8 @@ impl Criteria {
     /// # エラー
     /// - `Criteria::Map` の場合は [`CoreError::InvalidCriteriaType`] を返却する。
     /// - 段階数が仕様範囲外の場合は [`CoreError::InvalidScoreLevelCount`] を返却する。
+    /// - ラベルが空文字・空白のみの場合は [`CoreError::EmptyCriteriaLabel`] を返却する。
+    /// - ラベルに重複が存在する場合は [`CoreError::DuplicateCriteriaLabel`] を返却する。
     pub fn validate_score_list(&self, question_id: Option<&str>) -> Result<&[String]> {
         let list = self.as_list_or_err(QuestionType::Score, question_id)?;
         let count = list.len();
@@ -158,6 +192,20 @@ impl Criteria {
                 question_id: question_id.map(str::to_string),
                 count,
             });
+        }
+        for (i, label) in list.iter().enumerate() {
+            let trimmed = label.trim();
+            if trimmed.is_empty() {
+                return Err(CoreError::EmptyCriteriaLabel {
+                    question_id: question_id.map(str::to_string),
+                });
+            }
+            if list[i + 1..].iter().any(|other| trimmed == other.trim()) {
+                return Err(CoreError::DuplicateCriteriaLabel {
+                    question_id: question_id.map(str::to_string),
+                    label: label.clone(),
+                });
+            }
         }
         Ok(list)
     }
@@ -993,5 +1041,84 @@ mod tests {
             }
             _ => panic!("予期しないエラー型です: {err_map:?}。"),
         }
+    }
+
+    #[test]
+    fn test_validate_choice_map_empty_and_duplicate() {
+        // 1. 正常系
+        let valid_map = IndexMap::from([
+            ("opt1".to_string(), "説明 1".to_string()),
+            ("opt2".to_string(), "説明 2".to_string()),
+        ]);
+        let crit_valid = Criteria::Map(valid_map);
+        assert!(crit_valid.validate_choice_map(Some("q")).is_ok());
+
+        // 2. 空白のみのキー
+        let ws_key_map = IndexMap::from([
+            ("   ".to_string(), "説明 1".to_string()),
+            ("opt2".to_string(), "説明 2".to_string()),
+        ]);
+        let crit_ws_key = Criteria::Map(ws_key_map);
+        assert!(matches!(
+            crit_ws_key.validate_choice_map(Some("q")),
+            Err(CoreError::EmptyCriteriaLabel { .. })
+        ));
+
+        // 3. 空白のみの説明文
+        let ws_desc_map = IndexMap::from([
+            ("opt1".to_string(), "  \t  ".to_string()),
+            ("opt2".to_string(), "説明 2".to_string()),
+        ]);
+        let crit_ws_desc = Criteria::Map(ws_desc_map);
+        assert!(matches!(
+            crit_ws_desc.validate_choice_map(Some("q")),
+            Err(CoreError::EmptyCriteriaLabel { .. })
+        ));
+
+        // 4. 重複キー (トリム後一致)
+        let dup_key_map = IndexMap::from([
+            ("opt1".to_string(), "説明 1".to_string()),
+            (" opt1 ".to_string(), "説明 2".to_string()),
+        ]);
+        let crit_dup_key = Criteria::Map(dup_key_map);
+        assert!(matches!(
+            crit_dup_key.validate_choice_map(Some("q")),
+            Err(CoreError::DuplicateCriteriaLabel { .. })
+        ));
+
+        // 5. 重複説明文
+        let dup_desc_map = IndexMap::from([
+            ("opt1".to_string(), "同じ説明".to_string()),
+            ("opt2".to_string(), " 同じ説明 ".to_string()),
+        ]);
+        let crit_dup_desc = Criteria::Map(dup_desc_map);
+        assert!(matches!(
+            crit_dup_desc.validate_choice_map(Some("q")),
+            Err(CoreError::DuplicateCriteriaLabel { ref label, .. }) if label == "同じ説明"
+        ));
+    }
+
+    #[test]
+    fn test_validate_score_list_empty_and_duplicate() {
+        // 1. 正常系
+        let valid_list = vec!["低".to_string(), "中".to_string(), "高".to_string()];
+        let crit_valid = Criteria::List(valid_list);
+        assert!(crit_valid.validate_score_list(Some("q")).is_ok());
+
+        // 2. 空白ラベル
+        let ws_list = vec!["低".to_string(), "  \n  ".to_string(), "高".to_string()];
+        let crit_ws = Criteria::List(ws_list);
+        assert!(matches!(
+            crit_ws.validate_score_list(Some("q")),
+            Err(CoreError::EmptyCriteriaLabel { .. })
+        ));
+
+        // 3. 重複ラベル (トリム後一致)
+        let dup_list = vec!["低".to_string(), "中".to_string(), " 低 ".to_string()];
+        let crit_dup = Criteria::List(dup_list);
+        assert!(matches!(
+            crit_dup.validate_score_list(Some("q")),
+            Err(CoreError::DuplicateCriteriaLabel { ref label, .. }) if label == "低"
+        ));
     }
 }

@@ -79,6 +79,28 @@ pub enum CoreError {
         question_type: QuestionType,
     },
 
+    /// 評価基準(Criteria)に空文字または空白のみのラベル・説明文が含まれる場合のエラー。
+    #[error(
+        "{prefix}Criteria のラベルまたは説明文が空です。空白以外の文字列を指定してください。",
+        prefix = question_prefix(question_id)
+    )]
+    EmptyCriteriaLabel {
+        /// 対象の質問識別子(任意)。
+        question_id: Option<String>,
+    },
+
+    /// 評価基準(Criteria)に重複するラベルまたは説明文が含まれる場合のエラー。
+    #[error(
+        "{prefix}Criteria に重複するラベルまたは説明文 '{label}' が指定されました。",
+        prefix = question_prefix(question_id)
+    )]
+    DuplicateCriteriaLabel {
+        /// 対象の質問識別子(任意)。
+        question_id: Option<String>,
+        /// 重複が検出されたラベルまたは説明文。
+        label: String,
+    },
+
     /// 質問リストが空である場合のエラー。
     #[error("リクエストに含まれる questions が空です。1 件以上の質問を指定してください。")]
     EmptyQuestions,
@@ -185,6 +207,8 @@ impl CoreError {
             | Self::InvalidScoreLevelCount { question_id, .. }
             | Self::InvalidCriteriaType { question_id, .. }
             | Self::MissingCriteria { question_id, .. }
+            | Self::EmptyCriteriaLabel { question_id, .. }
+            | Self::DuplicateCriteriaLabel { question_id, .. }
             | Self::MathError { question_id, .. } => {
                 *question_id = qid_str;
             }
@@ -224,6 +248,34 @@ mod tests {
         assert_eq!(
             updated.to_string(),
             "質問 'urgency': 数値計算エラーが発生しました: ロジット長が不正です。。"
+        );
+    }
+
+    #[test]
+    fn test_criteria_label_errors_and_with_question_id() {
+        let empty_err = CoreError::EmptyCriteriaLabel { question_id: None };
+        assert_eq!(
+            empty_err.to_string(),
+            "Criteria のラベルまたは説明文が空です。空白以外の文字列を指定してください。"
+        );
+        let empty_with_id = empty_err.with_question_id("intent");
+        assert_eq!(
+            empty_with_id.to_string(),
+            "質問 'intent': Criteria のラベルまたは説明文が空です。空白以外の文字列を指定してください。"
+        );
+
+        let dup_err = CoreError::DuplicateCriteriaLabel {
+            question_id: None,
+            label: "満足".to_string(),
+        };
+        assert_eq!(
+            dup_err.to_string(),
+            "Criteria に重複するラベルまたは説明文 '満足' が指定されました。"
+        );
+        let dup_with_id = dup_err.with_question_id("satisfaction");
+        assert_eq!(
+            dup_with_id.to_string(),
+            "質問 'satisfaction': Criteria に重複するラベルまたは説明文 '満足' が指定されました。"
         );
     }
 }

@@ -51,7 +51,7 @@ pub use crate::guardrails::nli::{
 };
 pub use crate::guardrails::proxy::{GuardrailEngine, inline_guardrail_middleware};
 use crate::guardrails::sanitization::{
-    SanitizerConfig, normalize_noul_instruction, sanitize_score_criteria_text, sanitize_text,
+    SanitizerConfig, normalize_noul_instruction, sanitize_score_criteria, sanitize_text,
 };
 pub use crate::guardrails::streaming::{
     SENTENCE_DELIMITERS, SentenceChunkBuffer, SpeculativeStreamInterceptor,
@@ -261,22 +261,24 @@ impl GuardrailPipeline {
                     Some(Criteria::Map(new_map))
                 }
                 Some(Criteria::List(list)) => {
-                    let mut new_list = Vec::with_capacity(list.len());
+                    let mut compacted_list = Vec::with_capacity(list.len());
                     for item in list {
                         let item_sanitized = sanitize_text(item, &self.config.sanitizer);
                         let item_compacted = compact_text(&item_sanitized, &self.config.compactor);
-                        let mut item_final = item_compacted.into_owned();
-
-                        // Score 型 Criteria の数字・記号プレフィックス自動サニタイズ (プロンプト用)
-                        if question.question_type == QuestionType::Score
-                            && self.config.sanitizer.sanitize_score_prefixes
-                        {
-                            item_final = sanitize_score_criteria_text(&item_final).into_owned();
-                        }
-
-                        new_list.push(item_final);
+                        compacted_list.push(item_compacted.into_owned());
                     }
-                    Some(Criteria::List(new_list))
+
+                    // Score 型 Criteria の数字・記号プレフィックス自動サニタイズ (プロンプト用)
+                    // 重複発生時は自動的に元リストへロールバックされる。
+                    if question.question_type == QuestionType::Score
+                        && self.config.sanitizer.sanitize_score_prefixes
+                    {
+                        let (sanitized_criteria, _) =
+                            sanitize_score_criteria(&Criteria::List(compacted_list));
+                        Some(sanitized_criteria)
+                    } else {
+                        Some(Criteria::List(compacted_list))
+                    }
                 }
                 None => None,
             };
@@ -470,5 +472,70 @@ mod tests {
         assert_eq!(probs.get("2. 中度"), Some(&0.7));
         assert_eq!(probs.get("(3) 重大"), Some(&0.15));
         assert_eq!(probs.get("第4段階: 致命的"), Some(&0.05));
+    }
+
+    #[test]
+    fn test_pipeline_score_criteria_duplicate_rollback() {
+        let pipeline = GuardrailPipeline::default();
+
+        let mut questions = IndexMap::new();
+        // プレフィックス剥離後に重複が生じるケース (例: "1: 評価", "2: 評価", "3: 良好")
+        questions.insert(
+            "q_score".to_string(),
+            Question::new_score(
+                "評価を判定せよ。".to_string(),
+                vec![
+                    "1: 評価".to_string(),
+                    "2: 評価".to_string(),
+                    "3: 良好".to_string(),
+                ],
+            ),
+        );
+
+        let mut req = SystemOneRequest::new("システムログ本文".to_string(), questions);
+        let res = pipeline.process(&mut req, None);
+        assert!(res.is_ok());
+
+        // 重複が生じるためプレフィックス剥離がロールバックされ、元テキストが保持されること。
+        let q_score = req.questions.get("q_score").unwrap();
+        match &q_score.criteria {
+            Some(Criteria::List(list)) => {
+                assert_eq!(list, &["1: 評価", "2: 評価", "3: 良好"]);
+            }
+            _ => panic!("Criteria::List が必要です。"),
+        }
+    }
+
+    #[test]
+    fn test_pipeline_nfc_normalization() {
+        let pipeline = GuardrailPipeline::default();
+
+        let mut questions = IndexMap::new();
+        // NFD 濁点分離文字列を質問文と選択肢に設定
+        let nfd_inst = "か\u{3099}っこうの判定";
+        let nfd_key = "け\u{3099}んい";
+        let nfd_val = "へ\u{3099}んこう";
+        questions.insert(
+            "q1".to_string(),
+            Question::new_choice(
+                nfd_inst.to_string(),
+                IndexMap::from([(nfd_key.to_string(), nfd_val.to_string())]),
+            ),
+        );
+
+        let nfd_state = "とうきょうとか\u{3099}っこう";
+        let mut req = SystemOneRequest::new(nfd_state.to_string(), questions);
+
+        let res = pipeline.process(&mut req, None);
+        assert!(res.is_ok());
+
+        // State, Instructions, Criteria 全てに NFC 正規化が適用されていること
+        let state_str = req.state.as_str().unwrap();
+        assert!(state_str.contains("とうきょうとがっこう"));
+
+        let q1 = req.questions.get("q1").unwrap();
+        assert_eq!(q1.instructions, "がっこうの判定");
+        let criteria_map = q1.criteria.as_ref().unwrap().as_map().unwrap();
+        assert_eq!(criteria_map.get("げんい").unwrap(), "べんこう");
     }
 }

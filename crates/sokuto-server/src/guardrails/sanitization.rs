@@ -11,6 +11,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 use sokuto_core::schema::Criteria;
+use unicode_normalization::{IsNormalized, UnicodeNormalization, is_nfc_quick};
 
 /// 特殊トークン文字列の検出正規表現パターン。
 static SPECIAL_TOKENS_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -63,6 +64,8 @@ pub const NOUL_CANONICAL_TEMPLATE_SUFFIX: &str = "」が真実であるか評価
 /// サニタイズ設定構造体。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SanitizerConfig {
+    /// Unicode 文字列の NFC 正準等価正規化を有効にするか。
+    pub normalize_unicode_nfc: bool,
     /// 特殊マーカー文字列 (`[OP]` 等) の無害化を有効にするか。
     pub sanitize_special_tokens: bool,
     /// プロンプトデリミタ (`State:`, `Instructions:` 等) の偽装隔離を有効にするか。
@@ -76,6 +79,7 @@ pub struct SanitizerConfig {
 impl Default for SanitizerConfig {
     fn default() -> Self {
         Self {
+            normalize_unicode_nfc: true,
             sanitize_special_tokens: true,
             isolate_delimiters: true,
             sanitize_score_prefixes: true,
@@ -96,6 +100,17 @@ pub fn sanitize_text<'a>(text: &'a str, config: &SanitizerConfig) -> Cow<'a, str
     }
 
     let mut current = Cow::Borrowed(text);
+
+    // 0. Unicode NFC 正規化 (既 NFC 文字列はゼロアロケーション通過)
+    if config.normalize_unicode_nfc {
+        match is_nfc_quick(current.chars()) {
+            IsNormalized::Yes => {}
+            IsNormalized::No | IsNormalized::Maybe => {
+                let normalized: String = current.nfc().collect();
+                current = Cow::Owned(normalized);
+            }
+        }
+    }
 
     // 1. 特殊トークンの無害化
     if config.sanitize_special_tokens && current.contains('[') {
@@ -172,9 +187,14 @@ pub fn sanitize_score_criteria(criteria: &Criteria) -> (Criteria, bool) {
                 new_list.push(sanitized.into_owned());
             }
 
-            // 全要素が同一文字列になってしまうような縮退ケースでは元を維持する。
-            if !new_list.is_empty() && new_list.iter().all(|x| x == &new_list[0]) && list.len() > 1
-            {
+            // プレフィックス剥離後に重複が生じた場合は、任意の重複発生時にサニタイズをロールバックする。
+            let has_duplicate = new_list.iter().enumerate().any(|(i, label)| {
+                let trimmed = label.trim();
+                new_list[i + 1..]
+                    .iter()
+                    .any(|other| other.trim() == trimmed)
+            });
+            if has_duplicate {
                 return (criteria.clone(), false);
             }
 
@@ -261,6 +281,30 @@ mod tests {
     }
 
     #[test]
+    fn test_sanitize_text_unicode_nfc() {
+        let config = SanitizerConfig::default();
+
+        // 既に NFC 形式の文字列は借用のままゼロアロケーションで通過する。
+        let nfc_text = "がっこうのべんきょう";
+        let res = sanitize_text(nfc_text, &config);
+        assert!(matches!(res, Cow::Borrowed(_)));
+        assert_eq!(res, nfc_text);
+
+        // NFD (濁点分離) 形式の文字列は NFC 形式へ正準正規化される。
+        let nfd_text = "か\u{3099}っこうのへ\u{3099}んきょう";
+        let res = sanitize_text(nfd_text, &config);
+        assert!(matches!(res, Cow::Owned(_)));
+        assert_eq!(res, "がっこうのべんきょう");
+
+        // NFC 正規化無効化時はそのまま通過する。
+        let mut disabled_config = config;
+        disabled_config.normalize_unicode_nfc = false;
+        let res = sanitize_text(nfd_text, &disabled_config);
+        assert!(matches!(res, Cow::Borrowed(_)));
+        assert_eq!(res, nfd_text);
+    }
+
+    #[test]
     fn test_isolate_delimiters() {
         let config = SanitizerConfig::default();
 
@@ -333,6 +377,26 @@ mod tests {
             }
             _ => panic!("Criteria::List が返るべきです。"),
         }
+
+        // プレフィックス剥離後に一部重複が発生した場合、ロールバックされて元リストが維持されること。
+        let duplicate_criteria = Criteria::List(vec![
+            "1: 軽微".to_string(),
+            "2: 軽微".to_string(),
+            "3: 重大".to_string(),
+        ]);
+        let (rolled_back, changed) = sanitize_score_criteria(&duplicate_criteria);
+        assert!(!changed);
+        assert_eq!(rolled_back, duplicate_criteria);
+
+        // トリム後に重複する場合も同様にロールバックされること。
+        let whitespace_duplicate = Criteria::List(vec![
+            "1: 軽微".to_string(),
+            "2:  軽微 ".to_string(),
+            "3: 重大".to_string(),
+        ]);
+        let (rolled_back, changed) = sanitize_score_criteria(&whitespace_duplicate);
+        assert!(!changed);
+        assert_eq!(rolled_back, whitespace_duplicate);
     }
 
     #[test]

@@ -2208,6 +2208,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "unicode-normalization",
  "utoipa",
  "utoipa-swagger-ui",
 ]

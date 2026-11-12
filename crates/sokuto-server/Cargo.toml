@@ -27,6 +27,7 @@ mimalloc = { workspace = true }
 aho-corasick = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
+unicode-normalization = "0.1"
 
 [features]
 default = ["swagger"]

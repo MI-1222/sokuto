@@ -145,6 +145,7 @@ impl InProcessDagExecutor {
         let mut curr_node_id = dag.entry_node.clone();
         let mut step_count = 0;
         let mut final_answer: Option<Answer> = None;
+        let mut last_inference_node_id: Option<String> = None;
         let mut escalated = false;
         let mut escalation_reason = None;
         let mut escalation_node_id = None;
@@ -177,6 +178,7 @@ impl InProcessDagExecutor {
                     let ctx_val = answer_to_context_value(&answer);
                     context.insert(curr_node_id.clone(), ctx_val);
                     final_answer = Some(answer.clone());
+                    last_inference_node_id = Some(curr_node_id.clone());
 
                     // 条件評価
                     let next_node =
@@ -291,8 +293,10 @@ impl InProcessDagExecutor {
                     escalated = true;
                     escalation_reason = reason.clone();
 
-                    // エスカレーションをトリガーした直前ノードの特定
-                    let trigger_node_id = execution_path.iter().rev().nth(1).cloned();
+                    // エスカレーションをトリガーした直前ノードの特定(Inference -> Branch -> Escalate 等の遷移でも直近の推論ノードを捕捉)
+                    let trigger_node_id = last_inference_node_id
+                        .clone()
+                        .or_else(|| execution_path.iter().rev().nth(1).cloned());
                     escalation_node_id = trigger_node_id.clone();
 
                     // 最後の Answer から Gating メタデータを抽出
@@ -501,7 +505,7 @@ pub fn evaluate_conditions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dag::schema::{ConditionField, ContextProp, NodeConditionOp};
+    use crate::dag::schema::{ConditionField, ContextProp, DagNode, NodeConditionOp};
     use sokuto_core::gating::DecisionRoute;
 
     #[test]
@@ -1297,6 +1301,73 @@ mod tests {
         assert!(
             !prompt_template.contains("secret_value"),
             "context 内の値が initial_state 内へ漏洩・展開されてはなりません。"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_escalate_via_branch_preserves_last_inference_node_id_and_prompt() {
+        let engine = Arc::new(InferenceEngine::empty_for_test());
+        let tokenizer = Arc::new(JevTokenizer::empty_for_test());
+        let calib = CalibrationConfig::default();
+        let executor = InProcessDagExecutor::new(engine, tokenizer, calib);
+
+        let mut nodes = IndexMap::new();
+        // 1. 推論ノード
+        nodes.insert(
+            "step_infer".to_string(),
+            DagNode::inference(
+                Question::new_noul("テスト質問".to_string()),
+                vec![NodeCondition {
+                    field: "confidence".to_string(),
+                    op: NodeConditionOp::ConfidenceGte,
+                    value: Some(serde_json::json!(0.0)),
+                    target_node: "step_branch".to_string(),
+                }],
+            ),
+        );
+
+        // 2. Branch ノード
+        nodes.insert(
+            "step_branch".to_string(),
+            DagNode::branch(vec![NodeCondition {
+                field: "confidence".to_string(),
+                op: NodeConditionOp::ConfidenceGte,
+                value: Some(serde_json::json!(0.0)),
+                target_node: "step_escalate".to_string(),
+            }]),
+        );
+
+        // 3. Escalate ノード
+        nodes.insert(
+            "step_escalate".to_string(),
+            DagNode::escalate(Some("ポリシー違反によるエスカレーション。")),
+        );
+
+        let dag = DagDefinition {
+            dag_id: "test_branch_escalate_dag".to_string(),
+            timeout_ms: 1000,
+            entry_node: "step_infer".to_string(),
+            nodes,
+        };
+
+        let result = executor
+            .execute("テスト入力", &dag)
+            .await
+            .expect("DAG 実行に成功。");
+
+        assert!(result.escalated);
+        assert_eq!(
+            result.execution_path,
+            vec!["step_infer", "step_branch", "step_escalate"]
+        );
+        assert_eq!(
+            result.escalation_node_id.as_deref(),
+            Some("step_infer"),
+            "直前ノードが Branch であっても、最後に実行された Inference ノードの ID が記録される必要があります。"
+        );
+        assert!(
+            result.escalation_prompt.is_some(),
+            "System 2 向け Guided CoT プロンプト案が生成される必要があります。"
         );
     }
 }

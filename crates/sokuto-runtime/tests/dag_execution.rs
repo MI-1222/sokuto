@@ -563,6 +563,88 @@ async fn test_escalation_diagnostics_aggregation() {
     );
 }
 
+#[tokio::test]
+async fn test_escalation_via_branch_diagnostics_aggregation() {
+    let model_dir = default_model_dir();
+    let model_path = model_dir.join("model.onnx");
+    let tokenizer_path = model_dir.join("tokenizer.json");
+
+    if !model_path.exists() || !tokenizer_path.exists() {
+        eprintln!("スキップ: model.onnx または tokenizer.json が存在しません。");
+        return;
+    }
+
+    let tokenizer =
+        Arc::new(JevTokenizer::from_file(&tokenizer_path).expect("トークナイザー初期化失敗。"));
+    let engine = Arc::new(
+        InferenceEngine::new(&model_path, SessionConfig::cpu_only())
+            .expect("推論エンジン初期化失敗。"),
+    );
+
+    let calib_config = CalibrationConfig::default();
+    let executor = InProcessDagExecutor::new(engine, tokenizer, calib_config);
+
+    let mut nodes = IndexMap::new();
+    nodes.insert(
+        "fraud_check".to_string(),
+        DagNode::inference(
+            Question::new_noul("不正送金の疑いがありますか？".to_string()),
+            vec![NodeCondition {
+                field: "confidence".to_string(),
+                op: NodeConditionOp::ConfidenceGte,
+                value: Some(serde_json::json!(0.0)),
+                target_node: "branch_security".to_string(),
+            }],
+        ),
+    );
+
+    nodes.insert(
+        "branch_security".to_string(),
+        DagNode::branch(vec![NodeCondition {
+            field: "confidence".to_string(),
+            op: NodeConditionOp::ConfidenceGte,
+            value: Some(serde_json::json!(0.0)),
+            target_node: "escalate_security".to_string(),
+        }]),
+    );
+
+    nodes.insert(
+        "escalate_security".to_string(),
+        DagNode::escalate(Some("セキュリティ疑いによる即時エスカレーション。")),
+    );
+
+    let dag = DagDefinition {
+        dag_id: "escalation_via_branch_dag".to_string(),
+        timeout_ms: 200,
+        entry_node: "fraud_check".to_string(),
+        nodes,
+    };
+
+    let result = executor
+        .execute("至急確認してください", &dag)
+        .await
+        .expect("実行に成功。");
+
+    assert!(result.escalated);
+    assert_eq!(
+        result.execution_path,
+        vec!["fraud_check", "branch_security", "escalate_security"]
+    );
+    assert_eq!(
+        result.escalation_reason.as_deref(),
+        Some("セキュリティ疑いによる即時エスカレーション。")
+    );
+    assert_eq!(
+        result.escalation_node_id.as_deref(),
+        Some("fraud_check"),
+        "直前ノードが Branch の場合でも、最後に実行された推論ノードが特定されること。"
+    );
+    assert!(
+        result.escalation_prompt.is_some(),
+        "System 2 向け Guided CoT プロンプト案が集約されていること。"
+    );
+}
+
 #[test]
 fn test_validate_dag_condition_rejections() {
     use sokuto_runtime::dag::DagValidationError;

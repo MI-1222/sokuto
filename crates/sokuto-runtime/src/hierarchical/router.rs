@@ -381,20 +381,51 @@ impl<'a, P: HierarchicalPredictor> CoarseToFineRouter<'a, P> {
 
     /// 階層ルーティング推論を実行する。
     ///
-    /// # パイプライン
-    /// 1. **第 1 パス (大分類推論 & Dirichlet 較正)**: [`HierarchicalPredictor::predict_coarse_probabilities`] で大分類確率を算出し、設定に応じて ODIR Dirichlet 較正を適用。
-    /// 2. **Early-Exit 判定**: 複合確信度 $S_{\text{coarse}} < \tau_{\text{escalate}}$ の場合、即時脱出。
-    /// 3. **Soft-Beam 判定**: Top-Margin $M_{\text{coarse}} < \tau_{\text{beam}}$ の場合、Top-1 と Top-2 配下の候補をマージ。
-    /// 4. **第 2 パス (細分類推論 & 生ロジット取得)**: [`HierarchicalPredictor::forward_fine_raw`] でマージされた候補群に対して生ロジットを直接抽出。
-    /// 5. **温度調整 & 確率結合**: エントロピー連動温度・ベース温度を生ロジットへ直接適用 (1 回の Softmax) し、大分類確率と減衰周辺化結合。
-    /// 6. **受け皿候補バイアス**: $P(\text{その他}) \ge \tau_{\text{catchall}}$ 判定。
-    /// 7. **全候補空間 Gating 再計算**: 全細分類候補空間基準で Gating メタデータを正規化。
+    /// オントロジー内の全細分類候補を対象として推論を行う。
     pub fn route(
         &self,
         state: &str,
         instructions: &str,
         gating_config: Option<&GatingConfig>,
     ) -> Result<HierarchicalResult> {
+        self.route_with_allowed_candidates(state, instructions, None, gating_config)
+    }
+
+    /// 許可された細分類候補（オントロジーのサブセット）を指定して階層ルーティング推論を実行する。
+    ///
+    /// # 引数
+    /// - `state`: 文脈テキスト。
+    /// - `instructions`: 質問の指示文。
+    /// - `allowed_criteria`: 評価対象として制約する細分類候補マップ (任意)。`None` の場合はオントロジーの全細分類を対象とする。
+    /// - `gating_config`: ゲーティング閾値設定 (任意)。
+    ///
+    /// # パイプライン
+    /// 1. **第 1 パス (大分類推論 & Dirichlet 較正)**: [`HierarchicalPredictor::predict_coarse_probabilities`] で大分類確率を算出し、設定に応じて ODIR Dirichlet 較正を適用。
+    /// 2. **大分類クラスタ制約・再正規化**: `allowed_criteria` が指定されている場合、配下に候補が存在する大分類のみに限定して確率を再正規化。
+    /// 3. **Early-Exit 判定**: 複合確信度 $S_{\text{coarse}} < \tau_{\text{escalate}}$ の場合、即時脱出。
+    /// 4. **Soft-Beam 判定**: Top-Margin $M_{\text{coarse}} < \tau_{\text{beam}}$ の場合、Top-1 と Top-2 配下の候補をマージ。
+    /// 5. **第 2 パス (細分類推論 & 生ロジット取得)**: [`HierarchicalPredictor::forward_fine_raw`] でマージされた許可候補群に対して生ロジットを直接抽出。
+    /// 6. **温度調整 & 確率結合**: エントロピー連動温度・ベース温度を生ロジットへ直接適用 (1 回の Softmax) し、大分類確率と減衰周辺化結合。
+    /// 7. **受け皿候補バイアス**: $P(\text{その他}) \ge \tau_{\text{catchall}}$ 判定。
+    /// 8. **全候補空間 Gating 再計算**: 許可細分類候補空間基準で Gating メタデータを正規化。
+    pub fn route_with_allowed_candidates(
+        &self,
+        state: &str,
+        instructions: &str,
+        allowed_criteria: Option<&IndexMap<String, String>>,
+        gating_config: Option<&GatingConfig>,
+    ) -> Result<HierarchicalResult> {
+        let allowed_fine_keys: Vec<String> = if let Some(allowed) = allowed_criteria {
+            if allowed.is_empty() {
+                return Err(RuntimeError::InvalidQuestion(
+                    "指定された criteria が空です。".to_string(),
+                ));
+            }
+            allowed.keys().cloned().collect()
+        } else {
+            self.mapping.all_fine_keys().to_vec()
+        };
+
         // --- Step 1: 第 1 パス (大分類推論 & Dirichlet 較正) ---
         let coarse_probabilities = self.predictor.predict_coarse_probabilities(
             state,
@@ -420,9 +451,51 @@ impl<'a, P: HierarchicalPredictor> CoarseToFineRouter<'a, P> {
             coarse_probabilities
         };
 
+        // 配下に許可候補が存在する大分類クラスタを特定
+        let valid_coarse_keys: Vec<String> = if let Some(allowed) = allowed_criteria {
+            self.mapping
+                .all_coarse_keys()
+                .iter()
+                .filter(|c_key| {
+                    self.mapping
+                        .fine_keys_for_coarse(c_key)
+                        .map(|f_keys| f_keys.iter().any(|fk| allowed.contains_key(fk)))
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect()
+        } else {
+            self.mapping.all_coarse_keys().to_vec()
+        };
+
+        if valid_coarse_keys.is_empty() {
+            return Err(RuntimeError::InvalidQuestion(
+                "指定された criteria に合致する大分類クラスタが存在しません。".to_string(),
+            ));
+        }
+
+        // 許可大分類クラスタに限定した確率分布の再正規化
+        let mut filtered_coarse_probs = IndexMap::with_capacity(valid_coarse_keys.len());
+        let total_coarse_prob: f64 = valid_coarse_keys
+            .iter()
+            .map(|k| coarse_probabilities.get(k).copied().unwrap_or(0.0))
+            .sum();
+
+        if total_coarse_prob > f64::EPSILON && total_coarse_prob.is_finite() {
+            for k in &valid_coarse_keys {
+                let p = coarse_probabilities.get(k).copied().unwrap_or(0.0);
+                filtered_coarse_probs.insert(k.clone(), p / total_coarse_prob);
+            }
+        } else {
+            let uniform = 1.0 / (valid_coarse_keys.len() as f64);
+            for k in &valid_coarse_keys {
+                filtered_coarse_probs.insert(k.clone(), uniform);
+            }
+        }
+
         // 決定論的降順ソート (確率同値時は元の大分類インデックス昇順)
-        let all_coarse_keys = self.mapping.all_coarse_keys();
-        let sorted_coarse = sort_probabilities_descending(all_coarse_keys, &coarse_probabilities);
+        let sorted_coarse =
+            sort_probabilities_descending(&valid_coarse_keys, &filtered_coarse_probs);
 
         if sorted_coarse.is_empty() {
             return Err(RuntimeError::InvalidQuestion(
@@ -462,6 +535,7 @@ impl<'a, P: HierarchicalPredictor> CoarseToFineRouter<'a, P> {
                 state,
                 instructions,
                 &sorted_coarse,
+                &allowed_fine_keys,
                 coarse_margin,
                 norm_entropy,
                 composite_confidence,
@@ -485,6 +559,11 @@ impl<'a, P: HierarchicalPredictor> CoarseToFineRouter<'a, P> {
         for cluster in &selected_clusters {
             if let Some(f_keys) = self.mapping.fine_keys_for_coarse(cluster) {
                 for fk in f_keys {
+                    if let Some(allowed) = allowed_criteria
+                        && !allowed.contains_key(fk)
+                    {
+                        continue;
+                    }
                     if let Some(desc) = self.mapping.fine_criteria.get(fk) {
                         fine_candidates.insert(fk.clone(), desc.clone());
                     }
@@ -534,16 +613,15 @@ impl<'a, P: HierarchicalPredictor> CoarseToFineRouter<'a, P> {
         }
 
         let full_probabilities = combine_and_reconstruct_probabilities(
-            self.mapping.all_fine_keys(),
+            &allowed_fine_keys,
             &self.mapping.fine_to_coarse,
-            &coarse_probabilities,
+            &filtered_coarse_probs,
             &evaluated_fine_probs,
             self.config.coarse_power_alpha,
         )?;
 
         // --- Step 6: 決定論的勝者選定および受け皿候補バイアス ---
-        let all_fine_keys = self.mapping.all_fine_keys();
-        let sorted_full = sort_probabilities_descending(all_fine_keys, &full_probabilities);
+        let sorted_full = sort_probabilities_descending(&allowed_fine_keys, &full_probabilities);
 
         let (final_winner, _winner_prob, final_margin, catchall_bias_triggered) =
             resolve_winner_with_catchall_bias(
@@ -803,6 +881,7 @@ fn build_final_gating_metadata(
 /// - `state`: 推論対象のコンテキストテキスト。
 /// - `instructions`: 質問の判定指示文。
 /// - `sorted_coarse`: 確率降順に並んだ第 1 パスの大分類スコア一覧。
+/// - `allowed_fine_keys`: 評価対象として許可された細分類候補キー配列。
 /// - `coarse_margin`: 第 1 パスの Top-1 と Top-2 の確率差。
 /// - `norm_entropy`: 第 1 パスの正規化エントロピー。
 /// - `composite_confidence`: 第 1 パスの複合確信度スコア。
@@ -816,6 +895,7 @@ fn build_early_exit_result(
     state: &str,
     instructions: &str,
     sorted_coarse: &[(&str, f64)],
+    allowed_fine_keys: &[String],
     coarse_margin: f64,
     norm_entropy: f64,
     composite_confidence: f64,
@@ -831,8 +911,7 @@ fn build_early_exit_result(
             (None, None)
         };
 
-    let all_fine_keys = mapping.all_fine_keys();
-    if all_fine_keys.is_empty() {
+    if allowed_fine_keys.is_empty() {
         return Err(RuntimeError::InvalidQuestion(
             "階層マッピングの細分類候補が空です。".to_string(),
         ));
@@ -840,13 +919,13 @@ fn build_early_exit_result(
 
     let selected_choice = mapping
         .fine_keys_for_coarse(top1_coarse)
-        .and_then(|keys| keys.first())
+        .and_then(|keys| keys.iter().find(|fk| allowed_fine_keys.contains(fk)))
         .cloned()
-        .unwrap_or_else(|| all_fine_keys[0].clone());
+        .unwrap_or_else(|| allowed_fine_keys[0].clone());
 
-    let uniform_prob = 1.0 / (all_fine_keys.len() as f64);
-    let mut full_probs = IndexMap::with_capacity(all_fine_keys.len());
-    for k in all_fine_keys {
+    let uniform_prob = 1.0 / (allowed_fine_keys.len() as f64);
+    let mut full_probs = IndexMap::with_capacity(allowed_fine_keys.len());
+    for k in allowed_fine_keys {
         full_probs.insert(k.clone(), uniform_prob);
     }
 
@@ -859,7 +938,7 @@ fn build_early_exit_result(
         }
         if let Some(first_fine) = mapping
             .fine_keys_for_coarse(coarse_key)
-            .and_then(|keys| keys.first())
+            .and_then(|keys| keys.iter().find(|fk| allowed_fine_keys.contains(fk)))
             && seen.insert(first_fine.as_str())
         {
             top_candidates.push(CandidateProbability {
@@ -876,7 +955,7 @@ fn build_early_exit_result(
             if top_candidates.len() >= 3 {
                 break;
             }
-            if seen.insert(fk.as_str()) {
+            if allowed_fine_keys.contains(fk) && seen.insert(fk.as_str()) {
                 top_candidates.push(CandidateProbability {
                     candidate: fk.clone(),
                     probability: uniform_prob,
@@ -886,7 +965,7 @@ fn build_early_exit_result(
     }
 
     if top_candidates.len() < 3 {
-        for fk in all_fine_keys {
+        for fk in allowed_fine_keys {
             if top_candidates.len() >= 3 {
                 break;
             }
@@ -900,7 +979,11 @@ fn build_early_exit_result(
     }
 
     let reason = "Hierarchical Early-Exit: composite confidence below threshold".to_string();
-    let entropy_val = if all_fine_keys.len() > 1 { 1.0 } else { 0.0 };
+    let entropy_val = if allowed_fine_keys.len() > 1 {
+        1.0
+    } else {
+        0.0
+    };
     let mut fallback_gating = GatingMetadata {
         route: DecisionRoute::ConfirmOrEscalate,
         confidence: composite_confidence,
@@ -979,6 +1062,7 @@ mod tests {
             state,
             instructions,
             &sorted_coarse,
+            mapping.all_fine_keys(),
             0.02,
             0.96,
             0.0088,
@@ -1068,6 +1152,7 @@ mod tests {
             "判断対象のテキスト",
             "適切な候補を選択してください。",
             &sorted_coarse,
+            mapping.all_fine_keys(),
             1.0,
             0.0,
             0.1,
@@ -1629,5 +1714,73 @@ mod tests {
             .route("コンテキスト", "分類してください。", None)
             .expect_err("ロジット数不一致時はエラーを返すこと。");
         assert!(matches!(err, RuntimeError::InvalidQuestion(_)));
+    }
+
+    #[test]
+    fn test_route_with_allowed_candidates_restricts_candidates() {
+        let mapping = build_test_mapping();
+        let calib = CalibrationConfig::default();
+
+        // c3 の確率が一番高いが、c3 の候補は allowed_criteria に含まれていない状況を設定
+        let mut coarse_probs = IndexMap::new();
+        coarse_probs.insert("c1".to_string(), 0.3);
+        coarse_probs.insert("c2".to_string(), 0.2);
+        coarse_probs.insert("c3".to_string(), 0.5);
+        coarse_probs.insert("c4".to_string(), 0.0);
+
+        // c1_f1 と c2_f1 のみを許可候補として指定
+        let mut allowed_criteria = IndexMap::new();
+        allowed_criteria.insert("c1_f1".to_string(), "細分類1-1".to_string());
+        allowed_criteria.insert("c2_f1".to_string(), "細分類2-1".to_string());
+
+        let predictor = MockDirectCoarsePredictor {
+            coarse_probs,
+            // 許可候補 c1_f1 の生ロジット
+            fine_logits: vec![2.0],
+            fine_call_count: std::cell::Cell::new(0),
+        };
+
+        let config = HierarchicalRouterConfig {
+            enable_soft_beam: false,
+            enable_early_exit: false,
+            ..Default::default()
+        };
+
+        let router = CoarseToFineRouter::with_predictor(&predictor, &mapping, &calib, config)
+            .expect("ルーター構築に成功すること。");
+
+        let res = router
+            .route_with_allowed_candidates(
+                "コンテキスト",
+                "分類してください。",
+                Some(&allowed_criteria),
+                None,
+            )
+            .expect("制約付き階層ルーティングに成功すること。");
+
+        // 1. 勝者が許可された候補に含まれること
+        let choice = res
+            .answer()
+            .as_choice()
+            .expect("Choice 判定が存在すること。");
+        assert_eq!(choice, "c1_f1");
+
+        // 2. 確率分布のキーが許可された候補のみで構成されていること
+        let probs = res
+            .answer()
+            .probabilities()
+            .expect("確率マップが存在すること。");
+        assert_eq!(probs.len(), 2);
+        assert!(probs.contains_key("c1_f1"));
+        assert!(probs.contains_key("c2_f1"));
+        assert!(!probs.contains_key("c1_f2"));
+        assert!(!probs.contains_key("c3_f1"));
+
+        // 3. 確率の総和が 1.0 であること
+        let sum: f64 = probs.values().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+
+        // 4. 許可候補が存在しない大分類 (c3) ではなく、許可候補を持つ大分類 (c1) が Top-1 に選ばれていること
+        assert_eq!(res.trace().top1_coarse, "c1");
     }
 }

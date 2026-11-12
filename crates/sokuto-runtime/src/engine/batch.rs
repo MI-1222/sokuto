@@ -801,7 +801,13 @@ impl InferenceEngine {
         let mut results = IndexMap::with_capacity(questions.len());
 
         for (q_key, question) in questions {
-            let res = router.route(state, &question.instructions, gating_config)?;
+            let allowed_criteria = question.criteria.as_ref().and_then(|c| c.as_map());
+            let res = router.route_with_allowed_candidates(
+                state,
+                &question.instructions,
+                allowed_criteria,
+                gating_config,
+            )?;
             results.insert(q_key.clone(), res);
         }
 

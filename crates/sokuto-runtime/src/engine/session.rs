@@ -7,6 +7,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
+use indexmap::IndexMap;
+
 use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_core::contract::model_spec::{
     ModelInputDimensions, OP_INDEX_PADDING, TENSOR_ATTENTION_MASK, TENSOR_INPUT_IDS, TENSOR_LOGITS,
@@ -590,6 +592,36 @@ impl InferenceEngine {
     ) -> Result<HierarchicalResult> {
         let router = CoarseToFineRouter::new(self, tokenizer, mapping, calib_config, config)?;
         router.route(state, instructions, gating_config)
+    }
+
+    /// 許可された細分類候補制約を指定して単一質問に対する階層推論を実行する。
+    ///
+    /// # 引数
+    /// - `tokenizer`: Jev 高速トークナイザー。
+    /// - `state`: 文脈テキスト。
+    /// - `instructions`: 質問指示文。
+    /// - `allowed_criteria`: 評価対象として制約する細分類候補マップ (任意)。
+    /// - `mapping`: 大分類と細分類のオントロジー階層マッピング。
+    /// - `calib_config`: 較正温度設定。
+    /// - `config`: 階層ルーター設定。
+    /// - `gating_config`: ゲーティング閾値設定 (任意)。
+    ///
+    /// # 戻り値
+    /// 階層推論結果 (`HierarchicalResult`)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_question_hierarchical_with_allowed_candidates(
+        &self,
+        tokenizer: &JevTokenizer,
+        state: &str,
+        instructions: &str,
+        allowed_criteria: Option<&IndexMap<String, String>>,
+        mapping: &HierarchicalMapping,
+        calib_config: &CalibrationConfig,
+        config: HierarchicalRouterConfig,
+        gating_config: Option<&GatingConfig>,
+    ) -> Result<HierarchicalResult> {
+        let router = CoarseToFineRouter::new(self, tokenizer, mapping, calib_config, config)?;
+        router.route_with_allowed_candidates(state, instructions, allowed_criteria, gating_config)
     }
 
     /// 単一の質問をトークナイズして生ロジット配列 (Softmax 正規化前) を算出する。

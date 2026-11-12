@@ -343,6 +343,49 @@ fn test_evaluate_batch_questions_hierarchical() {
     assert!(batch_results.get("q1").unwrap().answer().is_choice());
     assert!(batch_results.get("q2").unwrap().answer().is_choice());
 
+    // criteria でオントロジーのサブセットを指定した質問が正しく制約されること。
+    let mut subset_criteria = indexmap::IndexMap::new();
+    subset_criteria.insert(
+        "lost_or_stolen_card".to_string(),
+        "カード紛失・盗難手続き。".to_string(),
+    );
+    subset_criteria.insert(
+        "card_arrival".to_string(),
+        "カードの配送状況確認。".to_string(),
+    );
+    let mut subset_questions = indexmap::IndexMap::new();
+    subset_questions.insert(
+        "q_subset".to_string(),
+        sokuto_core::schema::Question::new_choice(
+            "カードの紛失手続きについてカテゴリを選んでください。",
+            subset_criteria,
+        ),
+    );
+    let subset_results = engine
+        .evaluate_batch_questions_hierarchical(
+            &tokenizer,
+            state,
+            &subset_questions,
+            &mapping,
+            &calib_config,
+            config.clone(),
+            None,
+        )
+        .expect("候補制約付きバッチ階層推論の実行に成功する。");
+
+    let subset_ans = subset_results.get("q_subset").unwrap().answer();
+    let selected_choice = subset_ans.as_choice().expect("Choice 判定が存在すること。");
+    assert!(
+        selected_choice == "lost_or_stolen_card" || selected_choice == "card_arrival",
+        "勝者は criteria で指定された候補のいずれかであること。"
+    );
+    let probs = subset_ans
+        .probabilities()
+        .expect("確率マップが存在すること。");
+    assert_eq!(probs.len(), 2);
+    assert!(probs.contains_key("lost_or_stolen_card"));
+    assert!(probs.contains_key("card_arrival"));
+
     // 不正な質問種別 (Score 型) が渡された場合は InvalidQuestion エラーとなること。
     let mut invalid_questions = indexmap::IndexMap::new();
     invalid_questions.insert(

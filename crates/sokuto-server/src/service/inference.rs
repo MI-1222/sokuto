@@ -280,9 +280,12 @@ impl InferenceService {
                                     .unwrap_or(false);
 
                             if is_hierarchical {
-                                let res = router.route(
+                                let allowed_criteria =
+                                    question.criteria.as_ref().and_then(|c| c.as_map());
+                                let res = router.route_with_allowed_candidates(
                                     effective_state,
                                     &question.instructions,
+                                    allowed_criteria,
                                     Some(&gating_config),
                                 )?;
                                 if res.trace().soft_beam_triggered {
@@ -364,9 +367,12 @@ impl InferenceService {
                                 .unwrap_or(false);
 
                         if is_hierarchical {
-                            let res = router.route(
+                            let allowed_criteria =
+                                question.criteria.as_ref().and_then(|c| c.as_map());
+                            let res = router.route_with_allowed_candidates(
                                 &state_text,
                                 &question.instructions,
+                                allowed_criteria,
                                 Some(&gating_config),
                             )?;
                             if res.trace().soft_beam_triggered {

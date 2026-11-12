@@ -7,7 +7,7 @@ use indexmap::IndexMap;
 use sokuto_core::contract::CalibrationConfig;
 use sokuto_core::decision::evaluate_question_with_buf;
 use sokuto_core::gating::GatingConfig;
-use sokuto_core::schema::{Answer, Question, QuestionType};
+use sokuto_core::schema::{Answer, Question};
 
 use crate::engine::coarse::{
     CoarseScorer, CoarseToFineConfig, LexicalCoarseScorer, filter_top_candidates,
@@ -797,10 +797,7 @@ fn prepare_coarse_questions<S: CoarseScorer>(
     let mut original_keys_map: IndexMap<String, Vec<String>> = IndexMap::new();
 
     for (q_key, question) in questions {
-        if question.question_type == QuestionType::Choice
-            && let Some(map) = question.criteria.as_ref().and_then(|c| c.as_map())
-            && coarse_config.should_trigger(map.len())
-        {
+        if let Some(map) = coarse_config.applicable_candidates(question) {
             let original_keys: Vec<String> = map.keys().cloned().collect();
             let query = format!("State: {}\nInstructions: {}", state, question.instructions);
 

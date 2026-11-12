@@ -75,6 +75,34 @@ impl CoarseToFineConfig {
         candidate_count > self.threshold
     }
 
+    /// 指定された質問に対して粗密 2 段階探索を適用すべきかを判定する。
+    ///
+    /// `QuestionType::Choice` であり、かつ `Criteria::Map` の候補数が
+    /// `self.threshold` を超える場合に `true` を返す。
+    ///
+    /// # 引数
+    /// - `question`: 判定対象の質問定義。
+    pub fn is_applicable(&self, question: &Question) -> bool {
+        self.applicable_candidates(question).is_some()
+    }
+
+    /// 粗密 2 段階探索の適用条件を満たす場合、対象となる候補マップへの参照を返す。
+    ///
+    /// `QuestionType::Choice` 以外、または `Criteria::Map` の候補数が閾値以下の場合は `None` を返す。
+    ///
+    /// # 引数
+    /// - `question`: 判定対象の質問定義。
+    pub(crate) fn applicable_candidates<'a>(
+        &self,
+        question: &'a Question,
+    ) -> Option<&'a IndexMap<String, String>> {
+        if question.question_type != QuestionType::Choice {
+            return None;
+        }
+        let map = question.criteria.as_ref()?.as_map()?;
+        self.should_trigger(map.len()).then_some(map)
+    }
+
     /// 設定値の整合性を検証する。
     pub fn validate(&self) -> Result<()> {
         if self.top_m == 0 {
@@ -880,5 +908,42 @@ mod tests {
             .expect("gating メタデータが付与されること。");
         assert!(gating.is_ood);
         assert_eq!(gating.route, sokuto_core::gating::DecisionRoute::Fallback);
+    }
+
+    #[test]
+    fn test_coarse_config_is_applicable_variants() {
+        let config = CoarseToFineConfig {
+            threshold: 2,
+            top_m: 2,
+            preserve_negative: false,
+            negative_keys: vec![],
+        };
+
+        let mut three_candidates = IndexMap::new();
+        three_candidates.insert("a".to_string(), "A".to_string());
+        three_candidates.insert("b".to_string(), "B".to_string());
+        three_candidates.insert("c".to_string(), "C".to_string());
+        let q_large = Question::new_choice("選択", three_candidates);
+        assert!(config.is_applicable(&q_large));
+        assert_eq!(
+            config.applicable_candidates(&q_large).map(IndexMap::len),
+            Some(3)
+        );
+
+        let mut two_candidates = IndexMap::new();
+        two_candidates.insert("a".to_string(), "A".to_string());
+        two_candidates.insert("b".to_string(), "B".to_string());
+        let q_boundary = Question::new_choice("境界", two_candidates);
+        assert!(!config.is_applicable(&q_boundary));
+        assert!(config.applicable_candidates(&q_boundary).is_none());
+
+        let q_noul = Question::new_noul("真偽?");
+        assert!(!config.is_applicable(&q_noul));
+
+        let q_score = Question::new_score(
+            "評価",
+            vec!["1".to_string(), "2".to_string(), "3".to_string()],
+        );
+        assert!(!config.is_applicable(&q_score));
     }
 }

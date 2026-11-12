@@ -14,7 +14,7 @@ use sokuto_core::contract::model_spec::{
 };
 use sokuto_core::decision::evaluate_question;
 use sokuto_core::gating::GatingConfig;
-use sokuto_core::schema::{Answer, Question, QuestionType};
+use sokuto_core::schema::{Answer, Question};
 
 use ort::session::Session;
 use ort::session::builder::SessionBuilder;
@@ -459,15 +459,7 @@ impl InferenceEngine {
         coarse_config.validate()?;
 
         // 発動条件の検査: Choice 型 かつ Criteria が Map 形式 かつ 候補数 > threshold
-        let should_trigger = question.question_type == QuestionType::Choice
-            && question
-                .criteria
-                .as_ref()
-                .and_then(|c| c.as_map())
-                .map(|map| coarse_config.should_trigger(map.len()))
-                .unwrap_or(false);
-
-        if !should_trigger {
+        let Some(map) = coarse_config.applicable_candidates(question) else {
             // バイパス: 通常の単一推論を実行
             let tokenized = tokenizer.encode_question(state, question)?;
             let logits = self.forward_question(&tokenized)?;
@@ -484,13 +476,7 @@ impl InferenceEngine {
                 calib_config,
             );
             return Ok(answer);
-        }
-
-        let map = question
-            .criteria
-            .as_ref()
-            .and_then(|c| c.as_map())
-            .expect("should_trigger により Map の存在が保証されている。");
+        };
 
         let original_keys: Vec<String> = map.keys().cloned().collect();
         let query = format!("State: {}\nInstructions: {}", state, question.instructions);

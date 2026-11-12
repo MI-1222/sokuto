@@ -78,7 +78,10 @@ fn profile_single_request(
 
     // 5. 決定数理解決 & 確信度ゲーティング
     let t_math_start = Instant::now();
-    let gating_config = req.gating.unwrap_or_else(|| state.gating_config.clone());
+    let gating_config = match req.gating.as_ref() {
+        Some(patch) => state.gating_config.apply_patch(patch).unwrap(),
+        None => state.gating_config.clone(),
+    };
     if gating_config.enabled {
         for (qid, answer) in answers.iter_mut() {
             let q_def = req.questions.get(qid);

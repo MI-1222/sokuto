@@ -151,9 +151,10 @@ impl InferenceService {
         let guardrail_pipeline = self.state.guardrail_pipeline.clone();
         let chunk_size = self.state.chunk_size;
         let questions = req.questions;
-        let gating_config = req
-            .gating
-            .unwrap_or_else(|| self.state.gating_config.clone());
+        let gating_config = match req.gating.as_ref() {
+            Some(patch) => self.state.gating_config.apply_patch(patch)?,
+            None => self.state.gating_config.clone(),
+        };
         let auto_hierarchical = req
             .auto_hierarchical
             .unwrap_or(self.state.auto_hierarchical);

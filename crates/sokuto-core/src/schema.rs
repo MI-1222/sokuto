@@ -14,7 +14,7 @@ use crate::contract::model_spec::{
     MAX_NUM_OPTIONS, MAX_SCORE_LEVELS, MIN_NUM_OPTIONS, MIN_SCORE_LEVELS,
 };
 use crate::error::{CoreError, Result};
-use crate::gating::{DecisionRoute, GatingConfig, GatingMetadata, SystemRoutingSummary};
+use crate::gating::{DecisionRoute, GatingMetadata, GatingPatch, SystemRoutingSummary};
 
 /// 質問の決定プリミティブ種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -322,22 +322,22 @@ impl Question {
     }
 }
 
-/// 質問群マップおよび任意のゲーティング設定の整合性を検証する共通バリデータ。
+/// 質問群マップおよび任意のゲーティング設定パッチの整合性を検証する共通バリデータ。
 ///
 /// # 概要
 /// - 質問群が空配列の場合は [`CoreError::EmptyQuestions`] を返却する。
 /// - 含まれる各質問について、種別ごとの基準定義 ([`Question::validate`]) を検証する。
-/// - 確信度ゲーティング設定が存在する場合は、各閾値の妥当性 ([`GatingConfig::validate`]) を検証する。
+/// - 確信度ゲーティングパッチが存在する場合は、指定項目の妥当性 ([`GatingPatch::validate_partial`]) を検証する。
 ///
 /// # 引数
 /// - `questions`: 質問群マップ。
-/// - `gating`: 任意のゲーティング設定。
+/// - `gating`: 任意のゲーティング設定パッチ。
 ///
 /// # 戻り値
 /// - 成功時は `Ok(())`、不整合検出時は [`CoreError`]。
 pub fn validate_request_payload(
     questions: &IndexMap<String, Question>,
-    gating: Option<&GatingConfig>,
+    gating: Option<&GatingPatch>,
 ) -> Result<()> {
     if questions.is_empty() {
         return Err(CoreError::EmptyQuestions);
@@ -346,18 +346,18 @@ pub fn validate_request_payload(
         question.validate(Some(question_id))?;
     }
     if let Some(gating) = gating {
-        gating.validate()?;
+        gating.validate_partial()?;
     }
     Ok(())
 }
 
-/// 決定プリミティブ質問群とゲーティング設定を保持するリクエストペイロードの共通トレイト。
+/// 決定プリミティブ質問群とゲーティング設定パッチを保持するリクエストペイロードの共通トレイト。
 pub trait DecisionRequest {
     /// 評価対象となる質問群のマップへの参照を取得する。
     fn questions(&self) -> &IndexMap<String, Question>;
 
-    /// 確信度ゲーティング処理の設定パラメータへの参照を取得する。
-    fn gating(&self) -> Option<&GatingConfig>;
+    /// 確信度ゲーティング処理の設定パッチへの参照を取得する。
+    fn gating(&self) -> Option<&GatingPatch>;
 
     /// リクエスト全体の整合性を検証する。
     fn validate(&self) -> Result<()> {
@@ -384,9 +384,9 @@ pub struct SystemOneRequest {
     /// 評価対象となる質問群のマップ(キーは質問識別子)。
     pub questions: IndexMap<String, Question>,
 
-    /// 確信度ゲーティング処理の設定パラメータ(任意)。
+    /// 確信度ゲーティング処理の設定パラメータパッチ(任意)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gating: Option<GatingConfig>,
+    pub gating: Option<GatingPatch>,
 
     /// 候補数 K > 16 の Choice 質問に対する透過的粗密階層ルーティングの制御フラグ (任意)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -423,8 +423,8 @@ impl SystemOneRequest {
     }
 
     /// ゲーティング設定を指定してリクエストを作成する。
-    pub fn with_gating(mut self, gating: GatingConfig) -> Self {
-        self.gating = Some(gating);
+    pub fn with_gating(mut self, gating: impl Into<GatingPatch>) -> Self {
+        self.gating = Some(gating.into());
         self
     }
 
@@ -445,7 +445,7 @@ impl DecisionRequest for SystemOneRequest {
         &self.questions
     }
 
-    fn gating(&self) -> Option<&GatingConfig> {
+    fn gating(&self) -> Option<&GatingPatch> {
         self.gating.as_ref()
     }
 }

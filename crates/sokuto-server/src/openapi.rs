@@ -7,7 +7,7 @@ use axum::Router;
 use axum::response::IntoResponse;
 use sokuto_core::gating::{
     CandidateProbability, DecisionRoute, EscalationContext, GatingConfig, GatingMetadata,
-    SystemRoutingSummary,
+    GatingPatch, GatingThresholdsPatch, SystemRoutingSummary,
 };
 use sokuto_core::schema::{
     Answer, Criteria, Question, QuestionType, StateBatchRequest, StateBatchResponse,
@@ -46,6 +46,8 @@ use crate::schema::dag::{
             Usage,
             DecisionRoute,
             GatingConfig,
+            GatingPatch,
+            GatingThresholdsPatch,
             GatingMetadata,
             CandidateProbability,
             EscalationContext,

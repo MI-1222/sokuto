@@ -311,6 +311,206 @@ impl GatingConfig {
     pub fn validate(&self) -> Result<()> {
         self.thresholds.validate()
     }
+
+    /// ベース設定へ `Some` 項目のみマージ適用し、統合後の設定を検証して返却する。
+    ///
+    /// # 引数
+    /// - `patch`: リクエスト等から渡された部分上書きパッチ。
+    ///
+    /// # 戻り値
+    /// - パッチ適用・検証に成功した新規 `GatingConfig`。
+    ///
+    /// # エラー
+    /// - マージ後の閾値設定が制約に違反する場合は [`CoreError::InvalidGatingConfig`]。
+    pub fn apply_patch(&self, patch: &GatingPatch) -> Result<Self> {
+        let mut merged = self.clone();
+        if let Some(enabled) = patch.enabled {
+            merged.enabled = enabled;
+        }
+        let p = &patch.thresholds;
+        if let Some(v) = p.high_threshold {
+            merged.thresholds.high_threshold = v;
+        }
+        if let Some(v) = p.low_threshold {
+            merged.thresholds.low_threshold = v;
+        }
+        if let Some(v) = p.top_margin_threshold {
+            merged.thresholds.top_margin_threshold = v;
+        }
+        if let Some(v) = p.ood_enabled {
+            merged.thresholds.ood_enabled = v;
+        }
+        if let Some(v) = p.energy_threshold {
+            merged.thresholds.energy_threshold = v;
+        }
+        if let Some(v) = p.energy_temperature {
+            merged.thresholds.energy_temperature = Some(v);
+        }
+        if let Some(v) = p.loose_energy_threshold {
+            merged.thresholds.loose_energy_threshold = Some(v);
+        }
+        if let Some(v) = p.ood_min_confidence {
+            merged.thresholds.ood_min_confidence = Some(v);
+        }
+        if let Some(v) = p.ood_min_margin {
+            merged.thresholds.ood_min_margin = Some(v);
+        }
+        merged.validate()?;
+        Ok(merged)
+    }
+}
+
+/// 確信度ゲーティング閾値の部分上書きパッチ構造体。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct GatingThresholdsPatch {
+    /// 自動実行 (AutoExecute) と判定するための確信度下限値 (任意)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_threshold: Option<f64>,
+
+    /// 確認/エスカレーション (ConfirmOrEscalate) と判定するための確信度下限値 (任意)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low_threshold: Option<f64>,
+
+    /// 上位 2 候補の最小確率マージン閾値 (任意)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_margin_threshold: Option<f64>,
+
+    /// Energy-based OOD 安全弁を有効化するかどうか (任意)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ood_enabled: Option<bool>,
+
+    /// OOD 判定用の正規化自由エネルギー閾値 (任意)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_threshold: Option<f64>,
+
+    /// OOD 自由エネルギー算出専用の温度パラメータ (任意)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_temperature: Option<f64>,
+
+    /// ハイブリッド OOD 判定用の緩和正規化自由エネルギー閾値 (任意)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loose_energy_threshold: Option<f64>,
+
+    /// ハイブリッド OOD 判定用の最小確信度閾値 (任意)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ood_min_confidence: Option<f64>,
+
+    /// ハイブリッド OOD 判定用の最小マージン閾値 (任意)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ood_min_margin: Option<f64>,
+}
+
+impl From<GatingThresholds> for GatingThresholdsPatch {
+    fn from(thresholds: GatingThresholds) -> Self {
+        Self {
+            high_threshold: Some(thresholds.high_threshold),
+            low_threshold: Some(thresholds.low_threshold),
+            top_margin_threshold: Some(thresholds.top_margin_threshold),
+            ood_enabled: Some(thresholds.ood_enabled),
+            energy_threshold: Some(thresholds.energy_threshold),
+            energy_temperature: thresholds.energy_temperature,
+            loose_energy_threshold: thresholds.loose_energy_threshold,
+            ood_min_confidence: thresholds.ood_min_confidence,
+            ood_min_margin: thresholds.ood_min_margin,
+        }
+    }
+}
+
+/// リクエスト受信用ゲーティング部分上書きパッチ構造体。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct GatingPatch {
+    /// ゲーティング処理を有効化するかどうか (任意)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+
+    /// ゲーティング判定用閾値パラメータ群の部分パッチ。
+    #[serde(flatten, default)]
+    pub thresholds: GatingThresholdsPatch,
+}
+
+impl From<GatingConfig> for GatingPatch {
+    fn from(config: GatingConfig) -> Self {
+        Self {
+            enabled: Some(config.enabled),
+            thresholds: config.thresholds.into(),
+        }
+    }
+}
+
+impl GatingPatch {
+    /// パッチ指定された個別項目の妥当性を部分検証する。
+    ///
+    /// # 概要
+    /// - `Some` が指定された項目のみ、`[0.0, 1.0]` 区間や有限性、正の有限性などを検査する。
+    /// - `high_threshold` と `low_threshold` が両方指定されている場合は `low_threshold <= high_threshold` を検査する。
+    /// - `energy_threshold` と `loose_energy_threshold` が両方指定されている場合は `loose_energy_threshold <= energy_threshold` を検査する。
+    ///
+    /// # 戻り値
+    /// - 妥当な場合は `Ok(())`、範囲外または非有限値の場合は [`CoreError::InvalidGatingConfig`]。
+    pub fn validate_partial(&self) -> Result<()> {
+        let p = &self.thresholds;
+        if let Some(high) = p.high_threshold {
+            validate_unit_interval("high_threshold", high)?;
+        }
+        if let Some(low) = p.low_threshold {
+            validate_unit_interval("low_threshold", low)?;
+        }
+        if let (Some(low), Some(high)) = (p.low_threshold, p.high_threshold)
+            && low > high
+        {
+            return Err(CoreError::InvalidGatingConfig {
+                message: format!(
+                    "low_threshold ({low}) は high_threshold ({high}) 以下である必要があります。"
+                ),
+            });
+        }
+        if let Some(margin) = p.top_margin_threshold {
+            validate_unit_interval("top_margin_threshold", margin)?;
+        }
+        if let Some(energy) = p.energy_threshold
+            && !energy.is_finite()
+        {
+            return Err(CoreError::InvalidGatingConfig {
+                message: format!("energy_threshold ({energy}) は有限実数である必要があります。"),
+            });
+        }
+        if let Some(temp) = p.energy_temperature
+            && (!temp.is_finite() || temp <= 0.0)
+        {
+            return Err(CoreError::InvalidGatingConfig {
+                message: format!(
+                    "energy_temperature ({temp}) は正の有限実数である必要があります。"
+                ),
+            });
+        }
+        if let Some(loose) = p.loose_energy_threshold {
+            if !loose.is_finite() {
+                return Err(CoreError::InvalidGatingConfig {
+                    message: format!(
+                        "loose_energy_threshold ({loose}) は有限実数である必要があります。"
+                    ),
+                });
+            }
+            if let Some(energy) = p.energy_threshold
+                && loose > energy
+            {
+                return Err(CoreError::InvalidGatingConfig {
+                    message: format!(
+                        "loose_energy_threshold ({loose}) は energy_threshold ({energy}) 以下である必要があります。"
+                    ),
+                });
+            }
+        }
+        if let Some(c) = p.ood_min_confidence {
+            validate_unit_interval("ood_min_confidence", c)?;
+        }
+        if let Some(m) = p.ood_min_margin {
+            validate_unit_interval("ood_min_margin", m)?;
+        }
+        Ok(())
+    }
 }
 
 /// 候補とその予測確率値のペア。
@@ -1658,5 +1858,142 @@ mod tests {
                 "ood_min_margin={invalid_val} は拒否されるべき。"
             );
         }
+    }
+
+    #[test]
+    fn test_gating_patch_apply_partial_merge() {
+        // 1. デフォルト設定に対して enabled のみ上書き
+        let base = GatingConfig::default();
+        let patch_enabled = GatingPatch {
+            enabled: Some(false),
+            ..Default::default()
+        };
+        let merged = base.apply_patch(&patch_enabled).unwrap();
+        assert!(!merged.enabled);
+        assert_eq!(
+            merged.thresholds.high_threshold,
+            base.thresholds.high_threshold
+        );
+        assert_eq!(
+            merged.thresholds.energy_threshold,
+            base.thresholds.energy_threshold
+        );
+
+        // 2. 閾値の一部のみ上書き
+        let patch_th = GatingPatch {
+            thresholds: GatingThresholdsPatch {
+                high_threshold: Some(0.85),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let merged_th = base.apply_patch(&patch_th).unwrap();
+        assert_eq!(merged_th.thresholds.high_threshold, 0.85);
+        assert_eq!(
+            merged_th.thresholds.low_threshold,
+            base.thresholds.low_threshold
+        );
+
+        // 3. ハイブリッド OOD 3 項目が設定済みのベースに対して 1 項目のみ上書き
+        let hybrid_base = GatingConfig {
+            thresholds: GatingThresholds {
+                energy_threshold: -1.0,
+                loose_energy_threshold: Some(-2.5),
+                ood_min_confidence: Some(0.65),
+                ood_min_margin: Some(0.20),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let patch_conf = GatingPatch {
+            thresholds: GatingThresholdsPatch {
+                ood_min_confidence: Some(0.75),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let merged_hybrid = hybrid_base.apply_patch(&patch_conf).unwrap();
+        assert_eq!(merged_hybrid.thresholds.ood_min_confidence, Some(0.75));
+        assert_eq!(merged_hybrid.thresholds.loose_energy_threshold, Some(-2.5));
+        assert_eq!(merged_hybrid.thresholds.ood_min_margin, Some(0.20));
+
+        // 4. ハイブリッド OOD 未設定のベースに対して 1 項目のみパッチ指定すると検証で拒否
+        let patch_single_hybrid = GatingPatch {
+            thresholds: GatingThresholdsPatch {
+                loose_energy_threshold: Some(-2.5),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(base.apply_patch(&patch_single_hybrid).is_err());
+    }
+
+    #[test]
+    fn test_gating_patch_validate_partial() {
+        // 1. 空パッチは妥当
+        let empty_patch = GatingPatch::default();
+        assert!(empty_patch.validate_partial().is_ok());
+
+        // 2. 単一項目の妥当な指定
+        let valid_patch = GatingPatch {
+            thresholds: GatingThresholdsPatch {
+                high_threshold: Some(0.9),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(valid_patch.validate_partial().is_ok());
+
+        // 3. 範囲外値 (high_threshold > 1.0)
+        let invalid_patch = GatingPatch {
+            thresholds: GatingThresholdsPatch {
+                high_threshold: Some(1.2),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(invalid_patch.validate_partial().is_err());
+
+        // 4. low > high の逆転
+        let reversed_patch = GatingPatch {
+            thresholds: GatingThresholdsPatch {
+                high_threshold: Some(0.4),
+                low_threshold: Some(0.8),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(reversed_patch.validate_partial().is_err());
+
+        // 5. energy_temperature <= 0.0
+        let invalid_temp = GatingPatch {
+            thresholds: GatingThresholdsPatch {
+                energy_temperature: Some(0.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(invalid_temp.validate_partial().is_err());
+
+        // 6. loose > energy の逆転
+        let reversed_energy = GatingPatch {
+            thresholds: GatingThresholdsPatch {
+                energy_threshold: Some(-2.0),
+                loose_energy_threshold: Some(-1.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(reversed_energy.validate_partial().is_err());
+    }
+
+    #[test]
+    fn test_gating_patch_serde_roundtrip() {
+        let json_str = r#"{"enabled":false,"high_threshold":0.88,"energy_threshold":-2.0}"#;
+        let patch: GatingPatch = serde_json::from_str(json_str).unwrap();
+        assert_eq!(patch.enabled, Some(false));
+        assert_eq!(patch.thresholds.high_threshold, Some(0.88));
+        assert_eq!(patch.thresholds.low_threshold, None);
+        assert_eq!(patch.thresholds.energy_threshold, Some(-2.0));
     }
 }

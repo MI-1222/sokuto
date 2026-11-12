@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
 use sokuto_core::contract::calibration::CalibrationConfig;
-use sokuto_core::schema::{Answer, AnswerPayload};
+use sokuto_core::schema::{Answer, AnswerPayload, Question};
 
 use crate::dag::interpolate::{NodeContextValue, interpolate_prompt, interpolate_question};
 use crate::dag::pool::PoolError;
@@ -163,27 +163,13 @@ impl InProcessDagExecutor {
                         .as_ref()
                         .ok_or_else(|| DagError::NodeNotFound(curr_node_id.clone()))?;
 
-                    // ゼロアロケーション動的コンテキスト補間 (事前確保バッファの再利用)
-                    interpolate_prompt(initial_state, &context, &mut scratch_state);
-                    let interpolated_question = interpolate_question(raw_question, &context);
-
-                    // 推論処理を専用ブロッキングスレッドへオフロード
-                    let engine = self.engine.clone();
-                    let tokenizer = self.tokenizer.clone();
-                    let calib_config = self.calib_config.clone();
-                    let current_state = scratch_state.clone();
-
-                    let answer = tokio::task::spawn_blocking(move || {
-                        engine.predict_single_question(
-                            &tokenizer,
-                            &current_state,
-                            &interpolated_question,
-                            &calib_config,
-                        )
-                    })
-                    .await
-                    .map_err(|e| DagError::ExecutionFailed(format!("スレッド結合失敗: {e}。")))?
-                    .map_err(DagError::Runtime)?;
+                    let handle = self.spawn_inference_task(
+                        initial_state,
+                        raw_question,
+                        &context,
+                        &mut scratch_state,
+                    );
+                    let answer = Self::await_inference_task(handle, "スレッド結合失敗").await?;
 
                     // コンテキストに結果を反映
                     let ctx_val = answer_to_context_value(&answer);
@@ -248,37 +234,25 @@ impl InProcessDagExecutor {
                             ))
                         })?;
 
-                        // 事前確保バッファを活用してプロンプトを展開
-                        interpolate_prompt(initial_state, &context, &mut scratch_state);
-                        let interpolated_question = interpolate_question(raw_question, &context);
-
-                        let engine = self.engine.clone();
-                        let tokenizer = self.tokenizer.clone();
-                        let calib_config = self.calib_config.clone();
-                        let node_id_owned = p_node_id.clone();
-                        let state_owned = scratch_state.clone();
-
-                        let handle = tokio::task::spawn_blocking(move || {
-                            let ans = engine.predict_single_question(
-                                &tokenizer,
-                                &state_owned,
-                                &interpolated_question,
-                                &calib_config,
-                            );
-                            (node_id_owned, ans)
+                        let handle = self.spawn_inference_task(
+                            initial_state,
+                            raw_question,
+                            &context,
+                            &mut scratch_state,
+                        );
+                        let p_id = p_node_id.clone();
+                        tasks.push(async move {
+                            let ans =
+                                Self::await_inference_task(handle, "並行タスク結合失敗").await?;
+                            Ok::<_, DagError>((p_id, ans))
                         });
-                        tasks.push(handle);
                     }
 
                     // 並行実行を待機
                     let results = futures_util::future::join_all(tasks).await;
                     let mut parallel_answers = Vec::with_capacity(results.len());
                     for res in results {
-                        let (p_id, ans_res) = res.map_err(|e| {
-                            DagError::ExecutionFailed(format!("並行タスク結合失敗: {e}。"))
-                        })?;
-                        let ans = ans_res.map_err(DagError::Runtime)?;
-                        parallel_answers.push((p_id, ans));
+                        parallel_answers.push(res?);
                     }
 
                     let duration_ms = step_start.elapsed().as_secs_f64() * 1000.0;
@@ -389,6 +363,56 @@ impl InProcessDagExecutor {
             escalation_gating,
             final_answer,
         })
+    }
+
+    /// 単一質問に対する推論タスクをバックグラウンドスレッドへオフロードして生成する。
+    ///
+    /// 入力プロンプトおよび質問内のプレースホルダーを変数補間した上で、
+    /// `tokio::task::spawn_blocking` により推論エンジンを呼び出すタスクを生成する。
+    ///
+    /// # 引数
+    /// - `initial_state`: 初期入力テキスト。
+    /// - `raw_question`: 未補間の質問仕様。
+    /// - `context`: 現在のノード実行コンテキスト。
+    /// - `scratch_state`: プロンプト補間用のスクラッチバッファ。
+    fn spawn_inference_task(
+        &self,
+        initial_state: &str,
+        raw_question: &Question,
+        context: &IndexMap<String, NodeContextValue>,
+        scratch_state: &mut String,
+    ) -> tokio::task::JoinHandle<Result<Answer, RuntimeError>> {
+        interpolate_prompt(initial_state, context, scratch_state);
+        let interpolated_question = interpolate_question(raw_question, context);
+
+        let engine = self.engine.clone();
+        let tokenizer = self.tokenizer.clone();
+        let calib_config = self.calib_config.clone();
+        let current_state = scratch_state.clone();
+
+        tokio::task::spawn_blocking(move || {
+            engine.predict_single_question(
+                &tokenizer,
+                &current_state,
+                &interpolated_question,
+                &calib_config,
+            )
+        })
+    }
+
+    /// 単一推論タスクの終了を待機し、Answer または DagError を返却する。
+    ///
+    /// # 引数
+    /// - `handle`: 推論タスクの JoinHandle。
+    /// - `error_context`: スレッド結合失敗時のエラー文脈文字列。
+    async fn await_inference_task(
+        handle: tokio::task::JoinHandle<Result<Answer, RuntimeError>>,
+        error_context: &str,
+    ) -> Result<Answer, DagError> {
+        handle
+            .await
+            .map_err(|e| DagError::ExecutionFailed(format!("{error_context}: {e}。")))?
+            .map_err(DagError::Runtime)
     }
 }
 

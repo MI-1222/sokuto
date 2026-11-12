@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use sokuto_core::schema::{Criteria, Question, QuestionType};
 
 use crate::dag::executor::{ConditionField, ContextProp};
+use crate::dag::interpolate::extract_placeholders;
 use crate::dag::schema::{DagDefinition, DagNode, DagNodeType, NodeCondition, NodeConditionOp};
 
 /// DAG 静的検証で発生するエラー型。
@@ -59,6 +60,17 @@ pub enum DagValidationError {
         /// 理由説明文。
         reason: String,
     },
+
+    /// プロンプト補間変数 `{node_id.prop}` の参照先またはプロパティ名が不正。
+    #[error("ノード '{node_id}' のプロンプト補間変数 '{{{placeholder}}}' が不正です: {reason}。")]
+    InvalidInterpolation {
+        /// 補間変数を含むノード ID。
+        node_id: String,
+        /// 不正なプレースホルダー文字列。
+        placeholder: String,
+        /// 理由説明文。
+        reason: String,
+    },
 }
 
 /// DAG 定義の整合性と無閉路性を静的に検証する。
@@ -71,6 +83,7 @@ pub enum DagValidationError {
 /// 5. DFS による有向グラフの閉路 (サイクル) 検出。
 /// 6. `entry_node` から全ノードへの到達性確認。
 /// 7. 各条件式のフィールド・上流参照・型整合性検証。
+/// 8. 全 Inference ノードのプロンプト補間変数 (`{node_id.prop}`) の参照先実在性・プロパティ名・上流先行性検証。
 pub fn validate_dag(dag: &DagDefinition) -> Result<(), DagValidationError> {
     if dag.nodes.is_empty() {
         return Err(DagValidationError::EmptyNodes);
@@ -257,8 +270,35 @@ pub fn validate_dag(dag: &DagDefinition) -> Result<(), DagValidationError> {
         return Err(DagValidationError::UnreachableNodes(unreachable));
     }
 
-    // 5. 条件式の静的検証 (フィールド妥当性・先祖参照・型整合性)
-    validate_node_conditions(dag, &adj)?;
+    // 5. 逆隣接リストおよび先祖関係 (上流先行ノード集合) マップの構築
+    let mut rev_adj: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (&u, neighbors) in &adj {
+        for &v in neighbors {
+            rev_adj.entry(v).or_default().push(u);
+        }
+    }
+
+    let mut ancestors: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for node_id in dag.nodes.keys().map(String::as_str) {
+        let mut anc_set = HashSet::new();
+        let mut q = vec![node_id];
+        while let Some(curr) = q.pop() {
+            if let Some(preds) = rev_adj.get(curr) {
+                for &pred in preds {
+                    if anc_set.insert(pred) {
+                        q.push(pred);
+                    }
+                }
+            }
+        }
+        ancestors.insert(node_id, anc_set);
+    }
+
+    // 6. 条件式の静的検証 (フィールド妥当性・先祖参照・型整合性)
+    validate_node_conditions(dag, &ancestors, &rev_adj)?;
+
+    // 7. プロンプト補間変数の静的検証 (参照先実在性・プロパティ名・上流先行性)
+    validate_prompt_interpolations(dag, &ancestors)?;
 
     Ok(())
 }
@@ -329,40 +369,118 @@ fn resolve_target_question<'a>(
 /// 各ノードの条件式リスト (`conditions`) に対し、フィールド妥当性・先祖参照・型整合性を静的検証する。
 fn validate_node_conditions(
     dag: &DagDefinition,
-    adj: &HashMap<&str, Vec<&str>>,
+    ancestors: &HashMap<&str, HashSet<&str>>,
+    rev_adj: &HashMap<&str, Vec<&str>>,
 ) -> Result<(), DagValidationError> {
-    // 逆隣接リストの構築
-    let mut rev_adj: HashMap<&str, Vec<&str>> = HashMap::new();
-    for (&u, neighbors) in adj {
-        for &v in neighbors {
-            rev_adj.entry(v).or_default().push(u);
-        }
-    }
-
-    // 先祖関係 (上流先行ノード集合) マップの構築
-    let mut ancestors: HashMap<&str, HashSet<&str>> = HashMap::new();
-    for node_id in dag.nodes.keys().map(String::as_str) {
-        let mut anc_set = HashSet::new();
-        let mut q = vec![node_id];
-        while let Some(curr) = q.pop() {
-            if let Some(preds) = rev_adj.get(curr) {
-                for &pred in preds {
-                    if anc_set.insert(pred) {
-                        q.push(pred);
-                    }
-                }
-            }
-        }
-        ancestors.insert(node_id, anc_set);
-    }
-
-    // 各ノードの各条件式を静的検査
     for (node_id, node) in &dag.nodes {
         for cond in &node.conditions {
-            validate_single_condition(node_id, node, cond, dag, &ancestors, &rev_adj)?;
+            validate_single_condition(node_id, node, cond, dag, ancestors, rev_adj)?;
         }
     }
 
+    Ok(())
+}
+
+/// 全 Inference ノードの Instructions および Criteria におけるプロンプト補間変数 (`{node_id.prop}`) を静的検証する。
+fn validate_prompt_interpolations(
+    dag: &DagDefinition,
+    ancestors: &HashMap<&str, HashSet<&str>>,
+) -> Result<(), DagValidationError> {
+    for (node_id, node) in &dag.nodes {
+        if node.node_type != DagNodeType::Inference {
+            continue;
+        }
+        let Some(ref question) = node.question else {
+            continue;
+        };
+
+        // instructions 内の補間変数検証
+        validate_template_placeholders(node_id, &question.instructions, dag, ancestors)?;
+
+        // criteria 内の補間変数検証
+        match &question.criteria {
+            Some(Criteria::Map(map)) => {
+                for desc in map.values() {
+                    validate_template_placeholders(node_id, desc, dag, ancestors)?;
+                }
+            }
+            Some(Criteria::List(list)) => {
+                for item in list {
+                    validate_template_placeholders(node_id, item, dag, ancestors)?;
+                }
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_template_placeholders(
+    node_id: &str,
+    template: &str,
+    dag: &DagDefinition,
+    ancestors: &HashMap<&str, HashSet<&str>>,
+) -> Result<(), DagValidationError> {
+    let placeholders = extract_placeholders(template);
+    for ph in placeholders {
+        let placeholder = ph.as_str();
+
+        if let Some(prop) = ph.prop
+            && !matches!(prop, "value" | "answer" | "confidence")
+        {
+            return Err(DagValidationError::InvalidInterpolation {
+                node_id: node_id.to_string(),
+                placeholder,
+                reason: format!(
+                    "不正なプロパティ名 '{prop}' です。'value', 'answer', 'confidence' のいずれかを指定してください。"
+                ),
+            });
+        }
+
+        let Some(ref_node) = dag.nodes.get(ph.node_id) else {
+            return Err(DagValidationError::InvalidInterpolation {
+                node_id: node_id.to_string(),
+                placeholder,
+                reason: format!(
+                    "参照先ノード '{}' が nodes マップ内に存在しません。",
+                    ph.node_id
+                ),
+            });
+        };
+
+        if ref_node.node_type != DagNodeType::Inference {
+            return Err(DagValidationError::InvalidInterpolation {
+                node_id: node_id.to_string(),
+                placeholder,
+                reason: format!(
+                    "参照先ノード '{}' ({:?}) は推論結果を出力する Inference ノードである必要があります。",
+                    ph.node_id, ref_node.node_type
+                ),
+            });
+        }
+
+        if ph.node_id == node_id {
+            return Err(DagValidationError::InvalidInterpolation {
+                node_id: node_id.to_string(),
+                placeholder,
+                reason: format!("ノード '{node_id}' から自身を自己参照補間することはできません。"),
+            });
+        }
+
+        if !ancestors
+            .get(node_id)
+            .is_some_and(|anc| anc.contains(ph.node_id))
+        {
+            return Err(DagValidationError::InvalidInterpolation {
+                node_id: node_id.to_string(),
+                placeholder,
+                reason: format!(
+                    "参照先ノード '{}' は現在のノード '{node_id}' の上流 (先行実行パス) に存在する必要があります。",
+                    ph.node_id
+                ),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -1118,6 +1236,206 @@ mod tests {
         assert!(matches!(
             validate_dag(&dag_route),
             Err(DagValidationError::InvalidCondition { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_dag_valid_interpolations() {
+        let mut nodes = IndexMap::new();
+        nodes.insert(
+            "node1".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_noul("最初の質問？".to_string())),
+                conditions: vec![NodeCondition {
+                    field: "confidence".to_string(),
+                    op: NodeConditionOp::Gte,
+                    value: Some(serde_json::json!(0.5)),
+                    target_node: "node2".to_string(),
+                }],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+
+        let mut criteria = IndexMap::new();
+        criteria.insert(
+            "opt_a".to_string(),
+            "先行判定 {node1.value} (確信度: {node1.confidence}) に基づく".to_string(),
+        );
+        nodes.insert(
+            "node2".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_choice(
+                    "先行値={node1.answer} を考慮した質問".to_string(),
+                    criteria,
+                )),
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+
+        let dag = DagDefinition {
+            dag_id: "valid_interp_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "node1".to_string(),
+            nodes,
+        };
+        assert!(validate_dag(&dag).is_ok());
+    }
+
+    #[test]
+    fn test_validate_dag_rejects_invalid_interpolations() {
+        // 1. 未定義ノード補間
+        let mut nodes1 = IndexMap::new();
+        nodes1.insert(
+            "node1".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_noul("参照={ghost.value}".to_string())),
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        let dag1 = DagDefinition {
+            dag_id: "ghost_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "node1".to_string(),
+            nodes: nodes1,
+        };
+        let err1 = validate_dag(&dag1).expect_err("未定義ノード補間は拒否されること。");
+        assert!(matches!(
+            err1,
+            DagValidationError::InvalidInterpolation {
+                ref node_id,
+                ref placeholder,
+                ..
+            } if node_id == "node1" && placeholder == "ghost.value"
+        ));
+
+        // 2. 自己参照補間
+        let mut nodes2 = IndexMap::new();
+        nodes2.insert(
+            "self_node".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_noul("自己={self_node.value}".to_string())),
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        let dag2 = DagDefinition {
+            dag_id: "self_interp_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "self_node".to_string(),
+            nodes: nodes2,
+        };
+        let err2 = validate_dag(&dag2).expect_err("自己参照補間は拒否されること。");
+        assert!(matches!(
+            err2,
+            DagValidationError::InvalidInterpolation {
+                ref node_id,
+                ref placeholder,
+                ..
+            } if node_id == "self_node" && placeholder == "self_node.value"
+        ));
+
+        // 3. 不正プロパティ名補間
+        let mut nodes3 = IndexMap::new();
+        nodes3.insert(
+            "n1".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_noul("Q1".to_string())),
+                conditions: vec![NodeCondition {
+                    field: "route".to_string(),
+                    op: NodeConditionOp::Eq,
+                    value: Some(serde_json::json!("auto_execute")),
+                    target_node: "n2".to_string(),
+                }],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        nodes3.insert(
+            "n2".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_noul("不正プロパティ={n1.bogus}".to_string())),
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        let dag3 = DagDefinition {
+            dag_id: "bad_prop_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "n1".to_string(),
+            nodes: nodes3,
+        };
+        let err3 = validate_dag(&dag3).expect_err("不正プロパティ名補間は拒否されること。");
+        assert!(matches!(
+            err3,
+            DagValidationError::InvalidInterpolation {
+                ref node_id,
+                ref placeholder,
+                ..
+            } if node_id == "n2" && placeholder == "n1.bogus"
+        ));
+
+        // 4. 下流ノード参照補間
+        let mut nodes4 = IndexMap::new();
+        nodes4.insert(
+            "first".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_noul("下流参照={second.value}".to_string())),
+                conditions: vec![NodeCondition {
+                    field: "route".to_string(),
+                    op: NodeConditionOp::Eq,
+                    value: Some(serde_json::json!("auto_execute")),
+                    target_node: "second".to_string(),
+                }],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        nodes4.insert(
+            "second".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_noul("Q2".to_string())),
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        let dag4 = DagDefinition {
+            dag_id: "downstream_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "first".to_string(),
+            nodes: nodes4,
+        };
+        let err4 = validate_dag(&dag4).expect_err("下流ノード補間は拒否されること。");
+        assert!(matches!(
+            err4,
+            DagValidationError::InvalidInterpolation {
+                ref node_id,
+                ref placeholder,
+                ..
+            } if node_id == "first" && placeholder == "second.value"
         ));
     }
 }

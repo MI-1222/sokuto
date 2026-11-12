@@ -28,6 +28,52 @@ impl NodeContextValue {
     }
 }
 
+/// テンプレート内のプレースホルダー情報。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PromptPlaceholder<'a> {
+    /// 参照先ノード ID。
+    pub node_id: &'a str,
+    /// 参照プロパティ名 (例: `"value"`, `"answer"`, `"confidence"`、省略時は `None`)。
+    pub prop: Option<&'a str>,
+}
+
+impl<'a> PromptPlaceholder<'a> {
+    /// プレースホルダーの文字列表現を返却する。
+    pub fn as_str(&self) -> String {
+        match self.prop {
+            Some(p) => format!("{}.{p}", self.node_id),
+            None => self.node_id.to_string(),
+        }
+    }
+}
+
+/// テンプレート文字列内の `{...}` プレースホルダーを走査・抽出する。
+pub(crate) fn extract_placeholders(template: &str) -> Vec<PromptPlaceholder<'_>> {
+    let mut placeholders = Vec::new();
+    let mut cursor = 0;
+    while let Some(open) = template[cursor..].find('{') {
+        let open_idx = cursor + open;
+        let Some(close) = template[open_idx..].find('}') else {
+            break;
+        };
+        let close_idx = open_idx + close;
+        let key = &template[open_idx + 1..close_idx];
+        if let Some((node_id, prop)) = key.split_once('.') {
+            placeholders.push(PromptPlaceholder {
+                node_id,
+                prop: Some(prop),
+            });
+        } else {
+            placeholders.push(PromptPlaceholder {
+                node_id: key,
+                prop: None,
+            });
+        }
+        cursor = close_idx + 1;
+    }
+    placeholders
+}
+
 /// テンプレート文字列をスライス走査し、事前確保済みバッファへインプレース展開する。
 ///
 /// プレースホルダー `{node_id.value}`, `{node_id.answer}`, `{node_id.confidence}` を
@@ -216,5 +262,24 @@ mod tests {
         } else {
             panic!("Criteria が Map である必要があります。");
         }
+    }
+
+    #[test]
+    fn test_extract_placeholders() {
+        let template =
+            "こんにちは {user.name} さん。確信度={user.confidence}、スコア={score}、未終了 {broken";
+        let placeholders = extract_placeholders(template);
+        assert_eq!(placeholders.len(), 3);
+        assert_eq!(placeholders[0].node_id, "user");
+        assert_eq!(placeholders[0].prop, Some("name"));
+        assert_eq!(placeholders[0].as_str(), "user.name");
+
+        assert_eq!(placeholders[1].node_id, "user");
+        assert_eq!(placeholders[1].prop, Some("confidence"));
+        assert_eq!(placeholders[1].as_str(), "user.confidence");
+
+        assert_eq!(placeholders[2].node_id, "score");
+        assert_eq!(placeholders[2].prop, None);
+        assert_eq!(placeholders[2].as_str(), "score");
     }
 }

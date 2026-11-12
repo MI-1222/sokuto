@@ -7,7 +7,7 @@ use indexmap::IndexMap;
 use sokuto_core::contract::CalibrationConfig;
 use sokuto_core::decision::evaluate_question_with_buf;
 use sokuto_core::gating::GatingConfig;
-use sokuto_core::schema::{Answer, Question};
+use sokuto_core::schema::{Answer, Question, QuestionType};
 
 use crate::engine::coarse::{
     CoarseScorer, CoarseToFineConfig, LexicalCoarseScorer, filter_top_candidates,
@@ -18,7 +18,7 @@ use crate::engine::gating::{
     calculate_choice_energy_with_config, evaluate_and_gate_answer_with_buf,
 };
 use crate::engine::session::InferenceEngine;
-use crate::error::Result;
+use crate::error::{Result, RuntimeError};
 use crate::hierarchical::{
     CoarseToFineRouter, HierarchicalMapping, HierarchicalResult, HierarchicalRouterConfig,
 };
@@ -779,6 +779,12 @@ impl InferenceEngine {
     ///
     /// # 戻り値
     /// 各質問キーと階層推論結果 (`HierarchicalResult`) の順序付きマップ。
+    ///
+    /// # エラー
+    /// - いずれかの質問が [`QuestionType::Choice`] ではない場合。
+    /// - 質問の `criteria` が Map 形式ではない、あるいは空の場合。
+    /// - 質問の候補キーが階層オントロジーの細分類定義に含まれていない場合。
+    /// - ルーター構築または推論実行に失敗した場合。
     #[allow(clippy::too_many_arguments)]
     pub fn evaluate_batch_questions_hierarchical(
         &self,
@@ -790,6 +796,12 @@ impl InferenceEngine {
         config: HierarchicalRouterConfig,
         gating_config: Option<&GatingConfig>,
     ) -> Result<IndexMap<String, HierarchicalResult>> {
+        if questions.is_empty() {
+            return Ok(IndexMap::new());
+        }
+
+        validate_hierarchical_questions(questions, mapping)?;
+
         let router = CoarseToFineRouter::new(self, tokenizer, mapping, calib_config, config)?;
         let mut results = IndexMap::with_capacity(questions.len());
 
@@ -800,6 +812,51 @@ impl InferenceEngine {
 
         Ok(results)
     }
+}
+
+/// 階層ルーティング推論に渡された質問群が階層オントロジーおよび Choice 型に適合しているかを検証する。
+///
+/// # 検証項目
+/// - すべての質問が [`QuestionType::Choice`] であること。
+/// - `criteria` が指定されている場合、Map 形式かつ非空であること。
+/// - `criteria` に指定された候補キーがすべて [`HierarchicalMapping`] の細分類オントロジーに含まれていること。
+fn validate_hierarchical_questions(
+    questions: &IndexMap<String, Question>,
+    mapping: &HierarchicalMapping,
+) -> Result<()> {
+    for (q_key, question) in questions {
+        if question.question_type != QuestionType::Choice {
+            return Err(RuntimeError::InvalidQuestion(format!(
+                "階層ルーティング対象の質問 '{q_key}' は Choice 型である必要がありますが、{:?} が指定されました。",
+                question.question_type
+            )));
+        }
+
+        if let Some(ref criteria) = question.criteria {
+            let map = criteria.as_map().ok_or_else(|| {
+                RuntimeError::InvalidQuestion(format!(
+                    "階層ルーティング対象の質問 '{q_key}' の criteria は Map 形式である必要があります。"
+                ))
+            })?;
+
+            if map.is_empty() {
+                return Err(RuntimeError::InvalidQuestion(format!(
+                    "階層ルーティング対象の質問 '{q_key}' の criteria が空です。"
+                )));
+            }
+
+            for cand_key in map.keys() {
+                if !mapping.fine_to_coarse.contains_key(cand_key) {
+                    return Err(RuntimeError::InvalidQuestion(format!(
+                        "質問 '{q_key}' の候補キー '{cand_key}' は階層オントロジー '{}' の細分類に含まれていません。",
+                        mapping.name
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// バッチ推論結果の決定解決およびゲーティング適用に必要な共通コンテキスト。
@@ -1511,5 +1568,97 @@ mod tests {
             effective_single_model_chunk_size(Some(1), very_long_len),
             Some(1)
         );
+    }
+
+    #[test]
+    fn test_validate_hierarchical_questions() {
+        let mapping = HierarchicalMapping::banking77();
+
+        // 1. criteria が None の Choice 質問は正常に通過すること。
+        let mut questions_none = IndexMap::new();
+        questions_none.insert(
+            "q_choice_none".to_string(),
+            Question {
+                question_type: QuestionType::Choice,
+                instructions: "カテゴリを選択。".to_string(),
+                criteria: None,
+            },
+        );
+        assert!(validate_hierarchical_questions(&questions_none, &mapping).is_ok());
+
+        // 2. criteria がオントロジー内の細分類キーを含む Choice 質問は正常に通過すること。
+        let mut valid_criteria = IndexMap::new();
+        valid_criteria.insert("lost_or_stolen_card".to_string(), "カード紛失".to_string());
+        valid_criteria.insert("card_arrival".to_string(), "カード未着".to_string());
+        let mut questions_valid = IndexMap::new();
+        questions_valid.insert(
+            "q_choice_valid".to_string(),
+            Question::new_choice("カード関連の問い合わせ。", valid_criteria),
+        );
+        assert!(validate_hierarchical_questions(&questions_valid, &mapping).is_ok());
+
+        // 3. Score 型の質問が含まれる場合は InvalidQuestion エラーとなること。
+        let mut questions_score = IndexMap::new();
+        questions_score.insert(
+            "q_score".to_string(),
+            Question::new_score("重要度評価。", vec!["低".to_string(), "高".to_string()]),
+        );
+        let err_score = validate_hierarchical_questions(&questions_score, &mapping)
+            .expect_err("Score 型の質問は拒否されること。");
+        assert!(matches!(err_score, RuntimeError::InvalidQuestion(_)));
+
+        // 4. Noul 型の質問が含まれる場合は InvalidQuestion エラーとなること。
+        let mut questions_noul = IndexMap::new();
+        questions_noul.insert("q_noul".to_string(), Question::new_noul("本人確認済みか。"));
+        let err_noul = validate_hierarchical_questions(&questions_noul, &mapping)
+            .expect_err("Noul 型の質問は拒否されること。");
+        assert!(matches!(err_noul, RuntimeError::InvalidQuestion(_)));
+
+        // 5. criteria が List 形式の Choice 質問は InvalidQuestion エラーとなること。
+        let mut questions_invalid_criteria_type = IndexMap::new();
+        questions_invalid_criteria_type.insert(
+            "q_list_criteria".to_string(),
+            Question {
+                question_type: QuestionType::Choice,
+                instructions: "不正形式。".to_string(),
+                criteria: Some(sokuto_core::schema::Criteria::List(vec!["a".to_string()])),
+            },
+        );
+        let err_list_criteria =
+            validate_hierarchical_questions(&questions_invalid_criteria_type, &mapping)
+                .expect_err("List 形式の criteria は拒否されること。");
+        assert!(matches!(
+            err_list_criteria,
+            RuntimeError::InvalidQuestion(_)
+        ));
+
+        // 6. criteria が空マップの Choice 質問は InvalidQuestion エラーとなること。
+        let mut questions_empty_criteria = IndexMap::new();
+        questions_empty_criteria.insert(
+            "q_empty_criteria".to_string(),
+            Question::new_choice("空マップ。", IndexMap::new()),
+        );
+        let err_empty_criteria =
+            validate_hierarchical_questions(&questions_empty_criteria, &mapping)
+                .expect_err("空の criteria マップは拒否されること。");
+        assert!(matches!(
+            err_empty_criteria,
+            RuntimeError::InvalidQuestion(_)
+        ));
+
+        // 7. criteria にオントロジー外の細分類キーが含まれる場合は InvalidQuestion エラーとなること。
+        let mut invalid_criteria = IndexMap::new();
+        invalid_criteria.insert(
+            "unknown_intent_category".to_string(),
+            "未知のカテゴリ".to_string(),
+        );
+        let mut questions_invalid_key = IndexMap::new();
+        questions_invalid_key.insert(
+            "q_unknown_key".to_string(),
+            Question::new_choice("オントロジー外。", invalid_criteria),
+        );
+        let err_unknown_key = validate_hierarchical_questions(&questions_invalid_key, &mapping)
+            .expect_err("オントロジー外のキーは拒否されること。");
+        assert!(matches!(err_unknown_key, RuntimeError::InvalidQuestion(_)));
     }
 }

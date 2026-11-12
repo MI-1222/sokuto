@@ -334,7 +334,7 @@ fn test_evaluate_batch_questions_hierarchical() {
             &questions,
             &mapping,
             &calib_config,
-            config,
+            config.clone(),
             None,
         )
         .expect("バッチ階層推論の実行に成功する。");
@@ -342,6 +342,31 @@ fn test_evaluate_batch_questions_hierarchical() {
     assert_eq!(batch_results.len(), 2);
     assert!(batch_results.get("q1").unwrap().answer().is_choice());
     assert!(batch_results.get("q2").unwrap().answer().is_choice());
+
+    // 不正な質問種別 (Score 型) が渡された場合は InvalidQuestion エラーとなること。
+    let mut invalid_questions = indexmap::IndexMap::new();
+    invalid_questions.insert(
+        "q_score".to_string(),
+        sokuto_core::schema::Question::new_score(
+            "スコア評価。",
+            vec!["1".to_string(), "2".to_string()],
+        ),
+    );
+    let err_batch = engine
+        .evaluate_batch_questions_hierarchical(
+            &tokenizer,
+            state,
+            &invalid_questions,
+            &mapping,
+            &calib_config,
+            config,
+            None,
+        )
+        .expect_err("Score 型の質問は拒否されること。");
+    assert!(matches!(
+        err_batch,
+        sokuto_runtime::error::RuntimeError::InvalidQuestion(_)
+    ));
 }
 
 #[test]

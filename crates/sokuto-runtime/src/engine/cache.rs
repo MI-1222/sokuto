@@ -7,6 +7,7 @@
 //! 64バイトメモリアライメント、および `Tokio` ワーカースレッド競合隔離を提供する。
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
+use std::borrow::{Borrow, BorrowMut};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
@@ -152,6 +153,30 @@ impl<T: Copy> DerefMut for AlignedBuffer64<T> {
             // SAFETY: 排他的借用下で有効な割り当て領域と要素数を保持している。
             unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
         }
+    }
+}
+
+impl<T: Copy> AsRef<[T]> for AlignedBuffer64<T> {
+    fn as_ref(&self) -> &[T] {
+        self.deref()
+    }
+}
+
+impl<T: Copy> AsMut<[T]> for AlignedBuffer64<T> {
+    fn as_mut(&mut self) -> &mut [T] {
+        self.deref_mut()
+    }
+}
+
+impl<T: Copy> Borrow<[T]> for AlignedBuffer64<T> {
+    fn borrow(&self) -> &[T] {
+        self.deref()
+    }
+}
+
+impl<T: Copy> BorrowMut<[T]> for AlignedBuffer64<T> {
+    fn borrow_mut(&mut self) -> &mut [T] {
+        self.deref_mut()
     }
 }
 
@@ -1519,6 +1544,39 @@ mod tests {
     #[should_panic(expected = "ZST はサポートされていません。")]
     fn test_aligned_buffer64_zst_panic() {
         let _ = AlignedBuffer64::<()>::with_capacity_zeroed(1);
+    }
+
+    #[test]
+    fn test_aligned_buffer64_slice_traits() {
+        fn sum_as_ref(buf: impl AsRef<[f32]>) -> f32 {
+            buf.as_ref().iter().sum()
+        }
+        fn scale_as_mut(mut buf: impl AsMut<[f32]>, factor: f32) {
+            for v in buf.as_mut() {
+                *v *= factor;
+            }
+        }
+        fn sum_borrow(buf: &impl Borrow<[f32]>) -> f32 {
+            buf.borrow().iter().sum()
+        }
+        fn add_borrow_mut(buf: &mut impl BorrowMut<[f32]>, delta: f32) {
+            for v in buf.borrow_mut() {
+                *v += delta;
+            }
+        }
+
+        let mut buf = AlignedBuffer64::from_slice(&[1.0f32, 2.0, 3.0]);
+        assert!((sum_as_ref(&buf) - 6.0).abs() < 1e-6);
+        assert!((sum_borrow(&buf) - 6.0).abs() < 1e-6);
+
+        scale_as_mut(&mut buf, 2.0);
+        assert_eq!(buf.as_ref(), &[2.0, 4.0, 6.0]);
+
+        add_borrow_mut(&mut buf, 1.0);
+        assert_eq!(
+            <AlignedBuffer64<f32> as Borrow<[f32]>>::borrow(&buf),
+            &[3.0, 5.0, 7.0]
+        );
     }
 
     #[test]

@@ -456,20 +456,38 @@ impl InferenceEngine {
         } = prepare_coarse_questions(state, questions, coarse_config, scorer)?;
 
         // バッチ推論を実行 (最大候補数 K_max が縮小された状態で単一フォワードパス)
-        let mut answers =
-            self.evaluate_batch_questions(tokenizer, state, &processed_questions, calib_config)?;
+        let batch = tokenizer.encode_batch_questions(state, &processed_questions)?;
+        let total_logits = batch.dims.batch_size * batch.dims.num_options;
+        let mut flat_logits = vec![0.0f64; total_logits];
+        self.forward_batch_tokenized_into(&batch, &mut flat_logits)?;
 
-        // スクリーニングされた質問の確率マップ・複合確信度を全候補空間に復元し、ゲーティングを再適用
+        let mut answers = IndexMap::with_capacity(questions.len());
+        let mut probs_buf = vec![0.0f64; batch.dims.num_options];
+        let mut coarse_energies: IndexMap<String, Option<f64>> =
+            IndexMap::with_capacity(original_keys_map.len());
         let ctx = BatchEvalContext {
             state,
             calib_config,
             gating_config: None,
         };
+
+        resolve_coarse_batch_chunk(
+            &ctx,
+            &batch,
+            &processed_questions,
+            questions,
+            &original_keys_map,
+            &flat_logits,
+            &mut probs_buf,
+            &mut coarse_energies,
+            &mut answers,
+        )?;
+
         reconstruct_and_gate_batch_answers(
             &ctx,
             questions,
             &original_keys_map,
-            None,
+            &coarse_energies,
             &mut answers,
         )?;
 
@@ -611,44 +629,17 @@ impl InferenceEngine {
             self.forward_batch_tokenized_into(&batch, &mut flat_logits)?;
 
             let mut probs_buf = vec![0.0f64; batch.dims.num_options];
-            let num_options = batch.dims.num_options;
-
-            for (i, q_key) in batch.question_keys.iter().enumerate() {
-                let k_i = batch.candidate_counts[i];
-                let start_idx = i * num_options;
-                let valid_logits = &flat_logits[start_idx..start_idx + k_i];
-                let question = sub_questions
-                    .get(q_key)
-                    .expect("キーの一致が保証されている。");
-
-                let answer = if !original_keys_map.contains_key(q_key) {
-                    let orig_q = questions.get(q_key).unwrap_or(question);
-                    resolve_and_gate_answer(
-                        &ctx,
-                        q_key,
-                        orig_q,
-                        valid_logits,
-                        &mut probs_buf[..k_i],
-                    )?
-                } else {
-                    let answer = evaluate_question_with_buf(
-                        question,
-                        valid_logits,
-                        calib_config,
-                        &mut probs_buf[..k_i],
-                        Some(q_key.as_str()),
-                    )?;
-                    let energy = calculate_choice_energy_with_config(
-                        question,
-                        valid_logits,
-                        calib_config,
-                        gating_config,
-                    );
-                    coarse_energies.insert(q_key.clone(), energy);
-                    answer
-                };
-                answers.insert(q_key.clone(), answer);
-            }
+            resolve_coarse_batch_chunk(
+                &ctx,
+                &batch,
+                &sub_questions,
+                questions,
+                &original_keys_map,
+                &flat_logits,
+                &mut probs_buf,
+                &mut coarse_energies,
+                &mut answers,
+            )?;
         }
 
         // 4. スクリーニングされた質問の確率マップ・複合確信度を全候補空間に復元し、ゲーティングを適用
@@ -656,7 +647,7 @@ impl InferenceEngine {
             &ctx,
             questions,
             &original_keys_map,
-            Some(&coarse_energies),
+            &coarse_energies,
             &mut answers,
         )?;
 
@@ -825,29 +816,86 @@ fn prepare_coarse_questions<S: CoarseScorer>(
     })
 }
 
+/// 粗密バッチ推論の 1 チャンク分の生ロジットから決定解決を行い、スクリーニング対象外の質問は即座にゲーティングを適用する。
+///
+/// スクリーニング対象の質問は後続の全候補空間復元後にゲーティングを行うため、この段階では決定解決と自由エネルギーの事前算出のみを行う。
+///
+/// # 引数
+/// - `ctx`: 状態テキスト・較正設定・ゲーティング設定を保持する評価コンテキスト。
+/// - `batch`: トークナイズ済みバッチ情報。
+/// - `chunk_questions`: 縮小済み質問定義マップ (当チャンク分)。
+/// - `original_questions`: 元の全候補を含む質問定義マップ。
+/// - `original_keys_map`: 粗密スクリーニング対象となった質問の元候補キー配列マップ。
+/// - `flat_logits`: 平坦化されたバッチ生ロジット列。
+/// - `probs_buf`: Softmax 確率分布計算用の一時バッファ。
+/// - `coarse_energies`: 事前算出した自由エネルギー値の格納先マップ。
+/// - `answers`: 解決済み `Answer` の格納先マップ。
+#[allow(clippy::too_many_arguments)]
+fn resolve_coarse_batch_chunk(
+    ctx: &BatchEvalContext<'_>,
+    batch: &BatchTokenizedQuestions,
+    chunk_questions: &IndexMap<String, Question>,
+    original_questions: &IndexMap<String, Question>,
+    original_keys_map: &IndexMap<String, Vec<String>>,
+    flat_logits: &[f64],
+    probs_buf: &mut [f64],
+    coarse_energies: &mut IndexMap<String, Option<f64>>,
+    answers: &mut IndexMap<String, Answer>,
+) -> Result<()> {
+    let num_options = batch.dims.num_options;
+    for (i, q_key) in batch.question_keys.iter().enumerate() {
+        let k_i = batch.candidate_counts[i];
+        let start_idx = i * num_options;
+        let valid_logits = &flat_logits[start_idx..start_idx + k_i];
+        let question = chunk_questions
+            .get(q_key)
+            .expect("キーの一致が保証されている。");
+
+        let answer = if !original_keys_map.contains_key(q_key) {
+            let orig_q = original_questions.get(q_key).unwrap_or(question);
+            resolve_and_gate_answer(ctx, q_key, orig_q, valid_logits, &mut probs_buf[..k_i])?
+        } else {
+            let answer = evaluate_question_with_buf(
+                question,
+                valid_logits,
+                ctx.calib_config,
+                &mut probs_buf[..k_i],
+                Some(q_key.as_str()),
+            )?;
+            let energy = calculate_choice_energy_with_config(
+                question,
+                valid_logits,
+                ctx.calib_config,
+                ctx.gating_config,
+            );
+            coarse_energies.insert(q_key.clone(), energy);
+            answer
+        };
+        answers.insert(q_key.clone(), answer);
+    }
+    Ok(())
+}
+
 /// 粗密探索で縮小推論された各質問の結果を全候補空間へ復元し、複合確信度の再計算とゲーティングを適用する。
 ///
 /// # 引数
 /// - `ctx`: 状態テキスト・較正設定・ゲーティング設定を保持する評価コンテキスト。
 /// - `questions`: 元の全候補を含む質問定義マップ。
 /// - `original_keys_map`: 粗密スクリーニング対象となった質問の元候補キー配列マップ。
-/// - `energies`: 事前算出された自由エネルギーマップ (`None` の場合は各 `Answer` 既存の `gating.energy` を引き継ぐ)。
+/// - `energies`: 事前算出された自由エネルギーマップ。
 /// - `answers`: 復元・ゲーティング反映先の回答マップ。
 fn reconstruct_and_gate_batch_answers(
     ctx: &BatchEvalContext<'_>,
     questions: &IndexMap<String, Question>,
     original_keys_map: &IndexMap<String, Vec<String>>,
-    energies: Option<&IndexMap<String, Option<f64>>>,
+    energies: &IndexMap<String, Option<f64>>,
     answers: &mut IndexMap<String, Answer>,
 ) -> Result<()> {
     for (q_key, original_keys) in original_keys_map {
         if let Some(answer) = answers.get_mut(q_key)
             && answer.is_choice()
         {
-            let energy = match energies {
-                Some(map) => map.get(q_key).copied().flatten(),
-                None => answer.gating.as_ref().and_then(|g| g.energy),
-            };
+            let energy = energies.get(q_key).copied().flatten();
             reconstruct_and_gate_answer(
                 answer,
                 original_keys,
@@ -1166,5 +1214,113 @@ mod tests {
 
         assert!((actual_energy - expected_energy).abs() < 1e-12);
         assert!((actual_energy - fallback_energy).abs() > 1e-3);
+    }
+
+    #[test]
+    fn test_resolve_coarse_batch_chunk_defers_gating_until_reconstruction() {
+        let calib_config = CalibrationConfig::default();
+        let gating_config = GatingConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let ctx = BatchEvalContext {
+            state: "粗密バッチ文脈",
+            calib_config: &calib_config,
+            gating_config: Some(&gating_config),
+        };
+
+        let mut full_criteria = IndexMap::new();
+        full_criteria.insert("c1".to_string(), "候補1".to_string());
+        full_criteria.insert("c2".to_string(), "候補2".to_string());
+        full_criteria.insert("c3".to_string(), "候補3".to_string());
+        full_criteria.insert("c4".to_string(), "候補4".to_string());
+
+        let mut sub_criteria = IndexMap::new();
+        sub_criteria.insert("c3".to_string(), "候補3".to_string());
+        sub_criteria.insert("c4".to_string(), "候補4".to_string());
+
+        let mut original_questions = IndexMap::new();
+        original_questions.insert(
+            "q_coarse".to_string(),
+            Question::new_choice("大候補", full_criteria),
+        );
+        original_questions.insert("q_noul".to_string(), Question::new_noul("真偽?"));
+
+        let mut chunk_questions = IndexMap::new();
+        chunk_questions.insert(
+            "q_coarse".to_string(),
+            Question::new_choice("大候補", sub_criteria),
+        );
+        chunk_questions.insert("q_noul".to_string(), Question::new_noul("真偽?"));
+
+        let mut original_keys_map = IndexMap::new();
+        original_keys_map.insert(
+            "q_coarse".to_string(),
+            vec![
+                "c1".to_string(),
+                "c2".to_string(),
+                "c3".to_string(),
+                "c4".to_string(),
+            ],
+        );
+
+        let batch = BatchTokenizedQuestions {
+            input_ids: vec![],
+            attention_mask: vec![],
+            op_indices: vec![],
+            dims: ModelInputDimensions {
+                batch_size: 2,
+                sequence_length: 1,
+                num_options: 2,
+            },
+            question_keys: vec!["q_coarse".to_string(), "q_noul".to_string()],
+            candidate_counts: vec![2, 2],
+            option_keys_per_q: vec![
+                vec!["c3".to_string(), "c4".to_string()],
+                vec!["true".to_string(), "false".to_string()],
+            ],
+        };
+
+        let flat_logits = vec![4.0, -1.0, 6.0, 0.0];
+        let mut probs_buf = vec![0.0f64; 2];
+        let mut coarse_energies = IndexMap::new();
+        let mut answers = IndexMap::new();
+
+        resolve_coarse_batch_chunk(
+            &ctx,
+            &batch,
+            &chunk_questions,
+            &original_questions,
+            &original_keys_map,
+            &flat_logits,
+            &mut probs_buf,
+            &mut coarse_energies,
+            &mut answers,
+        )
+        .unwrap();
+
+        // スクリーニング対象質問はこの段階ではゲーティングされず、エネルギーのみ保持される
+        assert!(answers.get("q_coarse").unwrap().gating.is_none());
+        assert!(coarse_energies.get("q_coarse").and_then(|e| *e).is_some());
+        // スクリーニング対象外質問はこの段階で 1 度だけゲーティングされる
+        assert!(answers.get("q_noul").unwrap().gating.is_some());
+
+        reconstruct_and_gate_batch_answers(
+            &ctx,
+            &original_questions,
+            &original_keys_map,
+            &coarse_energies,
+            &mut answers,
+        )
+        .unwrap();
+
+        let coarse_ans = answers.get("q_coarse").unwrap();
+        assert_eq!(coarse_ans.probabilities().unwrap().len(), 4);
+        assert_eq!(coarse_ans.probabilities().unwrap().get("c1"), Some(&0.0));
+        assert!(coarse_ans.gating.is_some());
+        assert_eq!(
+            coarse_ans.gating.as_ref().unwrap().energy,
+            coarse_energies.get("q_coarse").copied().flatten()
+        );
     }
 }

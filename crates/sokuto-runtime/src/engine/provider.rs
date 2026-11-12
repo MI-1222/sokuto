@@ -18,6 +18,7 @@ pub fn register_execution_providers(
     preferred: &[ExecutionProvider],
     enable_mem_arena: bool,
 ) -> Result<ExecutionProvider> {
+    let mut explicit_cpu = false;
     for provider in preferred {
         match provider {
             ExecutionProvider::Auto => {
@@ -141,29 +142,74 @@ pub fn register_execution_providers(
                 }
             }
             ExecutionProvider::CPU => {
-                let ep = ort::ep::CPU::default().with_arena_allocator(enable_mem_arena);
-                ep.register(builder).map_err(|e| {
-                    RuntimeError::ExecutionProviderError(format!(
-                        "CPUExecutionProvider の登録に失敗しました: {e}。"
-                    ))
-                })?;
-                tracing::info!(
-                    "CPU Execution Provider が正常に登録されました (メモリアリーナ: {enable_mem_arena})。"
-                );
-                return Ok(ExecutionProvider::CPU);
+                explicit_cpu = true;
+                break;
             }
         }
     }
 
-    // いずれも成功しなかった場合の最終フォールバック
+    register_cpu_provider(builder, enable_mem_arena, !explicit_cpu)
+}
+
+/// CPU Execution Provider をセッションビルダーへ登録する共通ヘルパー。
+///
+/// ループ内で明示的な `ExecutionProvider::CPU` が選択された場合 (`is_fallback == false`) と、
+/// 優先リストに `CPU` が含まれないまま全アクセラレータ登録に失敗・未コンパイルとなった
+/// 最終フォールバック時 (`is_fallback == true`) の双方を単一経路で処理する。
+fn register_cpu_provider(
+    builder: &mut SessionBuilder,
+    enable_mem_arena: bool,
+    is_fallback: bool,
+) -> Result<ExecutionProvider> {
     let ep = ort::ep::CPU::default().with_arena_allocator(enable_mem_arena);
     ep.register(builder).map_err(|e| {
-        RuntimeError::ExecutionProviderError(format!(
-            "CPUExecutionProvider への最終フォールバックに失敗しました: {e}。"
-        ))
+        let context = if is_fallback {
+            "CPUExecutionProvider への最終フォールバックに失敗しました"
+        } else {
+            "CPUExecutionProvider の登録に失敗しました"
+        };
+        RuntimeError::ExecutionProviderError(format!("{context}: {e}。"))
     })?;
-    tracing::info!(
-        "CPU Execution Provider への最終フォールバックが完了しました (メモリアリーナ: {enable_mem_arena})。"
-    );
+    if is_fallback {
+        tracing::info!(
+            "CPU Execution Provider への最終フォールバックが完了しました (メモリアリーナ: {enable_mem_arena})。"
+        );
+    } else {
+        tracing::info!(
+            "CPU Execution Provider が正常に登録されました (メモリアリーナ: {enable_mem_arena})。"
+        );
+    }
     Ok(ExecutionProvider::CPU)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ort::session::Session;
+
+    #[test]
+    fn test_register_execution_providers_explicit_cpu_and_empty_fallback() {
+        let mut cpu_builder = Session::builder().expect("SessionBuilder 作成に成功すること。");
+        let ep_cpu =
+            register_execution_providers(&mut cpu_builder, &[ExecutionProvider::CPU], true)
+                .expect("明示的 CPU 指定で登録に成功すること。");
+        assert_eq!(ep_cpu, ExecutionProvider::CPU);
+
+        let mut empty_builder = Session::builder().expect("SessionBuilder 作成に成功すること。");
+        let ep_empty = register_execution_providers(&mut empty_builder, &[], false)
+            .expect("空リスト指定時も最終フォールバックで CPU 登録に成功すること。");
+        assert_eq!(ep_empty, ExecutionProvider::CPU);
+    }
+
+    #[test]
+    fn test_register_execution_providers_cpu_before_accelerator_respects_order() {
+        let mut builder = Session::builder().expect("SessionBuilder 作成に成功すること。");
+        let ep = register_execution_providers(
+            &mut builder,
+            &[ExecutionProvider::CPU, ExecutionProvider::CoreML],
+            true,
+        )
+        .expect("CPU 優先指定で登録に成功すること。");
+        assert_eq!(ep, ExecutionProvider::CPU);
+    }
 }

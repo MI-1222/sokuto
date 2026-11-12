@@ -11,6 +11,7 @@ use sokuto_core::decision::{
     evaluate_score_with_buf,
 };
 use sokuto_core::error::CoreError;
+use sokuto_core::gating::{GatingConfig, GatingPatch, GatingThresholdsPatch};
 use sokuto_core::schema::{Criteria, Question};
 
 /// 確率分布および確信度の極限状態を検証するテストモジュール。
@@ -532,5 +533,91 @@ mod deterministic_and_contract {
         assert!((ans_unbiased.as_noul().unwrap() - 0.7310585786300049).abs() < 1e-6);
         assert!((ans_biased.as_noul().unwrap() - 0.5).abs() < 1e-6);
         assert!(ans_biased.as_noul().unwrap() < ans_unbiased.as_noul().unwrap());
+    }
+
+    #[test]
+    fn test_choice_duplicate_and_empty_label_rejection() {
+        let logits = vec![1.0, 2.0];
+
+        // 1. 空文字キー
+        let mut map_empty_key = IndexMap::new();
+        map_empty_key.insert("".to_string(), "説明A".to_string());
+        map_empty_key.insert("b".to_string(), "説明B".to_string());
+        let err_empty_key =
+            evaluate_choice(&logits, &Criteria::Map(map_empty_key), 1.0).unwrap_err();
+        assert!(matches!(
+            err_empty_key,
+            CoreError::EmptyCriteriaLabel { .. }
+        ));
+
+        // 2. 空白のみキー
+        let mut map_ws_key = IndexMap::new();
+        map_ws_key.insert("   ".to_string(), "説明A".to_string());
+        map_ws_key.insert("b".to_string(), "説明B".to_string());
+        let err_ws_key = evaluate_choice(&logits, &Criteria::Map(map_ws_key), 1.0).unwrap_err();
+        assert!(matches!(err_ws_key, CoreError::EmptyCriteriaLabel { .. }));
+
+        // 3. 空白のみ説明文
+        let mut map_ws_desc = IndexMap::new();
+        map_ws_desc.insert("a".to_string(), "   ".to_string());
+        map_ws_desc.insert("b".to_string(), "説明B".to_string());
+        let err_ws_desc = evaluate_choice(&logits, &Criteria::Map(map_ws_desc), 1.0).unwrap_err();
+        assert!(matches!(err_ws_desc, CoreError::EmptyCriteriaLabel { .. }));
+
+        // 4. 重複説明文
+        let mut map_dup_desc = IndexMap::new();
+        map_dup_desc.insert("a".to_string(), "重複説明".to_string());
+        map_dup_desc.insert("b".to_string(), "重複説明".to_string());
+        let err_dup_desc = evaluate_choice(&logits, &Criteria::Map(map_dup_desc), 1.0).unwrap_err();
+        assert!(matches!(
+            err_dup_desc,
+            CoreError::DuplicateCriteriaLabel { ref label, .. } if label == "重複説明"
+        ));
+    }
+
+    #[test]
+    fn test_gating_patch_partial_merge_and_invalidation() {
+        let base = GatingConfig::default();
+
+        // 1. 部分パッチ適用による high_threshold のみの上書き
+        let patch = GatingPatch {
+            enabled: Some(true),
+            thresholds: GatingThresholdsPatch {
+                high_threshold: Some(0.92),
+                ..Default::default()
+            },
+        };
+        let merged = base
+            .apply_patch(&patch)
+            .expect("部分パッチのマージに成功すること。");
+        assert!(merged.enabled);
+        assert_eq!(merged.thresholds.high_threshold, 0.92);
+        assert_eq!(
+            merged.thresholds.low_threshold,
+            base.thresholds.low_threshold
+        );
+
+        // 2. 閾値逆転 (high < low) によるマージ後検証エラー
+        let invalid_patch = GatingPatch {
+            enabled: None,
+            thresholds: GatingThresholdsPatch {
+                high_threshold: Some(0.30),
+                low_threshold: Some(0.70),
+                ..Default::default()
+            },
+        };
+        let err = base.apply_patch(&invalid_patch).unwrap_err();
+        assert!(matches!(err, CoreError::InvalidGatingConfig { .. }));
+
+        // 3. OOD 3閾値の不完全パッチ指定による拒否
+        let incomplete_ood_patch = GatingPatch {
+            enabled: None,
+            thresholds: GatingThresholdsPatch {
+                ood_min_confidence: Some(0.40),
+                ..Default::default()
+            },
+        };
+        let err_ood = base.apply_patch(&incomplete_ood_patch).unwrap_err();
+        assert!(matches!(err_ood, CoreError::InvalidGatingConfig { .. }));
     }
 }

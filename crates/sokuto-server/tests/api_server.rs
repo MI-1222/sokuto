@@ -144,6 +144,20 @@ async fn test_metrics_and_openapi_endpoints() {
         .unwrap();
 
     assert_eq!(res.status(), StatusCode::OK);
+    let metrics_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let metrics_text = String::from_utf8_lossy(&metrics_bytes);
+    assert!(
+        metrics_text.contains("sokuto_requests_total"),
+        "初期メトリクス sokuto_requests_total が露出していること。"
+    );
+    assert!(
+        metrics_text.contains("sokuto_question_type_total"),
+        "初期メトリクス sokuto_question_type_total が露出していること。"
+    );
+    assert!(
+        metrics_text.contains("sokuto_gating_routes_total"),
+        "初期メトリクス sokuto_gating_routes_total が露出していること。"
+    );
 
     // 2. GET /api-docs/openapi.json
     let res = app

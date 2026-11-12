@@ -800,3 +800,166 @@ fn test_validate_dag_condition_rejections() {
         } if node_id == "q1" && field == "answer"
     ));
 }
+
+#[test]
+fn test_validate_dag_interpolation_rejections() {
+    use sokuto_runtime::dag::DagValidationError;
+
+    // 1. 未定義ノード補間 ({ghost.value}) の静的拒否
+    let mut nodes_ghost = IndexMap::new();
+    nodes_ghost.insert(
+        "q1".to_string(),
+        DagNode {
+            node_type: DagNodeType::Inference,
+            question: Some(Question::new_noul(
+                "前段結果 {ghost.value} に基づき判定せよ。".to_string(),
+            )),
+            conditions: vec![NodeCondition {
+                field: "answer".to_string(),
+                op: NodeConditionOp::Eq,
+                value: Some(serde_json::json!(true)),
+                target_node: "term".to_string(),
+            }],
+            parallel_nodes: Vec::new(),
+            join_node: None,
+            reason: None,
+        },
+    );
+    nodes_ghost.insert(
+        "term".to_string(),
+        DagNode {
+            node_type: DagNodeType::Escalate,
+            question: None,
+            conditions: Vec::new(),
+            parallel_nodes: Vec::new(),
+            join_node: None,
+            reason: None,
+        },
+    );
+    let dag_ghost = DagDefinition {
+        dag_id: "interpolate_ghost_test".to_string(),
+        timeout_ms: 100,
+        entry_node: "q1".to_string(),
+        nodes: nodes_ghost,
+    };
+    let err_ghost = validate_dag(&dag_ghost).expect_err("未定義ノード補間は拒否されること。");
+    assert!(matches!(
+        err_ghost,
+        DagValidationError::InvalidInterpolation {
+            ref node_id,
+            ref placeholder,
+            ..
+        } if node_id == "q1" && placeholder == "ghost.value"
+    ));
+
+    // 2. 自己参照 ({q1.value}) の静的拒否
+    let mut nodes_self = IndexMap::new();
+    nodes_self.insert(
+        "q1".to_string(),
+        DagNode {
+            node_type: DagNodeType::Inference,
+            question: Some(Question::new_noul(
+                "自己値 {q1.value} に基づき判定せよ。".to_string(),
+            )),
+            conditions: vec![NodeCondition {
+                field: "answer".to_string(),
+                op: NodeConditionOp::Eq,
+                value: Some(serde_json::json!(true)),
+                target_node: "term".to_string(),
+            }],
+            parallel_nodes: Vec::new(),
+            join_node: None,
+            reason: None,
+        },
+    );
+    nodes_self.insert(
+        "term".to_string(),
+        DagNode {
+            node_type: DagNodeType::Escalate,
+            question: None,
+            conditions: Vec::new(),
+            parallel_nodes: Vec::new(),
+            join_node: None,
+            reason: None,
+        },
+    );
+    let dag_self = DagDefinition {
+        dag_id: "interpolate_self_test".to_string(),
+        timeout_ms: 100,
+        entry_node: "q1".to_string(),
+        nodes: nodes_self,
+    };
+    let err_self = validate_dag(&dag_self).expect_err("自己参照補間は拒否されること。");
+    assert!(matches!(
+        err_self,
+        DagValidationError::InvalidInterpolation {
+            ref node_id,
+            ref placeholder,
+            ..
+        } if node_id == "q1" && placeholder == "q1.value"
+    ));
+
+    // 3. 上流逆転参照 (後続ノード {q2.value} を参照) の静的拒否
+    let mut nodes_forward = IndexMap::new();
+    nodes_forward.insert(
+        "q1".to_string(),
+        DagNode {
+            node_type: DagNodeType::Inference,
+            question: Some(Question::new_noul(
+                "後段結果 {q2.value} を参照。".to_string(),
+            )),
+            conditions: vec![NodeCondition {
+                field: "answer".to_string(),
+                op: NodeConditionOp::Eq,
+                value: Some(serde_json::json!(true)),
+                target_node: "q2".to_string(),
+            }],
+            parallel_nodes: Vec::new(),
+            join_node: None,
+            reason: None,
+        },
+    );
+    nodes_forward.insert(
+        "q2".to_string(),
+        DagNode {
+            node_type: DagNodeType::Inference,
+            question: Some(Question::new_noul("後段質問。".to_string())),
+            conditions: vec![NodeCondition {
+                field: "answer".to_string(),
+                op: NodeConditionOp::Eq,
+                value: Some(serde_json::json!(true)),
+                target_node: "term".to_string(),
+            }],
+            parallel_nodes: Vec::new(),
+            join_node: None,
+            reason: None,
+        },
+    );
+    nodes_forward.insert(
+        "term".to_string(),
+        DagNode {
+            node_type: DagNodeType::Escalate,
+            question: None,
+            conditions: Vec::new(),
+            parallel_nodes: Vec::new(),
+            join_node: None,
+            reason: None,
+        },
+    );
+    let dag_forward = DagDefinition {
+        dag_id: "interpolate_forward_test".to_string(),
+        timeout_ms: 100,
+        entry_node: "q1".to_string(),
+        nodes: nodes_forward,
+    };
+    let err_forward =
+        validate_dag(&dag_forward).expect_err("後続ノード参照 (逆転補間) は拒否されること。");
+    assert!(matches!(
+        err_forward,
+        DagValidationError::InvalidInterpolation {
+            ref node_id,
+            ref placeholder,
+            ..
+        } if node_id == "q1" && placeholder == "q2.value"
+    ));
+}

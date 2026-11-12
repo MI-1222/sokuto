@@ -349,3 +349,113 @@ async fn test_gating_metrics_recorded() {
         assert!(metrics_text.contains("sokuto_gating_routes_total"));
     }
 }
+
+/// Gating 部分指定 (GatingPatch) 時にベース設定が維持され正常適用されること、
+/// および逆転閾値のパッチ指定時に HTTP 400 で拒否されることの検証。
+#[tokio::test]
+async fn test_gating_partial_patch_application_and_rejection() {
+    let state = match init_test_app_state() {
+        Some(s) => s,
+        None => return,
+    };
+    let app = create_router(state, None);
+
+    let mut questions = IndexMap::new();
+    let mut criteria = IndexMap::new();
+    criteria.insert("refund".to_string(), "返金・注文キャンセル".to_string());
+    criteria.insert("inquiry".to_string(), "商品の仕様確認".to_string());
+    questions.insert(
+        "intent".to_string(),
+        Question {
+            question_type: sokuto_core::QuestionType::Choice,
+            instructions: "問い合わせ分類。".to_string(),
+            criteria: Some(Criteria::Map(criteria)),
+        },
+    );
+
+    // 1. enabled のみ true にし、閾値はベース設定を維持する部分パッチ
+    let partial_patch_payload = serde_json::json!({
+        "state": "返金してください。",
+        "questions": questions,
+        "gating": {
+            "enabled": true
+        }
+    });
+
+    let req_ok = Request::builder()
+        .method("POST")
+        .uri("/v1/systemone")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&partial_patch_payload).unwrap(),
+        ))
+        .unwrap();
+
+    let resp_ok = app.clone().oneshot(req_ok).await.unwrap();
+    assert_eq!(resp_ok.status(), StatusCode::OK);
+
+    // 2. 逆転閾値 (high < low) の部分パッチ指定時に HTTP 400 で拒否されること
+    let invalid_patch_payload = serde_json::json!({
+        "state": "返金してください。",
+        "questions": questions,
+        "gating": {
+            "enabled": true,
+            "thresholds": {
+                "high_threshold": 0.20,
+                "low_threshold": 0.80
+            }
+        }
+    });
+
+    let req_err = Request::builder()
+        .method("POST")
+        .uri("/v1/systemone")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&invalid_patch_payload).unwrap(),
+        ))
+        .unwrap();
+
+    let resp_err = app.oneshot(req_err).await.unwrap();
+    assert_eq!(resp_err.status(), StatusCode::BAD_REQUEST);
+}
+
+/// 空 State オフロード判定時にガードレールで勝手なタイムスタンプ追記が行われず、
+/// オフロード経路(キャッシュミス検証)へ直行することの検証。
+#[tokio::test]
+async fn test_empty_state_offload_bypass_guardrail() {
+    let state = match init_test_app_state() {
+        Some(s) => s,
+        None => return,
+    };
+    let app = create_router(state, None);
+
+    let mut questions = IndexMap::new();
+    questions.insert("q1".to_string(), Question::new_noul("テスト質問。"));
+
+    // 空文字列 State と X-State-Hash ヘッダーを指定
+    let empty_state_payload = serde_json::json!({
+        "state": "",
+        "questions": questions
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/systemone")
+        .header("content-type", "application/json")
+        .header("X-State-Hash", "0123456789abcdef")
+        .body(Body::from(
+            serde_json::to_vec(&empty_state_payload).unwrap(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    // dual_engine 未構成またはキャッシュミスのため、400 Bad Request (state_cache_miss) が返却されること
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json_val: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(
+        json_val["error"]["code"], "state_cache_miss",
+        "空 State が保持されてキャッシュミスエラーとなること。"
+    );
+}

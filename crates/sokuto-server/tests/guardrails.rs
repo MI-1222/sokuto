@@ -604,3 +604,59 @@ fn test_guardrail_structured_json_state_linearization() {
     assert!(state_str.contains("- customer.tier: VIP"));
     assert!(state_str.contains("- tags: [premium, jp]"));
 }
+
+/// Criteria サニタイズ時に重複が発生した場合のロールバック検証。
+#[test]
+fn test_guardrail_score_criteria_duplicate_rollback() {
+    use sokuto_core::schema::Criteria;
+    use sokuto_server::guardrails::GuardrailPipeline;
+
+    let pipeline = GuardrailPipeline::default();
+
+    let mut questions = IndexMap::new();
+    // サニタイズすると "軽微" が重複するケース
+    questions.insert(
+        "q_score".to_string(),
+        Question::new_score(
+            "緊急度判定".to_string(),
+            vec![
+                "1. 軽微".to_string(),
+                "2. 軽微".to_string(),
+                "3. 重大".to_string(),
+            ],
+        ),
+    );
+
+    let mut req = SystemOneRequest::new(Value::String("障害発生".to_string()), questions);
+    let res = pipeline.process(&mut req, None);
+    assert!(res.is_ok());
+
+    let q = req.questions.get("q_score").unwrap();
+    if let Some(Criteria::List(ref list)) = q.criteria {
+        // 重複が防止され、元のラベルがロールバック維持されていること
+        assert_eq!(list[0], "1. 軽微");
+        assert_eq!(list[1], "2. 軽微");
+        assert_eq!(list[2], "3. 重大");
+    } else {
+        panic!("Criteria::List が期待されます。");
+    }
+}
+
+/// Noul 命令正規化における否定文・否定疑問文の極性破壊防止の検証。
+#[test]
+fn test_guardrail_noul_negative_preservation() {
+    use sokuto_server::guardrails::sanitization::normalize_noul_instruction;
+
+    // 否定疑問文: 「〜ではないか？」の末尾「か」だけを削って「〜ではない」に反転・断定破壊しないこと
+    let neg_q1 = "初期不良ではないか？";
+    let norm1 = normalize_noul_instruction(neg_q1);
+    assert!(
+        norm1.contains("初期不良ではないか") || norm1.contains("初期不良"),
+        "否定疑問文の意図が破壊されていないこと: {norm1}"
+    );
+
+    // 否定文: 「〜されていないか？」
+    let neg_q2 = "更新されていないか？";
+    let norm2 = normalize_noul_instruction(neg_q2);
+    assert!(!norm2.is_empty(), "空文字にならず正規化されること: {norm2}");
+}

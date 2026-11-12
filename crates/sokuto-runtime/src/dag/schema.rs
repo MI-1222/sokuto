@@ -185,6 +185,31 @@ impl NodeCondition {
         parse_condition_f64(self.value.as_ref())
     }
 
+    /// コンテキスト値プロパティ比較用のスカラー値 (文字列、真偽値、有限数値) を文字列として抽出する。
+    pub fn context_value_as_string(&self) -> Option<String> {
+        match self.value.as_ref()? {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Bool(b) => Some(b.to_string()),
+            serde_json::Value::Number(n) => {
+                if n.as_f64().is_some_and(|f| f.is_finite()) {
+                    Some(n.to_string())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// ルート比較用の有効な識別子 ("auto_execute", "confirm_or_escalate", "fallback") を抽出する。
+    pub fn route_value_as_str(&self) -> Option<&str> {
+        let s = self.value.as_ref()?.as_str()?;
+        match s {
+            "auto_execute" | "confirm_or_escalate" | "fallback" => Some(s),
+            _ => None,
+        }
+    }
+
     /// 自身を事前パース・型解決済みの `CompiledCondition` へ変換する。
     pub fn compile(&self) -> Option<CompiledCondition> {
         CompiledCondition::from_node_condition(self)
@@ -247,6 +272,20 @@ impl NodeConditionOp {
             Self::Lt => lhs < rhs - Self::FLOAT_EPSILON,
             Self::Lte => lhs <= rhs + Self::FLOAT_EPSILON,
             Self::In | Self::ConfidenceGte | Self::ConfidenceLt => false,
+        }
+    }
+
+    /// 確信度評価用の演算子を正規化する。
+    ///
+    /// `ConfidenceGte` は `Gte` に、`ConfidenceLt` は `Lt` に統一する。
+    /// `In` 演算子は確信度比較に対して無効であるため `None` を返す。
+    #[inline]
+    pub fn normalize_confidence(self) -> Option<Self> {
+        match self {
+            Self::ConfidenceGte | Self::Gte => Some(Self::Gte),
+            Self::ConfidenceLt | Self::Lt => Some(Self::Lt),
+            Self::In => None,
+            other => Some(other),
         }
     }
 }
@@ -387,6 +426,51 @@ impl CompiledAnswerPredicate {
             }
         }
     }
+
+    /// 生の `NodeCondition` から `CompiledAnswerPredicate` をパース・型解決して構築する。
+    ///
+    /// 構文不正またはサポートされない演算子・値の組み合わせの場合は `None` を返す。
+    pub fn from_node_condition(cond: &NodeCondition) -> Option<Self> {
+        if cond.op == NodeConditionOp::In {
+            let arr = cond.value.as_ref()?.as_array()?;
+            if arr.is_empty() {
+                return None;
+            }
+            let mut candidates = Vec::with_capacity(arr.len());
+            for v in arr {
+                candidates.push(v.as_str()?.to_string());
+            }
+            Some(Self::In { candidates })
+        } else if let Some(b) = cond.value.as_ref().and_then(|v| v.as_bool()) {
+            Some(Self::Bool {
+                op: cond.op,
+                expected: b,
+            })
+        } else if let Some(n) = cond.value.as_ref().and_then(|v| v.as_f64()) {
+            if !n.is_finite() {
+                return None;
+            }
+            Some(Self::Numeric {
+                op: cond.op,
+                threshold: n,
+            })
+        } else if let Some(s) = cond.value.as_ref().and_then(|v| v.as_str()) {
+            let as_bool = match s {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            };
+            let as_f64 = s.trim().parse::<f64>().ok().filter(|f| f.is_finite());
+            Some(Self::String {
+                op: cond.op,
+                expected: s.to_string(),
+                as_f64,
+                as_bool,
+            })
+        } else {
+            None
+        }
+    }
 }
 
 /// コンパイル・型解決済みの条件判定述語。
@@ -413,6 +497,58 @@ pub enum ConditionPredicate {
     },
     /// 現在のノードの判定結果 (`answer` / `value`) に対する型付き判定。
     Answer(CompiledAnswerPredicate),
+}
+
+impl ConditionPredicate {
+    /// 生の `NodeCondition` から `ConditionPredicate` をパース・型解決して構築する。
+    ///
+    /// 構文不正またはサポートされない演算子・値の組み合わせの場合は `None` を返す。
+    pub fn from_node_condition(cond: &NodeCondition) -> Option<Self> {
+        match ConditionField::parse(&cond.field) {
+            ConditionField::Confidence => {
+                let threshold = cond.value_as_f64()?;
+                let op = cond.op.normalize_confidence()?;
+                Some(Self::Confidence { op, threshold })
+            }
+            ConditionField::Route => {
+                if !matches!(cond.op, NodeConditionOp::Eq | NodeConditionOp::Neq) {
+                    return None;
+                }
+                let expected = cond.route_value_as_str()?.to_string();
+                Some(Self::Route {
+                    op: cond.op,
+                    expected,
+                })
+            }
+            ConditionField::ContextProperty { node_id, prop } => match prop {
+                ContextProp::Confidence => {
+                    let threshold = cond.value_as_f64()?;
+                    let op = cond.op.normalize_confidence()?;
+                    Some(Self::ContextConfidence {
+                        node_id: node_id.to_string(),
+                        op,
+                        threshold,
+                    })
+                }
+                ContextProp::Value => {
+                    if !matches!(cond.op, NodeConditionOp::Eq | NodeConditionOp::Neq) {
+                        return None;
+                    }
+                    let expected = cond.context_value_as_string()?;
+                    Some(Self::ContextValue {
+                        node_id: node_id.to_string(),
+                        op: cond.op,
+                        expected,
+                    })
+                }
+            },
+            ConditionField::Answer => {
+                let ans_pred = CompiledAnswerPredicate::from_node_condition(cond)?;
+                Some(Self::Answer(ans_pred))
+            }
+            ConditionField::Unknown => None,
+        }
+    }
 }
 
 /// コンパイル・型解決済みのノード遷移条件。
@@ -471,101 +607,7 @@ impl CompiledCondition {
     ///
     /// 構文不正またはサポートされない演算子・値の組み合わせの場合は `None` を返す。
     pub fn from_node_condition(cond: &NodeCondition) -> Option<Self> {
-        let predicate = match ConditionField::parse(&cond.field) {
-            ConditionField::Confidence => {
-                let threshold = cond.value_as_f64()?;
-                let op = match cond.op {
-                    NodeConditionOp::ConfidenceGte | NodeConditionOp::Gte => NodeConditionOp::Gte,
-                    NodeConditionOp::ConfidenceLt | NodeConditionOp::Lt => NodeConditionOp::Lt,
-                    NodeConditionOp::In => return None,
-                    other => other,
-                };
-                ConditionPredicate::Confidence { op, threshold }
-            }
-            ConditionField::Route => {
-                if !matches!(cond.op, NodeConditionOp::Eq | NodeConditionOp::Neq) {
-                    return None;
-                }
-                let expected = cond.value.as_ref()?.as_str()?.to_string();
-                ConditionPredicate::Route {
-                    op: cond.op,
-                    expected,
-                }
-            }
-            ConditionField::ContextProperty { node_id, prop } => match prop {
-                ContextProp::Confidence => {
-                    let threshold = cond.value_as_f64()?;
-                    let op = match cond.op {
-                        NodeConditionOp::ConfidenceGte | NodeConditionOp::Gte => {
-                            NodeConditionOp::Gte
-                        }
-                        NodeConditionOp::ConfidenceLt | NodeConditionOp::Lt => NodeConditionOp::Lt,
-                        _ => return None,
-                    };
-                    ConditionPredicate::ContextConfidence {
-                        node_id: node_id.to_string(),
-                        op,
-                        threshold,
-                    }
-                }
-                ContextProp::Value => {
-                    if !matches!(cond.op, NodeConditionOp::Eq | NodeConditionOp::Neq) {
-                        return None;
-                    }
-                    let expected = match cond.value.as_ref()? {
-                        serde_json::Value::String(s) => s.clone(),
-                        serde_json::Value::Bool(b) => b.to_string(),
-                        serde_json::Value::Number(n) => n.to_string(),
-                        _ => return None,
-                    };
-                    ConditionPredicate::ContextValue {
-                        node_id: node_id.to_string(),
-                        op: cond.op,
-                        expected,
-                    }
-                }
-            },
-            ConditionField::Answer => {
-                if cond.op == NodeConditionOp::In {
-                    let arr = cond.value.as_ref()?.as_array()?;
-                    let mut candidates = Vec::with_capacity(arr.len());
-                    for v in arr {
-                        candidates.push(v.as_str()?.to_string());
-                    }
-                    ConditionPredicate::Answer(CompiledAnswerPredicate::In { candidates })
-                } else if let Some(b) = cond.value.as_ref().and_then(|v| v.as_bool()) {
-                    ConditionPredicate::Answer(CompiledAnswerPredicate::Bool {
-                        op: cond.op,
-                        expected: b,
-                    })
-                } else if let Some(n) = cond.value.as_ref().and_then(|v| v.as_f64()) {
-                    if !n.is_finite() {
-                        return None;
-                    }
-                    ConditionPredicate::Answer(CompiledAnswerPredicate::Numeric {
-                        op: cond.op,
-                        threshold: n,
-                    })
-                } else if let Some(s) = cond.value.as_ref().and_then(|v| v.as_str()) {
-                    let as_bool = match s {
-                        "true" => Some(true),
-                        "false" => Some(false),
-                        _ => None,
-                    };
-                    let as_f64 = s.trim().parse::<f64>().ok().filter(|f| f.is_finite());
-                    ConditionPredicate::Answer(CompiledAnswerPredicate::String {
-                        op: cond.op,
-                        expected: s.to_string(),
-                        as_f64,
-                        as_bool,
-                    })
-                } else {
-                    return None;
-                }
-            }
-            ConditionField::Unknown => return None,
-        };
-
+        let predicate = ConditionPredicate::from_node_condition(cond)?;
         Some(Self {
             predicate,
             target_node: cond.target_node.clone(),
@@ -830,5 +872,53 @@ mod tests {
             target_node: "target_c".to_string(),
         };
         assert!(cond_invalid.compile().is_none());
+
+        // ルート条件のコンパイルテスト。
+        let cond_route = NodeCondition {
+            field: "route".to_string(),
+            op: NodeConditionOp::Eq,
+            value: Some(serde_json::json!("auto_execute")),
+            target_node: "target_route".to_string(),
+        };
+        let compiled_route = cond_route.compile().expect("コンパイルに成功。");
+        assert_eq!(
+            compiled_route.predicate,
+            ConditionPredicate::Route {
+                op: NodeConditionOp::Eq,
+                expected: "auto_execute".to_string(),
+            }
+        );
+
+        // コンテキスト確信度条件のコンパイルテスト。
+        let cond_ctx_conf = NodeCondition {
+            field: "upstream_node.confidence".to_string(),
+            op: NodeConditionOp::ConfidenceLt,
+            value: Some(serde_json::json!(0.5)),
+            target_node: "target_conf".to_string(),
+        };
+        let compiled_ctx_conf = cond_ctx_conf.compile().expect("コンパイルに成功。");
+        assert_eq!(
+            compiled_ctx_conf.predicate,
+            ConditionPredicate::ContextConfidence {
+                node_id: "upstream_node".to_string(),
+                op: NodeConditionOp::Lt,
+                threshold: 0.5,
+            }
+        );
+
+        // 回答 'in' 条件のコンパイルテスト。
+        let cond_in = NodeCondition {
+            field: "answer".to_string(),
+            op: NodeConditionOp::In,
+            value: Some(serde_json::json!(["apple", "banana"])),
+            target_node: "target_in".to_string(),
+        };
+        let compiled_in = cond_in.compile().expect("コンパイルに成功。");
+        assert_eq!(
+            compiled_in.predicate,
+            ConditionPredicate::Answer(CompiledAnswerPredicate::In {
+                candidates: vec!["apple".to_string(), "banana".to_string()],
+            })
+        );
     }
 }

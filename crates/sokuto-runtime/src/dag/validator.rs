@@ -10,9 +10,8 @@ use sokuto_core::schema::{Criteria, Question, QuestionType};
 
 use crate::dag::interpolate::extract_placeholders;
 use crate::dag::schema::{
-    CompiledAnswerPredicate, CompiledCondition, CompiledDag, CompiledDagNode, ConditionField,
-    ConditionPredicate, ContextProp, DagDefinition, DagNode, DagNodeType, NodeCondition,
-    NodeConditionOp,
+    CompiledCondition, CompiledDag, CompiledDagNode, ConditionField, ContextProp, DagDefinition,
+    DagNode, DagNodeType, NodeCondition, NodeConditionOp,
 };
 
 /// DAG 静的検証で発生するエラー型。
@@ -604,7 +603,7 @@ fn validate_single_condition(
 ) -> Result<CompiledCondition, DagValidationError> {
     let field = ConditionField::parse(&cond.field);
 
-    let predicate = match field {
+    match field {
         ConditionField::Unknown => {
             return Err(DagValidationError::InvalidCondition {
                 node_id: node_id.to_string(),
@@ -655,24 +654,12 @@ fn validate_single_condition(
                                 .to_string(),
                         });
                     }
-                    let Some(threshold) = cond.value_as_f64() else {
+                    if cond.value_as_f64().is_none() {
                         return Err(DagValidationError::InvalidCondition {
                             node_id: node_id.to_string(),
                             field: cond.field.clone(),
                             reason: "確信度プロパティには有限数値 (または数値文字列) を指定する必要があります。".to_string(),
                         });
-                    };
-                    let op = match cond.op {
-                        NodeConditionOp::ConfidenceGte | NodeConditionOp::Gte => {
-                            NodeConditionOp::Gte
-                        }
-                        NodeConditionOp::ConfidenceLt | NodeConditionOp::Lt => NodeConditionOp::Lt,
-                        other => other,
-                    };
-                    ConditionPredicate::ContextConfidence {
-                        node_id: ref_id.to_string(),
-                        op,
-                        threshold,
                     }
                 }
                 ContextProp::Value => {
@@ -683,32 +670,12 @@ fn validate_single_condition(
                             reason: "コンテキスト値プロパティに対しては等価比較 (eq / neq) のみ使用できます。".to_string(),
                         });
                     }
-                    let is_scalar = match cond.value.as_ref() {
-                        Some(serde_json::Value::String(_)) | Some(serde_json::Value::Bool(_)) => {
-                            true
-                        }
-                        Some(serde_json::Value::Number(n)) => {
-                            n.as_f64().is_some_and(|f| f.is_finite())
-                        }
-                        _ => false,
-                    };
-                    if !is_scalar {
+                    if cond.context_value_as_string().is_none() {
                         return Err(DagValidationError::InvalidCondition {
                             node_id: node_id.to_string(),
                             field: cond.field.clone(),
                             reason: "コンテキスト値プロパティにはスカラー値 (文字列、真偽値、有限数値) を指定する必要があります。".to_string(),
                         });
-                    }
-                    let expected = match cond.value.as_ref().unwrap() {
-                        serde_json::Value::String(s) => s.clone(),
-                        serde_json::Value::Bool(b) => b.to_string(),
-                        serde_json::Value::Number(n) => n.to_string(),
-                        _ => unreachable!(),
-                    };
-                    ConditionPredicate::ContextValue {
-                        node_id: ref_id.to_string(),
-                        op: cond.op,
-                        expected,
                     }
                 }
             }
@@ -723,19 +690,13 @@ fn validate_single_condition(
                         .to_string(),
                 });
             }
-            let Some(threshold) = cond.value_as_f64() else {
+            if cond.value_as_f64().is_none() {
                 return Err(DagValidationError::InvalidCondition {
                     node_id: node_id.to_string(),
                     field: cond.field.clone(),
                     reason: "confidence フィールドには有限数値 (または数値文字列) を指定する必要があります。".to_string(),
                 });
-            };
-            let op = match cond.op {
-                NodeConditionOp::ConfidenceGte | NodeConditionOp::Gte => NodeConditionOp::Gte,
-                NodeConditionOp::ConfidenceLt | NodeConditionOp::Lt => NodeConditionOp::Lt,
-                other => other,
-            };
-            ConditionPredicate::Confidence { op, threshold }
+            }
         }
         ConditionField::Route => {
             resolve_upstream_inference_nodes(node_id, node, &cond.field, dag, rev_adj)?;
@@ -747,21 +708,12 @@ fn validate_single_condition(
                         .to_string(),
                 });
             }
-            let is_valid_route = match cond.value.as_ref().and_then(|v| v.as_str()) {
-                Some(s) => matches!(s, "auto_execute" | "confirm_or_escalate" | "fallback"),
-                None => false,
-            };
-            if !is_valid_route {
+            if cond.route_value_as_str().is_none() {
                 return Err(DagValidationError::InvalidCondition {
                     node_id: node_id.to_string(),
                     field: cond.field.clone(),
                     reason: "route フィールドには 'auto_execute', 'confirm_or_escalate', 'fallback' のいずれかの文字列を指定する必要があります。".to_string(),
                 });
-            }
-            let expected = cond.value.as_ref().unwrap().as_str().unwrap().to_string();
-            ConditionPredicate::Route {
-                op: cond.op,
-                expected,
             }
         }
         ConditionField::Answer => {
@@ -890,10 +842,10 @@ fn validate_single_condition(
                         };
                         if !is_valid {
                             return Err(DagValidationError::InvalidCondition {
-                                    node_id: node_id.to_string(),
-                                    field: cond.field.clone(),
-                                    reason: "Noul 型の等価比較には真偽値、'true'/'false' 文字列、または有限数値を指定する必要があります。".to_string(),
-                                });
+                                node_id: node_id.to_string(),
+                                field: cond.field.clone(),
+                                reason: "Noul 型の等価比較には真偽値、'true'/'false' 文字列、または有限数値を指定する必要があります。".to_string(),
+                            });
                         }
                     }
                     NodeConditionOp::Gt
@@ -919,48 +871,15 @@ fn validate_single_condition(
                 },
                 None => {}
             }
-
-            let ans_pred = if cond.op == NodeConditionOp::In {
-                let arr = cond.value.as_ref().unwrap().as_array().unwrap();
-                let candidates = arr
-                    .iter()
-                    .map(|item| item.as_str().unwrap().to_string())
-                    .collect();
-                CompiledAnswerPredicate::In { candidates }
-            } else if let Some(b) = cond.value.as_ref().and_then(|v| v.as_bool()) {
-                CompiledAnswerPredicate::Bool {
-                    op: cond.op,
-                    expected: b,
-                }
-            } else if let Some(n) = cond.value.as_ref().and_then(|v| v.as_f64()) {
-                CompiledAnswerPredicate::Numeric {
-                    op: cond.op,
-                    threshold: n,
-                }
-            } else if let Some(s) = cond.value.as_ref().and_then(|v| v.as_str()) {
-                let as_bool = match s {
-                    "true" => Some(true),
-                    "false" => Some(false),
-                    _ => None,
-                };
-                let as_f64 = s.trim().parse::<f64>().ok().filter(|f| f.is_finite());
-                CompiledAnswerPredicate::String {
-                    op: cond.op,
-                    expected: s.to_string(),
-                    as_f64,
-                    as_bool,
-                }
-            } else {
-                unreachable!()
-            };
-
-            ConditionPredicate::Answer(ans_pred)
         }
-    };
+    }
 
-    Ok(CompiledCondition {
-        predicate,
-        target_node: cond.target_node.clone(),
+    CompiledCondition::from_node_condition(cond).ok_or_else(|| {
+        DagValidationError::InvalidCondition {
+            node_id: node_id.to_string(),
+            field: cond.field.clone(),
+            reason: "条件式の値または演算子の形式が不正です。".to_string(),
+        }
     })
 }
 

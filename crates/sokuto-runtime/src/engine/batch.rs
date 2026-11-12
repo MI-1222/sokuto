@@ -959,8 +959,8 @@ fn resolve_coarse_batch_chunk(
             .get(q_key)
             .expect("キーの一致が保証されている。");
 
+        let orig_q = original_questions.get(q_key).unwrap_or(question);
         let answer = if !original_keys_map.contains_key(q_key) {
-            let orig_q = original_questions.get(q_key).unwrap_or(question);
             resolve_and_gate_answer(ctx, q_key, orig_q, valid_logits, &mut probs_buf[..k_i])?
         } else {
             let answer = evaluate_question_with_buf(
@@ -971,7 +971,7 @@ fn resolve_coarse_batch_chunk(
                 Some(q_key.as_str()),
             )?;
             let energy = calculate_choice_energy_with_config(
-                question,
+                orig_q,
                 valid_logits,
                 ctx.calib_config,
                 ctx.gating_config,
@@ -1451,6 +1451,16 @@ mod tests {
             coarse_ans.gating.as_ref().unwrap().energy,
             coarse_energies.get("q_coarse").copied().flatten()
         );
+
+        // 自由エネルギーが枝刈り後の M=2 ではなく全候補数 K=4 の母集団で正規化されていることを検証
+        let coarse_energy = coarse_energies
+            .get("q_coarse")
+            .copied()
+            .flatten()
+            .expect("エネルギーが存在する。");
+        let raw_energy = sokuto_core::math::free_energy(&[4.0, -1.0], 1.0).unwrap();
+        let expected_energy_k4 = raw_energy + (4.0f64).ln();
+        assert!((coarse_energy - expected_energy_k4).abs() < 1e-6);
     }
 
     #[test]

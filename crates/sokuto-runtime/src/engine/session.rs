@@ -481,12 +481,8 @@ impl InferenceEngine {
             .map_err(RuntimeError::Core)?;
 
         // 5. 全候補空間に対する確率マップの再構成・複合確信度の再計算およびゲーティング判定の適用
-        let energy = calculate_choice_energy_with_config(
-            &sub_question,
-            &sub_logits,
-            calib_config,
-            gating_config,
-        );
+        let energy =
+            calculate_choice_energy_with_config(question, &sub_logits, calib_config, gating_config);
         reconstruct_and_gate_answer(
             &mut answer,
             &original_keys,

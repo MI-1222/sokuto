@@ -36,8 +36,8 @@ use crate::engine::escalation::build_rich_escalation_prompt;
 use crate::error::{Result, RuntimeError};
 use sokuto_core::decision::evaluate_question_with_buf;
 use sokuto_core::gating::evaluate_answer_gating_opts;
-use sokuto_core::math::normalized_free_energy;
-use sokuto_core::schema::QuestionType;
+use sokuto_core::math::free_energy;
+use sokuto_core::schema::{Criteria, QuestionType};
 
 /// Choice 型の質問とロジット配列から、正規化ヘルムホルツ自由エネルギーを算出する。
 ///
@@ -62,6 +62,10 @@ pub fn calculate_choice_energy(
 
 /// Choice 型の質問とロジット配列、およびリクエスト固有のゲーティング設定から、正規化ヘルムホルツ自由エネルギーを算出する。
 ///
+/// 粗密探索 (Coarse-to-Fine) 等で $M$ 個に枝刈りされたロジット列と全 $K$ 候補を含む質問定義が渡された場合、
+/// 母集団数 $K$ ($K \ge M$) を用いて較正温度を解決し、除外候補を確率 0 (ロジット $-\infty$) とみなした
+/// 全候補空間基準の正規化自由エネルギー $E_{\text{norm}}(x; K) = -T \ln \sum_{m=1}^M \exp(z_m / T) + T \ln K$ を算出する。
+///
 /// # 温度解決の優先順位
 /// 1. `gating_config.energy_temperature`: リクエストで明示されたエネルギー温度。
 /// 2. `calib_config.gating_thresholds.energy_temperature`: モデル成果物で事前較正されたエネルギー専用温度。
@@ -84,12 +88,24 @@ pub fn calculate_choice_energy_with_config(
     if question.question_type != QuestionType::Choice || logits.is_empty() {
         return None;
     }
-    let k = logits.len();
+    let k = question
+        .criteria
+        .as_ref()
+        .and_then(Criteria::as_map)
+        .map_or_else(|| logits.len(), |m| m.len().max(logits.len()));
     let temp = gating_config
         .and_then(|cfg| cfg.thresholds.energy_temperature)
         .or(calib_config.gating_thresholds.energy_temperature)
         .unwrap_or_else(|| calib_config.get_temperature(QuestionType::Choice, k));
-    normalized_free_energy(logits, temp).ok()
+
+    if k <= 1 {
+        free_energy(logits, temp).ok()
+    } else {
+        let raw_energy = free_energy(logits, temp).ok()?;
+        let effective_tau = temp.max(1e-4);
+        let shift = effective_tau * (k as f64).ln();
+        Some(raw_energy + shift)
+    }
 }
 
 /// 単一の判定結果 (`Answer`) に対し、エネルギー値と解決されたゲーティング設定を適用する。
@@ -356,6 +372,7 @@ pub fn apply_gating_to_answers(
 mod tests {
     use super::*;
     use sokuto_core::contract::calibration::GatingThresholds;
+    use sokuto_core::math::normalized_free_energy;
 
     #[test]
     fn test_resolve_gating_config_cascade() {
@@ -595,6 +612,36 @@ mod tests {
 
         assert!((custom_energy - expected_energy).abs() < 1e-12);
         assert!((custom_energy - default_energy).abs() > 1e-3);
+    }
+
+    #[test]
+    fn test_calculate_choice_energy_with_coarse_pruning_population() {
+        let calib = CalibrationConfig::default();
+        let mut criteria = IndexMap::new();
+        criteria.insert("a".to_string(), "説明A".to_string());
+        criteria.insert("b".to_string(), "説明B".to_string());
+        criteria.insert("c".to_string(), "説明C".to_string());
+        criteria.insert("d".to_string(), "説明D".to_string());
+        let q_all = Question::new_choice("指示", criteria);
+
+        // 粗密探索で 4 候補中上位 2 候補のみ推論した場合
+        let sub_logits = [4.0, -1.0];
+        let energy = calculate_choice_energy(&q_all, &sub_logits, &calib).unwrap();
+
+        // 生エネルギー -T ln(exp(4) + exp(-1)) に 全候補数 K=4 のシフト +T ln(4) が加算されること
+        let raw_energy = free_energy(&sub_logits, 1.0).unwrap();
+        let expected_energy = raw_energy + (4.0f64).ln();
+        assert!((energy - expected_energy).abs() < 1e-12);
+
+        // 誤って 2 候補の質問を渡した場合のエネルギーより高くなる (OOD 側に正しく評価される) ことを確認
+        let mut sub_criteria = IndexMap::new();
+        sub_criteria.insert("a".to_string(), "説明A".to_string());
+        sub_criteria.insert("b".to_string(), "説明B".to_string());
+        let q_sub = Question::new_choice("指示", sub_criteria);
+        let sub_energy = calculate_choice_energy(&q_sub, &sub_logits, &calib).unwrap();
+
+        // 差分は ln(4) - ln(2) = ln(2)
+        assert!((energy - sub_energy - (2.0f64).ln()).abs() < 1e-12);
     }
 
     #[test]

@@ -495,4 +495,35 @@ mod tests {
         assert!(!meta.is_ood);
         assert!(meta.energy.is_some());
     }
+
+    #[test]
+    fn test_calculate_choice_energy_with_config_prefers_request_temperature() {
+        let calib = CalibrationConfig {
+            gating_thresholds: GatingThresholds {
+                energy_temperature: Some(1.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut criteria = IndexMap::new();
+        criteria.insert("a".to_string(), "説明A".to_string());
+        criteria.insert("b".to_string(), "説明B".to_string());
+        let q = Question::new_choice("指示", criteria);
+        let logits = [3.0, -1.0];
+
+        let default_energy = calculate_choice_energy(&q, &logits, &calib).unwrap();
+        let gating_cfg = GatingConfig {
+            enabled: true,
+            thresholds: GatingThresholds {
+                energy_temperature: Some(4.0),
+                ..Default::default()
+            },
+        };
+        let custom_energy =
+            calculate_choice_energy_with_config(&q, &logits, &calib, Some(&gating_cfg)).unwrap();
+        let expected_energy = normalized_free_energy(&logits, 4.0).unwrap();
+
+        assert!((custom_energy - expected_energy).abs() < 1e-12);
+        assert!((custom_energy - default_energy).abs() > 1e-3);
+    }
 }

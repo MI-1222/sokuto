@@ -13,7 +13,9 @@ use crate::engine::coarse::{
     CoarseScorer, CoarseToFineConfig, LexicalCoarseScorer, filter_top_candidates,
     reconstruct_and_gate_answer,
 };
-use crate::engine::gating::{apply_gating_to_answer_with_energy, calculate_choice_energy};
+use crate::engine::gating::{
+    apply_gating_to_answer_with_logits, calculate_choice_energy_with_config,
+};
 use crate::engine::session::InferenceEngine;
 use crate::error::Result;
 use crate::hierarchical::{
@@ -636,7 +638,12 @@ impl InferenceEngine {
                         &mut probs_buf[..k_i],
                         Some(q_key.as_str()),
                     )?;
-                    let energy = calculate_choice_energy(question, valid_logits, calib_config);
+                    let energy = calculate_choice_energy_with_config(
+                        question,
+                        valid_logits,
+                        calib_config,
+                        gating_config,
+                    );
                     coarse_energies.insert(q_key.clone(), energy);
                     answer
                 };
@@ -878,10 +885,9 @@ fn resolve_and_gate_answer(
         probs_buf,
         Some(q_key),
     )?;
-    let energy = calculate_choice_energy(question, valid_logits, ctx.calib_config);
-    apply_gating_to_answer_with_energy(
+    apply_gating_to_answer_with_logits(
         &mut answer,
-        energy,
+        Some(valid_logits),
         Some(ctx.state),
         Some(q_key),
         Some(question),
@@ -1117,5 +1123,48 @@ mod tests {
         assert_eq!(small_keys, vec!["s1", "s2"]);
         assert!(!original_keys_map.contains_key("small"));
         assert!(!original_keys_map.contains_key("noul"));
+    }
+
+    #[test]
+    fn test_resolve_and_gate_answer_respects_gating_energy_temperature() {
+        use sokuto_core::contract::calibration::GatingThresholds;
+        use sokuto_core::math::normalized_free_energy;
+
+        let calib_config = CalibrationConfig {
+            gating_thresholds: GatingThresholds {
+                energy_temperature: Some(1.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let gating_config = GatingConfig {
+            enabled: true,
+            thresholds: GatingThresholds {
+                energy_temperature: Some(5.0),
+                ..Default::default()
+            },
+        };
+        let ctx = BatchEvalContext {
+            state: "テスト用入力テキスト",
+            calib_config: &calib_config,
+            gating_config: Some(&gating_config),
+        };
+
+        let mut criteria = IndexMap::new();
+        criteria.insert("a".to_string(), "候補A".to_string());
+        criteria.insert("b".to_string(), "候補B".to_string());
+        let q_choice = Question::new_choice("選択せよ", criteria);
+        let logits = [3.0, -1.0];
+        let mut probs_buf = [0.0f64; 2];
+
+        let ans = resolve_and_gate_answer(&ctx, "q_temp", &q_choice, &logits, &mut probs_buf)
+            .expect("ゲート解決に成功する。");
+
+        let actual_energy = ans.gating.as_ref().and_then(|g| g.energy).unwrap();
+        let expected_energy = normalized_free_energy(&logits, 5.0).unwrap();
+        let fallback_energy = normalized_free_energy(&logits, 1.0).unwrap();
+
+        assert!((actual_energy - expected_energy).abs() < 1e-12);
+        assert!((actual_energy - fallback_energy).abs() > 1e-3);
     }
 }

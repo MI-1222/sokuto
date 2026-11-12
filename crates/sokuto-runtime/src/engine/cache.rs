@@ -33,7 +33,7 @@ use sokuto_core::schema::{Answer, Question};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::engine::config::{ExecutionProvider, SessionConfig};
-use crate::engine::gating::{apply_gating_to_answer_with_energy, calculate_choice_energy};
+use crate::engine::gating::apply_gating_to_answer_with_logits;
 use crate::engine::session::{acquire_pooled_session, create_session_builder};
 use crate::error::{Result, RuntimeError};
 use crate::tokenizer::{JevTokenizer, TokenizedQuestion};
@@ -1374,14 +1374,13 @@ impl DualSessionEngine {
                     Some(qid.as_str()),
                 )?;
 
-                let energy = calculate_choice_energy(q, sample_logits, calib_config);
                 let effective_state_text = match state_text {
                     Some(s) if !s.trim().is_empty() => Some(s),
                     _ => cached_state.state_text.as_deref(),
                 };
-                apply_gating_to_answer_with_energy(
+                apply_gating_to_answer_with_logits(
                     &mut answer,
-                    energy,
+                    Some(sample_logits),
                     effective_state_text,
                     Some(qid.as_str()),
                     Some(q),
@@ -1471,14 +1470,13 @@ impl DualSessionEngine {
         let mut answer =
             evaluate_question(question, &logits, calib_config).map_err(RuntimeError::Core)?;
 
-        let energy = calculate_choice_energy(question, &logits, calib_config);
         let effective_state_text = match state_text {
             Some(s) if !s.trim().is_empty() => Some(s),
             _ => cached_state.state_text.as_deref(),
         };
-        apply_gating_to_answer_with_energy(
+        apply_gating_to_answer_with_logits(
             &mut answer,
-            energy,
+            Some(&logits),
             effective_state_text,
             None,
             Some(question),

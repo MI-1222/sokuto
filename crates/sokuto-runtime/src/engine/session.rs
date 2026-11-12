@@ -25,7 +25,9 @@ use crate::engine::coarse::{
     reconstruct_and_gate_answer,
 };
 use crate::engine::config::{ExecutionProvider, SessionConfig, auto_intra_threads};
-use crate::engine::gating::{apply_gating_to_answer_with_energy, calculate_choice_energy};
+use crate::engine::gating::{
+    apply_gating_to_answer_with_logits, calculate_choice_energy_with_config,
+};
 use crate::engine::provider::register_execution_providers;
 use crate::error::{Result, RuntimeError};
 use crate::hierarchical::{
@@ -465,10 +467,9 @@ impl InferenceEngine {
             let logits = self.forward_question(&tokenized)?;
             let mut answer =
                 evaluate_question(question, &logits, calib_config).map_err(RuntimeError::Core)?;
-            let energy = calculate_choice_energy(question, &logits, calib_config);
-            apply_gating_to_answer_with_energy(
+            apply_gating_to_answer_with_logits(
                 &mut answer,
-                energy,
+                Some(&logits),
                 Some(state),
                 None,
                 Some(question),
@@ -496,7 +497,12 @@ impl InferenceEngine {
             .map_err(RuntimeError::Core)?;
 
         // 5. 全候補空間に対する確率マップの再構成・複合確信度の再計算およびゲーティング判定の適用
-        let energy = calculate_choice_energy(&sub_question, &sub_logits, calib_config);
+        let energy = calculate_choice_energy_with_config(
+            &sub_question,
+            &sub_logits,
+            calib_config,
+            gating_config,
+        );
         reconstruct_and_gate_answer(
             &mut answer,
             &original_keys,
@@ -642,10 +648,9 @@ impl InferenceEngine {
         let mut answer =
             evaluate_question(question, &logits, calib_config).map_err(RuntimeError::Core)?;
 
-        let energy = calculate_choice_energy(question, &logits, calib_config);
-        apply_gating_to_answer_with_energy(
+        apply_gating_to_answer_with_logits(
             &mut answer,
-            energy,
+            Some(&logits),
             Some(state),
             None,
             Some(question),

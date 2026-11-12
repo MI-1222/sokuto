@@ -9,7 +9,21 @@ use sokuto_core::contract::model_spec::{ModelInputDimensions, OP_INDEX_PADDING};
 use sokuto_core::schema::Question;
 
 use crate::error::{Result, RuntimeError};
-use crate::tokenizer::JevTokenizer;
+use crate::tokenizer::{JevTokenizer, TokenizedQuestion};
+
+/// 複数質問のトークナイズ結果を動的パディングし平坦化したテンソルバッファ構造体。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackedTokenizedBatch {
+    /// 平坦化された入力トークン列テンソル用データ (`[batch_size * sequence_length]`)。
+    pub input_ids: Vec<i64>,
+    /// 平坦化されたアテンションマスクテンソル用データ (`[batch_size * sequence_length]`)。
+    pub attention_mask: Vec<i64>,
+    /// 平坦化された候補出現位置インデックステンソル用データ (`[batch_size * num_options]`)。
+    /// パディング領域には未選択スロットを表す -1 (`OP_INDEX_PADDING`) が設定される。
+    pub op_indices: Vec<i64>,
+    /// バッチテンソルの次元情報 (`batch_size`, `sequence_length`, `num_options`)。
+    pub dims: ModelInputDimensions,
+}
 
 /// 複数質問を一括パッキングしたバッチトークナイズ結果構造体。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,26 +120,56 @@ impl JevTokenizer {
         let mut candidate_counts = Vec::with_capacity(batch_size);
         let mut option_keys_per_q = Vec::with_capacity(batch_size);
 
-        let mut max_seq_len = 0usize;
-        let mut max_num_options = 0usize;
-
         for (q_key, question) in questions {
             let tokenized = self.encode_with_pretokenized_state(state_ids, question, max_length)?;
-            let seq_len = tokenized.input_ids.len();
-            let num_options = tokenized.op_indices.len();
-
-            if seq_len > max_seq_len {
-                max_seq_len = seq_len;
-            }
-            if num_options > max_num_options {
-                max_num_options = num_options;
-            }
-
             question_keys.push(q_key.clone());
-            candidate_counts.push(num_options);
+            candidate_counts.push(tokenized.op_indices.len());
             option_keys_per_q.push(tokenized.option_keys.clone());
             tokenized_list.push(tokenized);
         }
+
+        let packed = self.pack_tokenized_questions(&tokenized_list)?;
+
+        Ok(BatchTokenizedQuestions {
+            input_ids: packed.input_ids,
+            attention_mask: packed.attention_mask,
+            op_indices: packed.op_indices,
+            dims: packed.dims,
+            question_keys,
+            candidate_counts,
+            option_keys_per_q,
+        })
+    }
+
+    /// 複数のトークナイズ済み要素 (`TokenizedQuestion`) を動的パディングし、単一の平坦化バッチテンソルにパックする。
+    ///
+    /// バッチ内の最大系列長 $L_{\max}$ および最大候補数 $K_{\max}$ を算出し、
+    /// パディングトークン ID (`pad_token_id`)、アテンションマスク (`0`)、
+    /// および未選択スロット (`OP_INDEX_PADDING`) で埋めた連続メモリバッファを構築する。
+    ///
+    /// # 引数
+    /// - `items`: トークナイズ済み質問参照のイテレータ。
+    ///
+    /// # 戻り値
+    /// パディングおよび平坦化済みの `PackedTokenizedBatch`。
+    ///
+    /// # エラー
+    /// - `items` が空の場合は `RuntimeError::InvalidQuestion`。
+    /// - テンソル形状がモデル制約を満たさない場合は `RuntimeError::ModelContractViolation`。
+    pub fn pack_tokenized_questions<'a, I>(&self, items: I) -> Result<PackedTokenizedBatch>
+    where
+        I: IntoIterator<Item = &'a TokenizedQuestion>,
+    {
+        let items: Vec<&TokenizedQuestion> = items.into_iter().collect();
+        let batch_size = items.len();
+        if batch_size == 0 {
+            return Err(RuntimeError::InvalidQuestion(
+                "パッキング対象の質問群が空のためバッチを構築できません。".to_string(),
+            ));
+        }
+
+        let max_seq_len = items.iter().map(|t| t.input_ids.len()).max().unwrap_or(1);
+        let max_num_options = items.iter().map(|t| t.op_indices.len()).max().unwrap_or(1);
 
         let dims = ModelInputDimensions::new(batch_size, max_seq_len, max_num_options)
             .map_err(|e| RuntimeError::ModelContractViolation(e.to_string()))?;
@@ -139,26 +183,22 @@ impl JevTokenizer {
         // パディング候補スロットは未選択スロットとして -1 で埋める。
         let mut op_indices = vec![OP_INDEX_PADDING; total_options];
 
-        for (i, tokenized) in tokenized_list.into_iter().enumerate() {
+        for (i, t) in items.iter().enumerate() {
             let token_offset = i * max_seq_len;
-            let seq_len = tokenized.input_ids.len();
-            input_ids[token_offset..token_offset + seq_len].copy_from_slice(&tokenized.input_ids);
-            attention_mask[token_offset..token_offset + seq_len]
-                .copy_from_slice(&tokenized.attention_mask);
+            let seq_len = t.input_ids.len();
+            input_ids[token_offset..token_offset + seq_len].copy_from_slice(&t.input_ids);
+            attention_mask[token_offset..token_offset + seq_len].copy_from_slice(&t.attention_mask);
 
             let op_offset = i * max_num_options;
-            let num_ops = tokenized.op_indices.len();
-            op_indices[op_offset..op_offset + num_ops].copy_from_slice(&tokenized.op_indices);
+            let num_ops = t.op_indices.len();
+            op_indices[op_offset..op_offset + num_ops].copy_from_slice(&t.op_indices);
         }
 
-        Ok(BatchTokenizedQuestions {
+        Ok(PackedTokenizedBatch {
             input_ids,
             attention_mask,
             op_indices,
             dims,
-            question_keys,
-            candidate_counts,
-            option_keys_per_q,
         })
     }
 }
@@ -263,5 +303,66 @@ mod tests {
         for k in 0..4 {
             assert_ne!(batch.op_indices[k_max + k], OP_INDEX_PADDING);
         }
+    }
+
+    #[test]
+    fn test_pack_tokenized_questions() {
+        let tokenizer_path = default_tokenizer_path();
+        if !tokenizer_path.exists() {
+            return;
+        }
+        let tokenizer = JevTokenizer::from_file(&tokenizer_path).unwrap();
+
+        // 空の場合はエラー
+        let empty: Vec<TokenizedQuestion> = vec![];
+        let err = tokenizer.pack_tokenized_questions(&empty);
+        assert!(err.is_err());
+
+        // 2つのクエリを作成してパッキング
+        let mut map_a = IndexMap::new();
+        map_a.insert("opt1".to_string(), "選択肢 1".to_string());
+        map_a.insert("opt2".to_string(), "選択肢 2".to_string());
+        let q1 = Question::new_choice("短い質問指示文。", map_a);
+
+        let mut map_b = IndexMap::new();
+        map_b.insert("a".to_string(), "候補 A".to_string());
+        map_b.insert("b".to_string(), "候補 B".to_string());
+        map_b.insert("c".to_string(), "候補 C".to_string());
+        let q2 = Question::new_choice("より長い質問指示文のテキストです。", map_b);
+
+        let t1 = tokenizer.encode_query(&q1).unwrap();
+        let t2 = tokenizer.encode_query(&q2).unwrap();
+
+        let items = vec![&t1, &t2];
+        let packed = tokenizer
+            .pack_tokenized_questions(items)
+            .expect("パッキングに成功すること。");
+
+        assert_eq!(packed.dims.batch_size, 2);
+        assert_eq!(packed.dims.num_options, 3);
+        assert_eq!(
+            packed.dims.sequence_length,
+            t1.input_ids.len().max(t2.input_ids.len())
+        );
+
+        let max_seq = packed.dims.sequence_length;
+        let pad_id = tokenizer.pad_token_id().unwrap_or(0) as i64;
+
+        // t1 のパディング検証
+        if t1.input_ids.len() < max_seq {
+            let offset = 0;
+            assert_eq!(packed.input_ids[offset + t1.input_ids.len()], pad_id);
+            assert_eq!(packed.attention_mask[offset + t1.input_ids.len()], 0);
+        }
+
+        // t1 の op_indices パディング検証 (2択なので3番目は OP_INDEX_PADDING)
+        assert_eq!(packed.op_indices[2], OP_INDEX_PADDING);
+        assert_ne!(packed.op_indices[0], OP_INDEX_PADDING);
+        assert_ne!(packed.op_indices[1], OP_INDEX_PADDING);
+
+        // t2 の op_indices (3択すべて有効)
+        assert_ne!(packed.op_indices[3], OP_INDEX_PADDING);
+        assert_ne!(packed.op_indices[4], OP_INDEX_PADDING);
+        assert_ne!(packed.op_indices[5], OP_INDEX_PADDING);
     }
 }

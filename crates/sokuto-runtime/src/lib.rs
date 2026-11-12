@@ -39,7 +39,9 @@ pub use hierarchical::{
     HierarchicalRouterConfig, combine_and_reconstruct_probabilities, compute_fine_temperature,
     compute_normalized_entropy, temperature_scaled_softmax,
 };
-pub use tokenizer::{BatchTokenizedQuestions, JevTokenizer, TokenizedQuestion};
+pub use tokenizer::{
+    BatchTokenizedQuestions, JevTokenizer, PackedTokenizedBatch, TokenizedQuestion,
+};
 
 /// ランタイムの初期化確認用関数。
 pub fn version() -> &'static str {

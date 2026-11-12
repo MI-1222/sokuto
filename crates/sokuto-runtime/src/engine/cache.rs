@@ -24,7 +24,7 @@ use ort::session::Session;
 use ort::value::{Tensor, Value};
 use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_core::contract::model_spec::{
-    ModelInputDimensions, OP_INDEX_PADDING, TENSOR_ATTENTION_MASK, TENSOR_INPUT_IDS, TENSOR_LOGITS,
+    ModelInputDimensions, TENSOR_ATTENTION_MASK, TENSOR_INPUT_IDS, TENSOR_LOGITS,
     TENSOR_OP_INDICES, TENSOR_QUERY_IDS, TENSOR_QUERY_MASK, TENSOR_STATE_HIDDEN_STATES,
     TENSOR_STATE_MASK,
 };
@@ -1315,7 +1315,6 @@ impl DualSessionEngine {
 
         let effective_chunk_size = chunk_size.max(1).min(max_safe_chunk);
         let mut answers = indexmap::IndexMap::with_capacity(questions.len());
-        let pad_id = tokenizer.pad_token_id().unwrap_or(0) as i64;
 
         let mut tokenized_items = Vec::with_capacity(questions.len());
         for (qid, q) in questions {
@@ -1329,38 +1328,8 @@ impl DualSessionEngine {
 
         for chunk in tokenized_items.chunks(effective_chunk_size) {
             let chunk_len = chunk.len();
-            let max_q_len = chunk
-                .iter()
-                .map(|(_, _, t)| t.input_ids.len())
-                .max()
-                .unwrap_or(1);
-            let max_opts = chunk
-                .iter()
-                .map(|(_, _, t)| t.op_indices.len())
-                .max()
-                .unwrap_or(1);
-
-            let mut batch_query_ids = vec![pad_id; chunk_len * max_q_len];
-            let mut batch_query_mask = vec![0i64; chunk_len * max_q_len];
-            let mut batch_op_indices = vec![OP_INDEX_PADDING; chunk_len * max_opts];
+            let packed = tokenizer.pack_tokenized_questions(chunk.iter().map(|(_, _, t)| t))?;
             let batch_state_mask = cached_state.state_mask_for_batch(chunk_len);
-
-            for (i, (_, _, t)) in chunk.iter().enumerate() {
-                let q_len = t.input_ids.len();
-                let q_start = i * max_q_len;
-                batch_query_ids[q_start..q_start + q_len].copy_from_slice(&t.input_ids);
-                batch_query_mask[q_start..q_start + q_len].copy_from_slice(&t.attention_mask);
-
-                let opt_len = t.op_indices.len();
-                let opt_start = i * max_opts;
-                batch_op_indices[opt_start..opt_start + opt_len].copy_from_slice(&t.op_indices);
-            }
-
-            let query_dims = ModelInputDimensions {
-                batch_size: chunk_len,
-                sequence_length: max_q_len,
-                num_options: max_opts,
-            };
 
             let state_val = match &reusable_state_val {
                 Some((len, val)) if *len == chunk_len => Arc::clone(val),
@@ -1375,10 +1344,10 @@ impl DualSessionEngine {
                 state_val.as_ref(),
                 state_seq_len,
                 &batch_state_mask,
-                &batch_query_ids,
-                &batch_query_mask,
-                &batch_op_indices,
-                query_dims,
+                &packed.input_ids,
+                &packed.attention_mask,
+                &packed.op_indices,
+                packed.dims,
             )?;
 
             for (i, (qid, q, t)) in chunk.iter().enumerate() {

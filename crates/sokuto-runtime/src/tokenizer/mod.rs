@@ -7,7 +7,7 @@
 pub mod batch;
 pub mod prompt;
 
-pub use batch::BatchTokenizedQuestions;
+pub use batch::{BatchTokenizedQuestions, PackedTokenizedBatch};
 
 use std::path::Path;
 

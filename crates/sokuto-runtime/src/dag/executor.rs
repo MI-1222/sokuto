@@ -1247,9 +1247,10 @@ mod tests {
         assert_eq!(unchanged.as_ref().and_then(|a| a.as_noul()), Some(0.80));
     }
 
-    /// 指定ステップ数を持つ直列 Branch/Escalate DAG を生成するテスト用ヘルパー。
+    /// 指定ステップ数を持つ直列 DAG (Inference / Branch / Escalate) を生成するテスト用ヘルパー。
     fn build_linear_control_dag(num_steps: usize, terminate_with_escalate: bool) -> DagDefinition {
         use crate::dag::schema::DagNode;
+        use sokuto_core::schema::Question;
 
         let mut nodes = IndexMap::new();
         for i in 0..num_steps {
@@ -1264,21 +1265,39 @@ mod tests {
                     join_node: None,
                     reason: Some("テスト終端エスカレーション。".to_string()),
                 }
-            } else {
-                let conditions = if is_last {
-                    Vec::new()
-                } else {
-                    vec![NodeCondition {
+            } else if is_last {
+                DagNode {
+                    node_type: DagNodeType::Branch,
+                    question: None,
+                    conditions: Vec::new(),
+                    parallel_nodes: Vec::new(),
+                    join_node: None,
+                    reason: None,
+                }
+            } else if i == 0 {
+                DagNode {
+                    node_type: DagNodeType::Inference,
+                    question: Some(Question::new_noul("テストステップ判定".to_string())),
+                    conditions: vec![NodeCondition {
                         field: "confidence".to_string(),
                         op: NodeConditionOp::ConfidenceGte,
                         value: Some(serde_json::json!(0.0)),
                         target_node: format!("step_{}", i + 1),
-                    }]
-                };
+                    }],
+                    parallel_nodes: Vec::new(),
+                    join_node: None,
+                    reason: None,
+                }
+            } else {
                 DagNode {
                     node_type: DagNodeType::Branch,
                     question: None,
-                    conditions,
+                    conditions: vec![NodeCondition {
+                        field: "confidence".to_string(),
+                        op: NodeConditionOp::ConfidenceGte,
+                        value: Some(serde_json::json!(0.0)),
+                        target_node: format!("step_{}", i + 1),
+                    }],
                     parallel_nodes: Vec::new(),
                     join_node: None,
                     reason: None,

@@ -112,6 +112,13 @@ pub fn validate_dag(dag: &DagDefinition) -> Result<(), DagValidationError> {
                 // conditions が空の場合は終端ノードとして扱われ、次ノードなしで正常終了する。
             }
             DagNodeType::Parallel => {
+                if !node.conditions.is_empty() {
+                    return Err(DagValidationError::InvalidNodeSpec {
+                        node_id: node_id.clone(),
+                        node_type: node.node_type,
+                        reason: "Parallel ノードは独自の conditions を持てません(join_node への遷移が固定されているため)。".to_string(),
+                    });
+                }
                 if node.parallel_nodes.is_empty() {
                     return Err(DagValidationError::InvalidNodeSpec {
                         node_id: node_id.clone(),
@@ -166,7 +173,16 @@ pub fn validate_dag(dag: &DagDefinition) -> Result<(), DagValidationError> {
                     }
                 }
             }
-            DagNodeType::Escalate => {}
+            DagNodeType::Escalate => {
+                if !node.conditions.is_empty() {
+                    return Err(DagValidationError::InvalidNodeSpec {
+                        node_id: node_id.clone(),
+                        node_type: node.node_type,
+                        reason: "Escalate ノードは終端ノードであり、conditions を持てません。"
+                            .to_string(),
+                    });
+                }
+            }
         }
 
         for cond in &node.conditions {
@@ -316,7 +332,7 @@ fn is_finite_number_value(val: Option<&serde_json::Value>) -> bool {
     false
 }
 
-/// 条件式を評価する対象の上流推論ノード群の質問仕様を探索・解決する。
+/// 条件式を評価する対象の上流推論ノード群を探索・解決する。
 ///
 /// `Inference` ノードの場合は自身の `question` を返し、
 /// `Branch` ノードの場合は直近の上流 `Inference` ノード群の質問仕様を幅優先探索で解決する。
@@ -325,8 +341,7 @@ fn is_finite_number_value(val: Option<&serde_json::Value>) -> bool {
 /// 1. 直近の上流 `Inference` ノードが存在しない場合はエラー。
 /// 2. 上流に同一の並行ノード (`Parallel`) に由来する複数タスクが存在する場合、暗黙のフィールド参照は曖昧となるため、
 ///    `node_id.value` (または `node_id.confidence`) 形式での明示指定を要求するエラーを返す。
-/// 3. 合流する複数の直近上流 `Inference` ノード間で質問タイプ (`question_type`) が不一致の場合はエラー。
-fn resolve_upstream_questions<'a>(
+fn resolve_upstream_inference_nodes<'a>(
     node_id: &'a str,
     node: &'a DagNode,
     field: &str,
@@ -386,16 +401,38 @@ fn resolve_upstream_questions<'a>(
                 .filter(|id| upstream_nodes.contains_key(id.as_str()))
                 .count();
             if matched_count > 1 {
+                let example_field = if field == "confidence" {
+                    "node_id.confidence"
+                } else {
+                    "node_id.value"
+                };
                 return Err(DagValidationError::InvalidCondition {
                     node_id: node_id.to_string(),
                     field: field.to_string(),
                     reason: format!(
-                        "並行ノードからの合流ノードでは複数の推論結果が存在するため、暗黙の '{field}' フィールドは使用できません。'node_id.value' 形式で評価対象ノードを明示的に指定してください。"
+                        "並行ノードからの合流ノードでは複数の推論結果が存在するため、暗黙の '{field}' フィールドは使用できません。'{example_field}' 形式で評価対象ノードを明示的に指定してください。"
                     ),
                 });
             }
         }
     }
+
+    Ok(upstream_nodes)
+}
+
+/// 条件式を評価する対象の上流推論ノード群の質問仕様を探索・解決し、質問タイプの一致を検証する。
+///
+/// # 検証ルール
+/// 1. `resolve_upstream_inference_nodes` による上流存在性・並行曖昧性検証。
+/// 2. 合流する複数の直近上流 `Inference` ノード間で質問タイプ (`question_type`) が不一致の場合はエラー。
+fn resolve_upstream_questions<'a>(
+    node_id: &'a str,
+    node: &'a DagNode,
+    field: &str,
+    dag: &'a DagDefinition,
+    rev_adj: &HashMap<&str, Vec<&str>>,
+) -> Result<IndexMap<&'a str, &'a Question>, DagValidationError> {
+    let upstream_nodes = resolve_upstream_inference_nodes(node_id, node, field, dag, rev_adj)?;
 
     // 合流する全上流 Inference ノード間で質問タイプ (question_type) が一致しているか検証。
     let first_type = upstream_nodes.values().next().unwrap().question_type;
@@ -634,6 +671,7 @@ fn validate_single_condition(
             Ok(())
         }
         ConditionField::Confidence => {
+            resolve_upstream_inference_nodes(node_id, node, &cond.field, dag, rev_adj)?;
             if cond.op == NodeConditionOp::In {
                 return Err(DagValidationError::InvalidCondition {
                     node_id: node_id.to_string(),
@@ -652,6 +690,7 @@ fn validate_single_condition(
             Ok(())
         }
         ConditionField::Route => {
+            resolve_upstream_inference_nodes(node_id, node, &cond.field, dag, rev_adj)?;
             if !matches!(cond.op, NodeConditionOp::Eq | NodeConditionOp::Neq) {
                 return Err(DagValidationError::InvalidCondition {
                     node_id: node_id.to_string(),
@@ -1673,8 +1712,8 @@ mod tests {
         nodes_hetero.insert(
             "root".to_string(),
             DagNode {
-                node_type: DagNodeType::Branch,
-                question: None,
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_noul("ルート推論".to_string())),
                 conditions: vec![
                     NodeCondition {
                         field: "confidence".to_string(),
@@ -1777,8 +1816,8 @@ mod tests {
         nodes_homo.insert(
             "root".to_string(),
             DagNode {
-                node_type: DagNodeType::Branch,
-                question: None,
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_noul("ルート推論".to_string())),
                 conditions: vec![
                     NodeCondition {
                         field: "confidence".to_string(),
@@ -1899,5 +1938,282 @@ mod tests {
                 ..
             } if node_id == "join_node" && field == "answer"
         ));
+    }
+
+    #[test]
+    fn test_parallel_and_escalate_cannot_have_conditions() {
+        // 1. Parallel ノードに conditions が定義されている場合は拒否
+        let mut nodes = IndexMap::new();
+        nodes.insert(
+            "p_task".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_noul("並行タスク？".to_string())),
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        nodes.insert(
+            "parallel".to_string(),
+            DagNode {
+                node_type: DagNodeType::Parallel,
+                question: None,
+                conditions: vec![NodeCondition {
+                    field: "confidence".to_string(),
+                    op: NodeConditionOp::ConfidenceGte,
+                    value: Some(serde_json::json!(0.5)),
+                    target_node: "join".to_string(),
+                }],
+                parallel_nodes: vec!["p_task".to_string()],
+                join_node: Some("join".to_string()),
+                reason: None,
+            },
+        );
+        nodes.insert(
+            "join".to_string(),
+            DagNode {
+                node_type: DagNodeType::Escalate,
+                question: None,
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: Some("合流".to_string()),
+            },
+        );
+
+        let dag_parallel_cond = DagDefinition {
+            dag_id: "parallel_with_cond".to_string(),
+            timeout_ms: 100,
+            entry_node: "parallel".to_string(),
+            nodes,
+        };
+        let err_parallel = validate_dag(&dag_parallel_cond)
+            .expect_err("Parallel ノードに conditions が存在する場合はエラーとなること。");
+        assert!(matches!(
+            err_parallel,
+            DagValidationError::InvalidNodeSpec {
+                ref node_id,
+                node_type: DagNodeType::Parallel,
+                ..
+            } if node_id == "parallel"
+        ));
+
+        // 2. Escalate ノードに conditions が定義されている場合は拒否
+        let mut nodes_esc = IndexMap::new();
+        nodes_esc.insert(
+            "root".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_noul("推論？".to_string())),
+                conditions: vec![NodeCondition {
+                    field: "answer".to_string(),
+                    op: NodeConditionOp::Eq,
+                    value: Some(serde_json::Value::Bool(true)),
+                    target_node: "term".to_string(),
+                }],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        nodes_esc.insert(
+            "term".to_string(),
+            DagNode {
+                node_type: DagNodeType::Escalate,
+                question: None,
+                conditions: vec![NodeCondition {
+                    field: "confidence".to_string(),
+                    op: NodeConditionOp::ConfidenceGte,
+                    value: Some(serde_json::json!(0.5)),
+                    target_node: "root".to_string(),
+                }],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: Some("終端".to_string()),
+            },
+        );
+
+        let dag_esc_cond = DagDefinition {
+            dag_id: "esc_with_cond".to_string(),
+            timeout_ms: 100,
+            entry_node: "root".to_string(),
+            nodes: nodes_esc,
+        };
+        let err_esc = validate_dag(&dag_esc_cond)
+            .expect_err("Escalate ノードに conditions が存在する場合はエラーとなること。");
+        assert!(matches!(
+            err_esc,
+            DagValidationError::InvalidNodeSpec {
+                ref node_id,
+                node_type: DagNodeType::Escalate,
+                ..
+            } if node_id == "term"
+        ));
+    }
+
+    #[test]
+    fn test_branch_without_upstream_inference_rejects_confidence_and_route() {
+        // 1. entry_node が Branch で field: "confidence" を評価しようとする場合は拒否
+        let mut nodes_conf = IndexMap::new();
+        nodes_conf.insert(
+            "entry_branch".to_string(),
+            DagNode {
+                node_type: DagNodeType::Branch,
+                question: None,
+                conditions: vec![NodeCondition {
+                    field: "confidence".to_string(),
+                    op: NodeConditionOp::ConfidenceGte,
+                    value: Some(serde_json::json!(0.8)),
+                    target_node: "term".to_string(),
+                }],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        nodes_conf.insert(
+            "term".to_string(),
+            DagNode {
+                node_type: DagNodeType::Escalate,
+                question: None,
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: Some("終端".to_string()),
+            },
+        );
+
+        let dag_conf = DagDefinition {
+            dag_id: "branch_entry_conf".to_string(),
+            timeout_ms: 100,
+            entry_node: "entry_branch".to_string(),
+            nodes: nodes_conf,
+        };
+        let err_conf = validate_dag(&dag_conf)
+            .expect_err("上流推論ノード無しの confidence 評価は拒否されること。");
+        assert!(matches!(
+            err_conf,
+            DagValidationError::InvalidCondition {
+                ref node_id,
+                ref field,
+                ..
+            } if node_id == "entry_branch" && field == "confidence"
+        ));
+
+        // 2. entry_node が Branch で field: "route" を評価しようとする場合は拒否
+        let mut nodes_route = IndexMap::new();
+        nodes_route.insert(
+            "entry_branch".to_string(),
+            DagNode {
+                node_type: DagNodeType::Branch,
+                question: None,
+                conditions: vec![NodeCondition {
+                    field: "route".to_string(),
+                    op: NodeConditionOp::Eq,
+                    value: Some(serde_json::json!("auto_execute")),
+                    target_node: "term".to_string(),
+                }],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        nodes_route.insert(
+            "term".to_string(),
+            DagNode {
+                node_type: DagNodeType::Escalate,
+                question: None,
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: Some("終端".to_string()),
+            },
+        );
+
+        let dag_route = DagDefinition {
+            dag_id: "branch_entry_route".to_string(),
+            timeout_ms: 100,
+            entry_node: "entry_branch".to_string(),
+            nodes: nodes_route,
+        };
+        let err_route = validate_dag(&dag_route)
+            .expect_err("上流推論ノード無しの route 評価は拒否されること。");
+        assert!(matches!(
+            err_route,
+            DagValidationError::InvalidCondition {
+                ref node_id,
+                ref field,
+                ..
+            } if node_id == "entry_branch" && field == "route"
+        ));
+    }
+
+    #[test]
+    fn test_branch_with_upstream_inference_allows_confidence_and_route() {
+        let mut nodes = IndexMap::new();
+        nodes.insert(
+            "root".to_string(),
+            DagNode {
+                node_type: DagNodeType::Inference,
+                question: Some(Question::new_noul("推論？".to_string())),
+                conditions: vec![NodeCondition {
+                    field: "answer".to_string(),
+                    op: NodeConditionOp::Eq,
+                    value: Some(serde_json::Value::Bool(true)),
+                    target_node: "branch".to_string(),
+                }],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        nodes.insert(
+            "branch".to_string(),
+            DagNode {
+                node_type: DagNodeType::Branch,
+                question: None,
+                conditions: vec![
+                    NodeCondition {
+                        field: "route".to_string(),
+                        op: NodeConditionOp::Eq,
+                        value: Some(serde_json::json!("auto_execute")),
+                        target_node: "term".to_string(),
+                    },
+                    NodeCondition {
+                        field: "confidence".to_string(),
+                        op: NodeConditionOp::ConfidenceGte,
+                        value: Some(serde_json::json!(0.7)),
+                        target_node: "term".to_string(),
+                    },
+                ],
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: None,
+            },
+        );
+        nodes.insert(
+            "term".to_string(),
+            DagNode {
+                node_type: DagNodeType::Escalate,
+                question: None,
+                conditions: Vec::new(),
+                parallel_nodes: Vec::new(),
+                join_node: None,
+                reason: Some("終端".to_string()),
+            },
+        );
+
+        let dag = DagDefinition {
+            dag_id: "branch_with_upstream_inference".to_string(),
+            timeout_ms: 100,
+            entry_node: "root".to_string(),
+            nodes,
+        };
+        assert!(
+            validate_dag(&dag).is_ok(),
+            "上流に Inference ノードが存在する Branch ノードでの confidence / route 評価は合格すること。"
+        );
     }
 }

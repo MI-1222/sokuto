@@ -184,7 +184,12 @@ impl JevTokenizer {
     /// トークナイズを呼び出さないユニットテスト用のダミートークナイザーを生成する。
     #[cfg(test)]
     pub(crate) fn empty_for_test() -> Self {
-        let word_level = tokenizers::models::wordlevel::WordLevel::default();
+        let vocab = [("[UNK]".to_string(), 0u32)].into_iter().collect();
+        let word_level = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("[UNK]".to_string())
+            .build()
+            .expect("テスト用 WordLevel 構築失敗。");
         Self {
             inner: tokenizers::Tokenizer::new(word_level),
             op_token_id: 0,

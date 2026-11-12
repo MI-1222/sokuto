@@ -301,6 +301,13 @@ impl InferenceEngine {
         let op_indices_tensor = TensorRef::from_array_view(([batch_size, num_options], op_indices))
             .map_err(RuntimeError::Ort)?;
 
+        #[cfg(test)]
+        if self.sessions.is_empty() {
+            // テスト用空エンジンの場合、ゼロロジットでダミー応答
+            out_logits.fill(0.0);
+            return Ok(());
+        }
+
         // 4. セッションプールから空きセッションを獲得 (非ブロッキング探索 -> ラウンドロビン待機)
         let mut session = acquire_pooled_session(&self.sessions, &self.next_session_idx, "")?;
 

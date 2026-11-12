@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
 use sokuto_core::contract::calibration::CalibrationConfig;
-use sokuto_core::gating::DecisionRoute;
 use sokuto_core::schema::{Answer, AnswerPayload};
 
 use crate::dag::interpolate::{NodeContextValue, interpolate_prompt, interpolate_question};
@@ -457,16 +456,6 @@ pub fn evaluate_conditions(
     None
 }
 
-/// 条件値 (`serde_json::Value`) を有限な `f64` として解釈する。
-///
-/// JSON 数値リテラルに加えて、`"3"` や `"3.0"` のような数値文字列もパースして返却する。
-fn parse_condition_f64(value: Option<&serde_json::Value>) -> Option<f64> {
-    let val = value?;
-    val.as_f64()
-        .or_else(|| val.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
-        .filter(|n| n.is_finite())
-}
-
 /// コンテキストノード参照 (`node_id.prop`) で参照可能なプロパティ種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContextProp {
@@ -533,7 +522,7 @@ fn matches_condition(
 /// `confidence` フィールドに対する閾値比較を評価する。
 fn matches_confidence(cond: &NodeCondition, answer: Option<&Answer>) -> bool {
     let conf = answer.map(Answer::effective_confidence).unwrap_or(0.0);
-    let Some(target_val) = parse_condition_f64(cond.value.as_ref()) else {
+    let Some(target_val) = cond.value_as_f64() else {
         return false;
     };
     let normalized_op = match cond.op {
@@ -570,13 +559,7 @@ fn matches_route(cond: &NodeCondition, answer: Option<&Answer>) -> bool {
     let Some(gating) = answer.and_then(|a| a.gating.as_ref()) else {
         return false;
     };
-    let route_str = match gating.route {
-        DecisionRoute::AutoExecute => "auto_execute",
-        DecisionRoute::ConfirmOrEscalate => "confirm_or_escalate",
-        DecisionRoute::Fallback => "fallback",
-    };
-
-    matches_str_eq_neq(cond.op, route_str, cond.value.as_ref())
+    matches_str_eq_neq(cond.op, gating.route.as_str(), cond.value.as_ref())
 }
 
 /// `answer` / `value` フィールドに対する型別 (Noul / Choice / Score) 条件評価を行う。
@@ -588,7 +571,8 @@ fn matches_answer_value(cond: &NodeCondition, ans: &Answer) -> bool {
         return matches_choice_value(cond, choice_val);
     }
     if let Some(score_val) = ans.as_score() {
-        return parse_condition_f64(cond.value.as_ref())
+        return cond
+            .value_as_f64()
             .is_some_and(|target_num| cond.op.eval_f64(score_val, target_num));
     }
     false
@@ -614,7 +598,7 @@ fn matches_noul_value(cond: &NodeCondition, noul_val: f64) -> bool {
         };
     }
 
-    parse_condition_f64(cond.value.as_ref())
+    cond.value_as_f64()
         .is_some_and(|target_num| cond.op.eval_f64(noul_val, target_num))
 }
 
@@ -690,7 +674,7 @@ fn matches_context_property(
             }
         }
         ContextProp::Confidence => {
-            let Some(target_num) = parse_condition_f64(cond.value.as_ref()) else {
+            let Some(target_num) = cond.value_as_f64() else {
                 return false;
             };
             let normalized_op = match cond.op {
@@ -706,6 +690,7 @@ fn matches_context_property(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sokuto_core::gating::DecisionRoute;
 
     #[test]
     fn test_evaluate_conditions_confidence() {

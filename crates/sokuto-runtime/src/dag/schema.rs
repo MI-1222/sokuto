@@ -78,6 +78,24 @@ pub struct NodeCondition {
     pub target_node: String,
 }
 
+impl NodeCondition {
+    /// 自身の `value` フィールドを有限な `f64` として解釈する。
+    pub fn value_as_f64(&self) -> Option<f64> {
+        parse_condition_f64(self.value.as_ref())
+    }
+}
+
+/// 条件値 (`serde_json::Value`) を有限な `f64` として解釈する。
+///
+/// JSON 数値リテラルに加えて、`"3"` や `"3.0"` のような数値文字列もパースして返却する。
+/// 有限な数値でない場合 (`NaN`, `Infinity`, パース失敗など) は `None` を返す。
+pub fn parse_condition_f64(value: Option<&serde_json::Value>) -> Option<f64> {
+    let val = value?;
+    val.as_f64()
+        .or_else(|| val.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+        .filter(|n| n.is_finite())
+}
+
 /// 条件評価演算子。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -232,5 +250,22 @@ mod tests {
         assert!(!NodeConditionOp::In.eval_f64(1.0, 1.0));
         assert!(!NodeConditionOp::ConfidenceGte.eval_f64(1.0, 0.5));
         assert!(!NodeConditionOp::ConfidenceLt.eval_f64(0.2, 0.5));
+    }
+
+    #[test]
+    fn test_parse_condition_f64() {
+        let num_val = serde_json::json!(42.5);
+        assert_eq!(parse_condition_f64(Some(&num_val)), Some(42.5));
+
+        let str_val = serde_json::json!("  -12.5  ");
+        assert_eq!(parse_condition_f64(Some(&str_val)), Some(-12.5));
+
+        let invalid_str = serde_json::json!("not_a_number");
+        assert_eq!(parse_condition_f64(Some(&invalid_str)), None);
+
+        let bool_val = serde_json::json!(true);
+        assert_eq!(parse_condition_f64(Some(&bool_val)), None);
+
+        assert_eq!(parse_condition_f64(None), None);
     }
 }

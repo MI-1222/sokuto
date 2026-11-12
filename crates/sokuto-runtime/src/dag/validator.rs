@@ -320,18 +320,6 @@ pub fn validate_dag(dag: &DagDefinition) -> Result<(), DagValidationError> {
     Ok(())
 }
 
-/// 条件値 (`serde_json::Value`) が有限な `f64` (または数値文字列) として解釈可能か判定する。
-fn is_finite_number_value(val: Option<&serde_json::Value>) -> bool {
-    let Some(v) = val else { return false };
-    if let Some(n) = v.as_f64() {
-        return n.is_finite();
-    }
-    if let Some(s) = v.as_str() {
-        return s.trim().parse::<f64>().is_ok_and(|f| f.is_finite());
-    }
-    false
-}
-
 /// 条件式を評価する対象の上流推論ノード群を探索・解決する。
 ///
 /// `Inference` ノードの場合は自身の `question` を返し、
@@ -634,7 +622,7 @@ fn validate_single_condition(
                                 .to_string(),
                         });
                     }
-                    if !is_finite_number_value(cond.value.as_ref()) {
+                    if cond.value_as_f64().is_none() {
                         return Err(DagValidationError::InvalidCondition {
                             node_id: node_id.to_string(),
                             field: cond.field.clone(),
@@ -680,7 +668,7 @@ fn validate_single_condition(
                         .to_string(),
                 });
             }
-            if !is_finite_number_value(cond.value.as_ref()) {
+            if cond.value_as_f64().is_none() {
                 return Err(DagValidationError::InvalidCondition {
                     node_id: node_id.to_string(),
                     field: cond.field.clone(),
@@ -815,7 +803,7 @@ fn validate_single_condition(
                             reason: "Score 型判定に対して 'in' 演算子または確信度専用演算子は使用できません。".to_string(),
                         });
                     }
-                    if !is_finite_number_value(cond.value.as_ref()) {
+                    if cond.value_as_f64().is_none() {
                         return Err(DagValidationError::InvalidCondition {
                             node_id: node_id.to_string(),
                             field: cond.field.clone(),
@@ -848,7 +836,7 @@ fn validate_single_condition(
                     | NodeConditionOp::Gte
                     | NodeConditionOp::Lt
                     | NodeConditionOp::Lte => {
-                        if !is_finite_number_value(cond.value.as_ref()) {
+                        if cond.value_as_f64().is_none() {
                             return Err(DagValidationError::InvalidCondition {
                                 node_id: node_id.to_string(),
                                 field: cond.field.clone(),

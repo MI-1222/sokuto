@@ -17,6 +17,6 @@ pub use pool::{
 };
 pub use schema::{
     DagDefinition, DagExecutionResult, DagNode, DagNodeType, NodeCondition, NodeConditionOp,
-    StepExecutionResult,
+    StepExecutionResult, parse_condition_f64,
 };
 pub use validator::{DagValidationError, validate_dag};

@@ -47,29 +47,73 @@ impl<'a> PromptPlaceholder<'a> {
     }
 }
 
+/// プレースホルダーの識別子 (ノード ID またはプロパティ名) として妥当かを検証する。
+///
+/// 空白や記号 (JSON 構文文字等) を含まず、ASCII 英数字・アンダースコア・ハイフンのみで構成されているかを判定する。
+#[inline]
+fn is_valid_placeholder_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+}
+
+/// 波括弧内の文字列を構文解析し、妥当なプレースホルダーであれば `PromptPlaceholder` を返す。
+#[inline]
+pub(crate) fn parse_placeholder(inner: &str) -> Option<PromptPlaceholder<'_>> {
+    if let Some((node_id, prop)) = inner.split_once('.') {
+        if is_valid_placeholder_ident(node_id) && is_valid_placeholder_ident(prop) {
+            Some(PromptPlaceholder {
+                node_id,
+                prop: Some(prop),
+            })
+        } else {
+            None
+        }
+    } else if is_valid_placeholder_ident(inner) {
+        Some(PromptPlaceholder {
+            node_id: inner,
+            prop: None,
+        })
+    } else {
+        None
+    }
+}
+
 /// テンプレート文字列内の `{...}` プレースホルダーを走査・抽出する。
+///
+/// JSON オブジェクトリテラル内の波括弧 (例: `{"status": {node1.value}}`) が
+/// 含まれる場合でも、外側の波括弧と誤結合せず、内側の有効なプレースホルダーのみを抽出する。
 pub(crate) fn extract_placeholders(template: &str) -> Vec<PromptPlaceholder<'_>> {
     let mut placeholders = Vec::new();
     let mut cursor = 0;
-    while let Some(open) = template[cursor..].find('{') {
-        let open_idx = cursor + open;
-        let Some(close) = template[open_idx..].find('}') else {
+
+    while cursor < template.len() {
+        let Some(rel_open) = template[cursor..].find('{') else {
             break;
         };
-        let close_idx = open_idx + close;
-        let key = &template[open_idx + 1..close_idx];
-        if let Some((node_id, prop)) = key.split_once('.') {
-            placeholders.push(PromptPlaceholder {
-                node_id,
-                prop: Some(prop),
-            });
-        } else {
-            placeholders.push(PromptPlaceholder {
-                node_id: key,
-                prop: None,
-            });
+        let mut open_idx = cursor + rel_open;
+
+        loop {
+            let Some(rel_close) = template[open_idx + 1..].find('}') else {
+                return placeholders;
+            };
+            let close_idx = open_idx + 1 + rel_close;
+
+            if let Some(inner_rel_open) = template[open_idx + 1..close_idx].find('{') {
+                open_idx = open_idx + 1 + inner_rel_open;
+                continue;
+            }
+
+            let inner = &template[open_idx + 1..close_idx];
+            if let Some(ph) = parse_placeholder(inner) {
+                placeholders.push(ph);
+                cursor = close_idx + 1;
+                break;
+            } else {
+                cursor = open_idx + 1;
+                break;
+            }
         }
-        cursor = close_idx + 1;
     }
     placeholders
 }
@@ -78,6 +122,8 @@ pub(crate) fn extract_placeholders(template: &str) -> Vec<PromptPlaceholder<'_>>
 ///
 /// プレースホルダー `{node_id.value}`, `{node_id.answer}`, `{node_id.confidence}` を
 /// 検出してコンテキスト内の対応値に置換する。
+/// JSON オブジェクトリテラル内の波括弧 (例: `{"status": {node1.value}}`) が含まれる場合でも
+/// 外側と内側の波括弧を誤結合せず正しく展開する。
 ///
 /// # 引数
 /// - `template`: プレースホルダーを含むテンプレート文字列。
@@ -92,36 +138,55 @@ pub fn interpolate_prompt(
     output.reserve(template.len() + 64);
     let mut cursor = 0;
 
-    while let Some(open) = template[cursor..].find('{') {
-        let open_idx = cursor + open;
+    while cursor < template.len() {
+        let Some(rel_open) = template[cursor..].find('{') else {
+            break;
+        };
+        let mut open_idx = cursor + rel_open;
         output.push_str(&template[cursor..open_idx]);
 
-        if let Some(close) = template[open_idx..].find('}') {
-            let close_idx = open_idx + close;
-            let key = &template[open_idx + 1..close_idx];
+        loop {
+            let Some(rel_close) = template[open_idx + 1..].find('}') else {
+                output.push_str(&template[open_idx..]);
+                return;
+            };
+            let close_idx = open_idx + 1 + rel_close;
 
-            if let Some((node_id, prop)) = key.split_once('.') {
-                if let Some(ctx_val) = context.get(node_id) {
-                    match prop {
-                        "value" | "answer" => output.push_str(&ctx_val.value),
-                        "confidence" => {
-                            let _ = write!(output, "{:.3}", ctx_val.confidence);
+            if let Some(inner_rel_open) = template[open_idx + 1..close_idx].find('{') {
+                let new_open_idx = open_idx + 1 + inner_rel_open;
+                output.push_str(&template[open_idx..new_open_idx]);
+                open_idx = new_open_idx;
+                continue;
+            }
+
+            let inner = &template[open_idx + 1..close_idx];
+            if let Some(ph) = parse_placeholder(inner) {
+                if let Some(prop) = ph.prop {
+                    if let Some(ctx_val) = context.get(ph.node_id) {
+                        match prop {
+                            "value" | "answer" => output.push_str(&ctx_val.value),
+                            "confidence" => {
+                                let _ = write!(output, "{:.3}", ctx_val.confidence);
+                            }
+                            _ => output.push_str("null"),
                         }
-                        _ => output.push_str("null"),
+                    } else {
+                        // 未解決プレースホルダーはそのまま保持する
+                        output.push_str(&template[open_idx..=close_idx]);
                     }
+                } else if let Some(ctx_val) = context.get(ph.node_id) {
+                    output.push_str(&ctx_val.value);
                 } else {
-                    // 未解決プレースホルダーはそのまま保持する
                     output.push_str(&template[open_idx..=close_idx]);
                 }
-            } else if let Some(ctx_val) = context.get(key) {
-                output.push_str(&ctx_val.value);
+                cursor = close_idx + 1;
+                break;
             } else {
-                output.push_str(&template[open_idx..=close_idx]);
+                // 有効なプレースホルダーでない波括弧 (JSON リテラル等) はそのまま出力
+                output.push('{');
+                cursor = open_idx + 1;
+                break;
             }
-            cursor = close_idx + 1;
-        } else {
-            cursor = open_idx;
-            break;
         }
     }
     output.push_str(&template[cursor..]);
@@ -281,5 +346,74 @@ mod tests {
         assert_eq!(placeholders[2].node_id, "score");
         assert_eq!(placeholders[2].prop, None);
         assert_eq!(placeholders[2].as_str(), "score");
+    }
+
+    #[test]
+    fn test_extract_placeholders_with_json_literal() {
+        // 1. プレースホルダーを含まない純粋な JSON リテラル
+        let json_plain = r#"{"status": "ok", "code": 200, "flag": true}"#;
+        assert!(extract_placeholders(json_plain).is_empty());
+
+        // 2. 波括弧誤結合の典型例: JSON オブジェクト内にプレースホルダーが含まれる場合
+        let json_nested = r#"{"status": {node1.value}}"#;
+        let phs = extract_placeholders(json_nested);
+        assert_eq!(phs.len(), 1);
+        assert_eq!(phs[0].node_id, "node1");
+        assert_eq!(phs[0].prop, Some("value"));
+
+        // 3. 多重ネストされた JSON オブジェクト内のプレースホルダー
+        let json_deep = r#"{"meta": {"inner": {"target": {user_rank.value}}, "enabled": true}}"#;
+        let phs_deep = extract_placeholders(json_deep);
+        assert_eq!(phs_deep.len(), 1);
+        assert_eq!(phs_deep[0].node_id, "user_rank");
+        assert_eq!(phs_deep[0].prop, Some("value"));
+
+        // 4. 複数プレースホルダーが JSON 内に散在する場合
+        let json_multi = r#"{"a": {node_a.answer}, "b": {node_b.confidence}, "c": "literal"}"#;
+        let phs_multi = extract_placeholders(json_multi);
+        assert_eq!(phs_multi.len(), 2);
+        assert_eq!(phs_multi[0].node_id, "node_a");
+        assert_eq!(phs_multi[0].prop, Some("answer"));
+        assert_eq!(phs_multi[1].node_id, "node_b");
+        assert_eq!(phs_multi[1].prop, Some("confidence"));
+    }
+
+    #[test]
+    fn test_interpolate_prompt_with_json_literal() {
+        let mut context = IndexMap::new();
+        context.insert(
+            "node_a".to_string(),
+            NodeContextValue::new("approved", 0.9523),
+        );
+        context.insert("node_b".to_string(), NodeContextValue::new("true", 0.880));
+
+        // 1. JSON リテラル内の単一プレースホルダー
+        let template = r#"{"status": {node_a.value}}"#;
+        let mut output = String::new();
+        interpolate_prompt(template, &context, &mut output);
+        assert_eq!(output, r#"{"status": approved}"#);
+
+        // 2. プレースホルダーを含まない JSON リテラルがそのまま出力されること
+        let template_plain = r#"{"key": "value", "list": [1, 2]}"#;
+        interpolate_prompt(template_plain, &context, &mut output);
+        assert_eq!(output, template_plain);
+
+        // 3. JSON 文字列値としての補間と数値としての補間
+        let template_quoted =
+            r#"{"query": "{node_a.value}", "conf": {node_a.confidence}, "active": {node_b.value}}"#;
+        interpolate_prompt(template_quoted, &context, &mut output);
+        assert_eq!(
+            output,
+            r#"{"query": "approved", "conf": 0.952, "active": true}"#
+        );
+
+        // 4. 通常テキストと JSON 構造が混在するテンプレート
+        let template_mixed =
+            r#"先行結果: {node_a.value}、設定 JSON: {"status": {node_b.answer}} です。"#;
+        interpolate_prompt(template_mixed, &context, &mut output);
+        assert_eq!(
+            output,
+            r#"先行結果: approved、設定 JSON: {"status": true} です。"#
+        );
     }
 }

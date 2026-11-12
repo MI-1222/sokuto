@@ -1318,6 +1318,58 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_dag_valid_json_interpolations() {
+        let mut nodes = IndexMap::new();
+        nodes.insert(
+            "node1".to_string(),
+            DagNode::inference(
+                Question::new_choice(
+                    "初期判定".to_string(),
+                    IndexMap::from([
+                        ("a".to_string(), "選択A".to_string()),
+                        ("b".to_string(), "選択B".to_string()),
+                    ]),
+                ),
+                vec![NodeCondition {
+                    field: "confidence".to_string(),
+                    op: NodeConditionOp::Gte,
+                    value: Some(serde_json::json!(0.0)),
+                    target_node: "node2".to_string(),
+                }],
+            ),
+        );
+
+        // JSON リテラルおよび JSON 内波括弧補間を含むノード
+        let mut criteria = IndexMap::new();
+        criteria.insert(
+            "json_opt".to_string(),
+            r#"設定ペイロード: {"status": {node1.value}, "config": {"meta": "ok"}}"#.to_string(),
+        );
+        nodes.insert(
+            "node2".to_string(),
+            DagNode::inference(
+                Question::new_choice(
+                    r#"入力 JSON: {"raw": "data", "prev": "{node1.value}", "active": true}"#
+                        .to_string(),
+                    criteria,
+                ),
+                Vec::new(),
+            ),
+        );
+
+        let dag = DagDefinition {
+            dag_id: "valid_json_interp_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "node1".to_string(),
+            nodes,
+        };
+        assert!(
+            validate_dag(&dag).is_ok(),
+            "JSON リテラルおよび波括弧を含むプロンプトのバリデーションに合格すること。"
+        );
+    }
+
+    #[test]
     fn test_validate_dag_rejects_invalid_interpolations() {
         // 1. 未定義ノード補間
         let mut nodes1 = IndexMap::new();

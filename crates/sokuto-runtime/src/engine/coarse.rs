@@ -138,6 +138,80 @@ impl CoarseToFineConfig {
     }
 }
 
+/// ネガティブ候補判定のための高速マッチャー。
+///
+/// 候補キーの大文字小文字を無視した比較 (`eq_ignore_ascii_case`) と、
+/// 事前正規化(小文字化・トリム)されたフレーズ群を保持することで、
+/// 候補走査中の不要なヒープアロケーションを排除する。
+#[derive(Debug, Clone)]
+pub struct NegativeCandidateMatcher<'a> {
+    negative_keys: &'a [String],
+    normalized_phrases: Vec<String>,
+}
+
+impl<'a> NegativeCandidateMatcher<'a> {
+    /// 指定されたネガティブキーおよびフレーズからマッチャーを構築する。
+    ///
+    /// # 引数
+    /// - `negative_keys`: 登録済みネガティブキー一覧。
+    /// - `negative_phrases`: 登録済みネガティブ説明文フレーズ一覧。
+    pub fn new(negative_keys: &'a [String], negative_phrases: &[String]) -> Self {
+        let normalized_phrases = negative_phrases
+            .iter()
+            .map(|p| p.trim().to_lowercase())
+            .collect();
+        Self {
+            negative_keys,
+            normalized_phrases,
+        }
+    }
+
+    /// 既定のネガティブフレーズを用いてマッチャーを構築する。
+    ///
+    /// # 引数
+    /// - `negative_keys`: 登録済みネガティブキー一覧。
+    pub fn from_keys(negative_keys: &'a [String]) -> Self {
+        let normalized_phrases = DEFAULT_NEGATIVE_PHRASES
+            .iter()
+            .map(|&s| s.to_string())
+            .collect();
+        Self {
+            negative_keys,
+            normalized_phrases,
+        }
+    }
+
+    /// 候補キーおよび説明文がネガティブ候補であるかを判定する。
+    ///
+    /// # 引数
+    /// - `key`: 候補識別子。
+    /// - `description`: 候補の説明文。
+    #[inline]
+    pub fn is_negative(&self, key: &str, description: &str) -> bool {
+        let trimmed_key = key.trim();
+        if self
+            .negative_keys
+            .iter()
+            .any(|nk| trimmed_key.eq_ignore_ascii_case(nk.trim()))
+        {
+            return true;
+        }
+
+        let trimmed_desc = description.trim();
+        let lower_desc;
+        let desc_haystack = if trimmed_desc.chars().any(|c| c.is_ascii_uppercase()) {
+            lower_desc = trimmed_desc.to_lowercase();
+            lower_desc.as_str()
+        } else {
+            trimmed_desc
+        };
+
+        self.normalized_phrases
+            .iter()
+            .any(|phrase| desc_haystack.contains(phrase.as_str()))
+    }
+}
+
 /// 候補キーおよび説明文が「該当なし / その他」などのネガティブ候補であるかを
 /// 指定されたネガティブキーおよびフレーズに基づいて判定する。
 ///
@@ -154,18 +228,31 @@ pub fn is_negative_candidate_with_phrases(
     negative_keys: &[String],
     negative_phrases: &[String],
 ) -> bool {
-    let lower_key = key.trim().to_lowercase();
+    let trimmed_key = key.trim();
     if negative_keys
         .iter()
-        .any(|nk| nk.to_lowercase() == lower_key)
+        .any(|nk| trimmed_key.eq_ignore_ascii_case(nk.trim()))
     {
         return true;
     }
 
-    let lower_desc = description.trim().to_lowercase();
-    negative_phrases
-        .iter()
-        .any(|phrase| lower_desc.contains(&phrase.to_lowercase()))
+    let trimmed_desc = description.trim();
+    let lower_desc;
+    let desc_haystack = if trimmed_desc.chars().any(|c| c.is_ascii_uppercase()) {
+        lower_desc = trimmed_desc.to_lowercase();
+        lower_desc.as_str()
+    } else {
+        trimmed_desc
+    };
+
+    negative_phrases.iter().any(|phrase| {
+        let p = phrase.trim();
+        if p.chars().any(|c| c.is_ascii_uppercase()) {
+            desc_haystack.contains(&p.to_lowercase())
+        } else {
+            desc_haystack.contains(p)
+        }
+    })
 }
 
 /// 候補キーおよび説明文が「該当なし / その他」などのネガティブ候補であるかを既定のフレーズを用いて判定する。
@@ -175,11 +262,26 @@ pub fn is_negative_candidate_with_phrases(
 /// - `description`: 候補の説明文。
 /// - `negative_keys`: 登録済みネガティブキー一覧。
 pub fn is_negative_candidate(key: &str, description: &str, negative_keys: &[String]) -> bool {
-    let default_phrases: Vec<String> = DEFAULT_NEGATIVE_PHRASES
+    let trimmed_key = key.trim();
+    if negative_keys
         .iter()
-        .map(|&s| s.to_string())
-        .collect();
-    is_negative_candidate_with_phrases(key, description, negative_keys, &default_phrases)
+        .any(|nk| trimmed_key.eq_ignore_ascii_case(nk.trim()))
+    {
+        return true;
+    }
+
+    let trimmed_desc = description.trim();
+    let lower_desc;
+    let desc_haystack = if trimmed_desc.chars().any(|c| c.is_ascii_uppercase()) {
+        lower_desc = trimmed_desc.to_lowercase();
+        lower_desc.as_str()
+    } else {
+        trimmed_desc
+    };
+
+    DEFAULT_NEGATIVE_PHRASES
+        .iter()
+        .any(|&phrase| desc_haystack.contains(phrase))
 }
 
 /// 事前エンコードされた候補埋め込みベクトルを保持・照会するキャッシュ。
@@ -500,17 +602,18 @@ pub fn filter_top_candidates(
     let mut candidate_entries: Vec<(usize, &String, &String)> =
         Vec::with_capacity(total_candidates);
 
-    for (orig_idx, (key, desc)) in candidates.iter().enumerate() {
-        if config.preserve_negative
-            && is_negative_candidate_with_phrases(
-                key,
-                desc,
-                &config.negative_keys,
-                &config.negative_phrases,
-            )
-        {
-            pinned_indices.push(orig_idx);
-        } else {
+    if config.preserve_negative {
+        let matcher =
+            NegativeCandidateMatcher::new(&config.negative_keys, &config.negative_phrases);
+        for (orig_idx, (key, desc)) in candidates.iter().enumerate() {
+            if matcher.is_negative(key, desc) {
+                pinned_indices.push(orig_idx);
+            } else {
+                candidate_entries.push((orig_idx, key, desc));
+            }
+        }
+    } else {
+        for (orig_idx, (key, desc)) in candidates.iter().enumerate() {
             candidate_entries.push((orig_idx, key, desc));
         }
     }
@@ -756,6 +859,17 @@ mod tests {
             &neg_keys,
             &custom_phrases
         ));
+
+        // NegativeCandidateMatcher 経由での判定検証
+        let matcher = NegativeCandidateMatcher::new(&neg_keys, &custom_phrases);
+        assert!(matcher.is_negative("NONE", "無関係な説明文"));
+        assert!(matcher.is_negative("general_inquiry", "その他のお問い合わせ"));
+        assert!(!matcher.is_negative("card_lost", "カード紛失"));
+
+        let default_matcher = NegativeCandidateMatcher::from_keys(&neg_keys);
+        assert!(default_matcher.is_negative("OTHER", "ランダム説明文"));
+        assert!(default_matcher.is_negative("opt", "上記のいずれにも該当しない"));
+        assert!(!default_matcher.is_negative("opt", "通常のお問い合わせ"));
     }
 
     #[test]

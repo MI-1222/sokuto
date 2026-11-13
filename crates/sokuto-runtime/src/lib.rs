@@ -28,9 +28,10 @@ pub use engine::{
     CoarseToFineConfig, DEFAULT_COARSE_THRESHOLD, DEFAULT_DUAL_MAX_BATCH_CHUNK_SIZE,
     DEFAULT_MAX_BATCH_CHUNK_SIZE, DEFAULT_NEGATIVE_KEYS, DEFAULT_NEGATIVE_PHRASES,
     DEFAULT_TOP_M_CANDIDATES, DualSessionEngine, EmbeddingCoarseScorer, ExecutionProvider,
-    FilteredCandidates, InferenceEngine, LexicalCoarseScorer, OptimizationLevel, SessionConfig,
-    StateCacheManager, StateHash, filter_top_candidates, is_aligned_64, is_negative_candidate,
-    is_negative_candidate_with_phrases, reconstruct_probabilities,
+    FilteredCandidates, InferenceEngine, LexicalCoarseScorer, NegativeCandidateMatcher,
+    OptimizationLevel, SessionConfig, StateCacheManager, StateHash, filter_top_candidates,
+    is_aligned_64, is_negative_candidate, is_negative_candidate_with_phrases,
+    reconstruct_probabilities,
 };
 pub use error::{Result, RuntimeError};
 pub use hierarchical::{

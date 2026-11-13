@@ -231,10 +231,7 @@ impl InferenceEngine {
             return Ok(IndexMap::new());
         }
 
-        let mut prepared_coarse = None;
-        let mut coarse_state = None;
-
-        if let Some(coarse_cfg) = coarse_config {
+        let mut plan = if let Some(coarse_cfg) = coarse_config {
             let fallback_scorer;
             let scorer: &dyn CoarseScorer = match coarse_scorer {
                 Some(s) => s,
@@ -245,14 +242,18 @@ impl InferenceEngine {
             };
             let prepared = prepare_coarse_questions(state, questions, coarse_cfg, scorer)?;
             let energies = IndexMap::with_capacity(prepared.original_keys_map.len());
-            coarse_state = Some(CoarseRuntimeState {
-                original_keys_map: prepared.original_keys_map,
-                energies,
-            });
-            prepared_coarse = Some(prepared.processed_questions);
-        }
+            CoarseBatchPlan::Enabled(Box::new(EnabledCoarseBatch {
+                processed_questions: prepared.processed_questions,
+                runtime_state: CoarseRuntimeState {
+                    original_keys_map: prepared.original_keys_map,
+                    energies,
+                },
+            }))
+        } else {
+            CoarseBatchPlan::Disabled { questions }
+        };
 
-        let effective_questions = prepared_coarse.as_ref().unwrap_or(questions);
+        let (effective_questions, mut coarse_state) = plan.as_parts_mut();
         let mut local_scratchpad;
         let scratchpad = match scratchpad {
             Some(sp) => sp,
@@ -285,7 +286,7 @@ impl InferenceEngine {
                     &sub_questions,
                     questions,
                     scratchpad,
-                    coarse_state.as_mut(),
+                    coarse_state.as_deref_mut(),
                     &mut answers,
                 )?;
             }
@@ -301,17 +302,17 @@ impl InferenceEngine {
                 effective_questions,
                 questions,
                 scratchpad,
-                coarse_state.as_mut(),
+                coarse_state,
                 &mut answers,
             )?;
         }
 
-        if let Some(coarse) = coarse_state.as_ref() {
+        if let CoarseBatchPlan::Enabled(enabled) = &plan {
             reconstruct_and_gate_batch_answers(
                 &ctx,
                 questions,
-                &coarse.original_keys_map,
-                &coarse.energies,
+                &enabled.runtime_state.original_keys_map,
+                &enabled.runtime_state.energies,
                 &mut answers,
             )?;
         }
@@ -888,6 +889,37 @@ struct PreparedCoarseBatch {
 struct CoarseRuntimeState {
     original_keys_map: IndexMap<String, Vec<String>>,
     energies: IndexMap<String, Option<f64>>,
+}
+
+/// バッチ推論における粗密 2 段階探索の有効時計画データ。
+struct EnabledCoarseBatch {
+    processed_questions: IndexMap<String, Question>,
+    runtime_state: CoarseRuntimeState,
+}
+
+/// バッチ推論における粗密 2 段階探索の実行計画および状態管理 enum。
+///
+/// 粗密探索の有効・無効状態を一元管理し、縮小済み質問マップと復元用状態の食い違いをコンパイル時に排除する。
+enum CoarseBatchPlan<'a> {
+    /// 粗密探索が無効な状態(元の質問マップを直接参照)
+    Disabled {
+        questions: &'a IndexMap<String, Question>,
+    },
+    /// 粗密探索が有効な状態(縮小済み質問マップおよび復元用実行時状態を保持)
+    Enabled(Box<EnabledCoarseBatch>),
+}
+
+impl<'a> CoarseBatchPlan<'a> {
+    /// 評価対象となる質問マップおよび粗密探索実行時状態の可変参照を分解取得する。
+    fn as_parts_mut(&mut self) -> (&IndexMap<String, Question>, Option<&mut CoarseRuntimeState>) {
+        match self {
+            Self::Disabled { questions } => (*questions, None),
+            Self::Enabled(enabled) => (
+                &enabled.processed_questions,
+                Some(&mut enabled.runtime_state),
+            ),
+        }
+    }
 }
 
 /// 粗密探索の前処理として、候補数が閾値を超える `Choice` 質問を Top-$M$ 候補へ縮小する。

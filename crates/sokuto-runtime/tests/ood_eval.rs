@@ -556,6 +556,85 @@ fn analyze_model_energy_distribution(
     (id_energies, ood_energies)
 }
 
+/// 本番の `GatingConfig` を用いてハイブリッド OOD 検知率 (TPR) および ID 誤棄却率 (FPR) を計測・評価する。
+#[allow(clippy::too_many_arguments)]
+fn evaluate_hybrid_gating_metrics(
+    engine: &InferenceEngine,
+    tokenizer: &JevTokenizer,
+    calib: &CalibrationConfig,
+    coarse_config: &CoarseToFineConfig,
+    gating_config: &GatingConfig,
+    id_samples: &[Sample],
+    ood_samples: &[Sample],
+    tier_name: &str,
+) -> (f64, f64) {
+    let mut ood_detected = 0;
+    for sample in ood_samples {
+        let mut criteria_map = IndexMap::new();
+        for (k, v) in &sample.criteria {
+            criteria_map.insert(k.to_string(), v.to_string());
+        }
+        let question = Question::new_choice(sample.instructions, criteria_map);
+        let answer = engine
+            .evaluate_question_coarse_to_fine_with_gating(
+                tokenizer,
+                sample.state,
+                &question,
+                calib,
+                coarse_config,
+                Some(gating_config),
+            )
+            .expect("推論に成功した。");
+
+        let gating = answer.gating.expect("gating メタデータが存在する。");
+        if gating.is_ood {
+            ood_detected += 1;
+        }
+    }
+    let tpr = (ood_detected as f64 / ood_samples.len() as f64) * 100.0;
+    println!(
+        "{} 本番 GatingConfig OOD 検知率 (TPR): {:.1}% ({}/{}) (目標 90.0% 以上)。",
+        tier_name,
+        tpr,
+        ood_detected,
+        ood_samples.len()
+    );
+
+    let mut id_rejected = 0;
+    for sample in id_samples {
+        let mut criteria_map = IndexMap::new();
+        for (k, v) in &sample.criteria {
+            criteria_map.insert(k.to_string(), v.to_string());
+        }
+        let question = Question::new_choice(sample.instructions, criteria_map);
+        let answer = engine
+            .evaluate_question_coarse_to_fine_with_gating(
+                tokenizer,
+                sample.state,
+                &question,
+                calib,
+                coarse_config,
+                Some(gating_config),
+            )
+            .expect("推論に成功した。");
+
+        let gating = answer.gating.expect("gating メタデータが存在する。");
+        if gating.is_ood {
+            id_rejected += 1;
+        }
+    }
+    let fpr = (id_rejected as f64 / id_samples.len() as f64) * 100.0;
+    println!(
+        "{} 本番 GatingConfig ID 誤棄却率 (FPR): {:.1}% ({}/{}) (目標 25.0% 以下)。",
+        tier_name,
+        fpr,
+        id_rejected,
+        id_samples.len()
+    );
+
+    (tpr, fpr)
+}
+
 #[test]
 fn test_ood_safety_valve_benchmark() {
     let root = workspace_root();
@@ -583,12 +662,44 @@ fn test_ood_safety_valve_benchmark() {
             auroc1
         );
 
-        // 閾値 tau = 2.5 における OOD 検知率 90% 以上 (Exit Criteria 4 達成検証)
-        let tpr1 = (ood1.iter().filter(|&&e| e > 2.5).count() as f64 / ood1.len() as f64) * 100.0;
+        // 閾値 tau = 2.5 におけるエネルギー単体 OOD 検知率・ID 誤棄却率の検証
+        let tpr1_raw =
+            (ood1.iter().filter(|&&e| e > 2.5).count() as f64 / ood1.len() as f64) * 100.0;
+        let fpr1_raw = (id1.iter().filter(|&&e| e > 2.5).count() as f64 / id1.len() as f64) * 100.0;
+        assert!(
+            tpr1_raw >= 90.0,
+            "Tier 1 固定閾値 tau=2.5 における OOD 検知率が 90.0% 以上であること。実際: {:.1}%。",
+            tpr1_raw
+        );
+        assert!(
+            fpr1_raw <= 15.0,
+            "Tier 1 固定閾値 tau=2.5 における ID 誤棄却率 (FPR) が 15.0% 以下であること。実際: {:.1}%。",
+            fpr1_raw
+        );
+
+        // 本番 GatingConfig による実推論ハイブリッド OOD 検知率および誤棄却率の検証
+        let (id_samples, ood_samples) = build_evaluation_datasets();
+        let coarse_config = CoarseToFineConfig::default();
+        let gating_config1 = calib1.gating_config();
+        let (tpr1, fpr1) = evaluate_hybrid_gating_metrics(
+            &engine1,
+            &tok1,
+            &calib1,
+            &coarse_config,
+            &gating_config1,
+            &id_samples,
+            &ood_samples,
+            "Tier 1 (130M-INT8)",
+        );
         assert!(
             tpr1 >= 90.0,
-            "Tier 1 OOD 検知率が 90.0% 以上であること。実際: {:.1}%。",
+            "Tier 1 ハイブリッド OOD 検知率が 90.0% 以上であること。実際: {:.1}%。",
             tpr1
+        );
+        assert!(
+            fpr1 <= 25.0,
+            "Tier 1 ハイブリッド ID 誤棄却率 (FPR) が 25.0% 以下であること。実際: {:.1}%。",
+            fpr1
         );
     }
 
@@ -616,79 +727,31 @@ fn test_ood_safety_valve_benchmark() {
             auroc2
         );
 
-        // calibration.json の設定に基づく GatingConfig での実推論 OOD 検知率検証
+        // calibration.json の設定に基づく GatingConfig での実推論 OOD 検知率・ID 誤棄却率検証
         let (id_samples, ood_samples) = build_evaluation_datasets();
         let coarse_config = CoarseToFineConfig::default();
         let gating_config2 = calib2.gating_config();
 
-        let mut ood_detected = 0;
-        for sample in &ood_samples {
-            let mut criteria_map = IndexMap::new();
-            for (k, v) in &sample.criteria {
-                criteria_map.insert(k.to_string(), v.to_string());
-            }
-            let question = Question::new_choice(sample.instructions, criteria_map);
-            let answer = engine2
-                .evaluate_question_coarse_to_fine_with_gating(
-                    &tok2,
-                    sample.state,
-                    &question,
-                    &calib2,
-                    &coarse_config,
-                    Some(&gating_config2),
-                )
-                .expect("推論に成功した。");
-
-            let gating = answer.gating.expect("gating メタデータが存在する。");
-            if gating.is_ood {
-                ood_detected += 1;
-            }
-        }
-
-        let tpr2 = (ood_detected as f64 / ood_samples.len() as f64) * 100.0;
-        println!(
-            "Tier 2 (310M-INT8) ハイブリッド OOD 検知率: {:.1}% ({}/{}) (目標 90.0% 以上)。",
-            tpr2,
-            ood_detected,
-            ood_samples.len()
-        );
-
-        // ID サンプルの誤棄却率 (FPR) も計測
-        let mut id_rejected = 0;
-        for sample in &id_samples {
-            let mut criteria_map = IndexMap::new();
-            for (k, v) in &sample.criteria {
-                criteria_map.insert(k.to_string(), v.to_string());
-            }
-            let question = Question::new_choice(sample.instructions, criteria_map);
-            let answer = engine2
-                .evaluate_question_coarse_to_fine_with_gating(
-                    &tok2,
-                    sample.state,
-                    &question,
-                    &calib2,
-                    &coarse_config,
-                    Some(&gating_config2),
-                )
-                .expect("推論に成功した。");
-
-            let gating = answer.gating.expect("gating メタデータが存在する。");
-            if gating.is_ood {
-                id_rejected += 1;
-            }
-        }
-        let fpr2 = (id_rejected as f64 / id_samples.len() as f64) * 100.0;
-        println!(
-            "Tier 2 (310M-INT8) ID 誤棄却率 (FPR): {:.1}% ({}/{})。",
-            fpr2,
-            id_rejected,
-            id_samples.len()
+        let (tpr2, fpr2) = evaluate_hybrid_gating_metrics(
+            &engine2,
+            &tok2,
+            &calib2,
+            &coarse_config,
+            &gating_config2,
+            &id_samples,
+            &ood_samples,
+            "Tier 2 (310M-INT8)",
         );
 
         assert!(
             tpr2 >= 90.0,
             "Tier 2 OOD 検知率が 90.0% 以上であること。実際: {:.1}%。",
             tpr2
+        );
+        assert!(
+            fpr2 <= 25.0,
+            "Tier 2 ID 誤棄却率 (FPR) が 25.0% 以下であること。実際: {:.1}%。",
+            fpr2
         );
     }
 }

@@ -29,6 +29,18 @@ fn default_model_dir() -> PathBuf {
     workspace_root().join("models").join("default")
 }
 
+/// DAG 実行結果から最終決定ラベルを抽出する。
+fn extract_decision(res: &sokuto_runtime::dag::DagExecutionResult) -> Option<&str> {
+    res.final_answer
+        .as_ref()
+        .and_then(|a| a.as_choice())
+        .or_else(|| {
+            res.execution_path
+                .last()
+                .and_then(|node| node.strip_prefix("decision_"))
+        })
+}
+
 /// Contrast Pair JSON デシリアライズ用構造体。
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -175,6 +187,8 @@ async fn test_counterfactual_dag_execution_with_model_if_available() {
     let suite = load_contrast_suite("ecommerce_return.json");
     let mut total_latency_us = 0u128;
     let mut evaluated_count = 0;
+    let mut correct_decisions = 0;
+    let mut total_decisions = 0;
 
     for pair in suite.pairs.iter().take(5) {
         let t0 = Instant::now();
@@ -202,7 +216,49 @@ async fn test_counterfactual_dag_execution_with_model_if_available() {
         // 実行ステップ数が 1〜4 ステップに収まり、タイムアウトしていないこと
         assert!(!base_out.execution_path.is_empty());
         assert!(!cf_out.execution_path.is_empty());
+
+        // 期待決定との一致率・正誤判定
+        let base_dec = extract_decision(&base_out);
+        let cf_dec = extract_decision(&cf_out);
+
+        if base_dec == Some(pair.expected_base.as_str()) {
+            correct_decisions += 1;
+        }
+        total_decisions += 1;
+
+        if cf_dec == Some(pair.expected_cf.as_str()) {
+            correct_decisions += 1;
+        }
+        total_decisions += 1;
+
+        assert_eq!(
+            base_dec,
+            Some(pair.expected_base.as_str()),
+            "Base 期待決定不一致 [{}]: 期待={}, 実際={:?}",
+            pair.id,
+            pair.expected_base,
+            base_dec
+        );
+        assert_eq!(
+            cf_dec,
+            Some(pair.expected_cf.as_str()),
+            "CF 期待決定不一致 [{}]: 期待={}, 実際={:?}",
+            pair.id,
+            pair.expected_cf,
+            cf_dec
+        );
     }
+
+    let match_rate = (correct_decisions as f64) / (total_decisions as f64) * 100.0;
+    println!(
+        "実モデル DAG 決定一致率: {:.1}% ({}/{}) (目標 98.0% 以上)",
+        match_rate, correct_decisions, total_decisions
+    );
+    assert!(
+        match_rate >= 98.0,
+        "DAG 決定一致率が目標 (98.0% 以上) を下回りました: {:.1}%",
+        match_rate
+    );
 
     let avg_latency_ms = (total_latency_us as f64) / (evaluated_count as f64) / 1000.0;
     println!("実モデル DAG 平均推論遅延: {:.2}ms", avg_latency_ms);

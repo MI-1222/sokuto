@@ -4,6 +4,7 @@
 //! `tokio::task::spawn_blocking` オフロードによる超低遅延オーケストレーションを提供する。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
@@ -46,6 +47,19 @@ pub enum DagError {
     /// 並行タスクジョインエラーなど。
     #[error("DAG 実行失敗: {0}。")]
     ExecutionFailed(String),
+}
+
+/// DAG 実行キャンセル用 RAII ドロップガード。
+///
+/// タイムアウトや早期エラー発生により Future が中断・ドロップされた際、
+/// 保持するキャンセルフラグを `true` に倒し、キュー待機中または実行開始前の
+/// `spawn_blocking` 推論タスクを即座にスキップさせてセッションプールの枯渇を防ぐ。
+struct CancellationGuard(Arc<AtomicBool>);
+
+impl Drop for CancellationGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 /// インプロセス DAG 実行エンジン。
@@ -110,9 +124,16 @@ impl InProcessDagExecutor {
     ) -> Result<DagExecutionResult, DagError> {
         let timeout_duration = Duration::from_millis(dag.timeout_ms);
         let start_time = Instant::now();
+        let deadline = start_time + timeout_duration;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _guard = CancellationGuard(Arc::clone(&cancelled));
 
         // 2. タイムアウト監視付きでステップループを実行
-        let exec_result = tokio::time::timeout(timeout_duration, self.run_dag(state, dag)).await;
+        let exec_result = tokio::time::timeout(
+            timeout_duration,
+            self.run_dag(state, dag, Arc::clone(&cancelled), deadline),
+        )
+        .await;
 
         match exec_result {
             Ok(Ok(mut res)) => {
@@ -120,7 +141,10 @@ impl InProcessDagExecutor {
                 Ok(res)
             }
             Ok(Err(err)) => Err(err),
-            Err(_) => Err(DagError::Timeout(dag.timeout_ms)),
+            Err(_) => {
+                cancelled.store(true, Ordering::Relaxed);
+                Err(DagError::Timeout(dag.timeout_ms))
+            }
         }
     }
 
@@ -129,6 +153,8 @@ impl InProcessDagExecutor {
         &self,
         initial_state: &str,
         dag: &CompiledDag,
+        cancelled: Arc<AtomicBool>,
+        deadline: Instant,
     ) -> Result<DagExecutionResult, DagError> {
         let mut context: IndexMap<String, NodeContextValue> = IndexMap::new();
         let mut steps: IndexMap<String, StepExecutionResult> = IndexMap::new();
@@ -148,6 +174,9 @@ impl InProcessDagExecutor {
         let mut escalation_gating = None;
 
         loop {
+            if cancelled.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                return Err(DagError::Timeout(dag.timeout_ms));
+            }
             if step_count >= self.max_steps {
                 return Err(DagError::StepLimitExceeded(self.max_steps));
             }
@@ -166,7 +195,13 @@ impl InProcessDagExecutor {
                     conditions,
                     reason,
                 } => {
-                    let handle = self.spawn_inference_task(Arc::clone(&state), question, &context);
+                    let handle = self.spawn_inference_task(
+                        Arc::clone(&state),
+                        question,
+                        &context,
+                        Arc::clone(&cancelled),
+                        deadline,
+                    );
                     let answer = Self::await_inference_task(handle, "スレッド結合失敗").await?;
 
                     // コンテキストに結果を反映
@@ -224,6 +259,10 @@ impl InProcessDagExecutor {
                     join_node,
                     reason,
                 } => {
+                    if cancelled.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                        return Err(DagError::Timeout(dag.timeout_ms));
+                    }
+
                     let mut tasks = Vec::with_capacity(parallel_nodes.len());
 
                     for p_node_id in parallel_nodes {
@@ -238,8 +277,13 @@ impl InProcessDagExecutor {
                             ))
                         })?;
 
-                        let handle =
-                            self.spawn_inference_task(Arc::clone(&state), raw_question, &context);
+                        let handle = self.spawn_inference_task(
+                            Arc::clone(&state),
+                            raw_question,
+                            &context,
+                            Arc::clone(&cancelled),
+                            deadline,
+                        );
                         let p_id = p_node_id.clone();
                         tasks.push(async move {
                             let ans =
@@ -374,17 +418,23 @@ impl InProcessDagExecutor {
     /// `tokio::task::spawn_blocking` により推論エンジンを呼び出すタスクを生成する。
     /// 外部入力テキスト (`state`) は、内部判定値や確信度の漏洩を防ぐため補間対象から除外し、
     /// そのまま推論エンジンに渡す。
+    /// タスク開始時にキャンセルフラグおよびデッドラインを評価し、期限切れやキャンセル時は
+    /// 即座に推論をスキップしてセッションプールとスレッドの枯渇を防ぐ。
     ///
     /// # 引数
     /// - `state`: 初期入力テキスト。
     /// - `raw_question`: 未補間の質問仕様。
     /// - `context`: 現在のノード実行コンテキスト。
+    /// - `cancelled`: キャンセル共有フラグ。
+    /// - `deadline`: 実行デッドライン時刻。
     fn spawn_inference_task(
         &self,
         state: Arc<str>,
         raw_question: &Question,
         context: &IndexMap<String, NodeContextValue>,
-    ) -> tokio::task::JoinHandle<Result<Answer, RuntimeError>> {
+        cancelled: Arc<AtomicBool>,
+        deadline: Instant,
+    ) -> tokio::task::JoinHandle<Result<Answer, DagError>> {
         let interpolated_question = interpolate_question(raw_question, context);
 
         let engine = self.engine.clone();
@@ -392,12 +442,27 @@ impl InProcessDagExecutor {
         let calib_config = self.calib_config.clone();
 
         tokio::task::spawn_blocking(move || {
-            engine.predict_single_question(
-                &tokenizer,
-                &state,
-                &interpolated_question,
-                &calib_config,
-            )
+            // 推論開始前にキャンセルフラグまたはデッドライン到達を検知し、
+            // ONNX Runtime セッションプールの借用や重いテンソル計算を即座にスキップする
+            if cancelled.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                return Err(DagError::ExecutionFailed(
+                    "DAG タイムアウトまたはキャンセルにより推論実行をスキップしました。"
+                        .to_string(),
+                ));
+            }
+
+            let ans = engine
+                .predict_single_question(&tokenizer, &state, &interpolated_question, &calib_config)
+                .map_err(DagError::Runtime)?;
+
+            // 推論完了直後のキャンセルフラグも確認
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(DagError::ExecutionFailed(
+                    "推論完了直前に DAG がタイムアウトまたはキャンセルされました。".to_string(),
+                ));
+            }
+
+            Ok(ans)
         })
     }
 
@@ -407,13 +472,12 @@ impl InProcessDagExecutor {
     /// - `handle`: 推論タスクの JoinHandle。
     /// - `error_context`: スレッド結合失敗時のエラー文脈文字列。
     async fn await_inference_task(
-        handle: tokio::task::JoinHandle<Result<Answer, RuntimeError>>,
+        handle: tokio::task::JoinHandle<Result<Answer, DagError>>,
         error_context: &str,
     ) -> Result<Answer, DagError> {
         handle
             .await
             .map_err(|e| DagError::ExecutionFailed(format!("{error_context}: {e}。")))?
-            .map_err(DagError::Runtime)
     }
 }
 
@@ -1414,8 +1478,15 @@ mod tests {
             Arc::from("User input containing {node_a.value} and {node_a.confidence}");
         let raw_question = Question::new_noul("テスト判定".to_string());
 
-        let handle =
-            executor.spawn_inference_task(Arc::clone(&initial_state), &raw_question, &context);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let handle = executor.spawn_inference_task(
+            Arc::clone(&initial_state),
+            &raw_question,
+            &context,
+            cancelled,
+            deadline,
+        );
 
         // empty_for_test でも空ロジットから Answer が生成されるため、
         // initial_state 内のプレースホルダーが展開されずに生テキストのまま維持されていることを検証する
@@ -1596,5 +1667,86 @@ mod tests {
             prompt.contains("並行タスク2の質問"),
             "Escalate 時のプロンプト定義は古い node_a ではなく最後の並行タスク p2 の質問に基づく必要があります。"
         );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_inference_task_cancelled_or_deadline_skips_execution() {
+        let engine = Arc::new(InferenceEngine::empty_for_test());
+        let tokenizer = Arc::new(JevTokenizer::empty_for_test());
+        let calib = CalibrationConfig::default();
+        let executor = InProcessDagExecutor::new(engine, tokenizer, calib);
+
+        let initial_state: Arc<str> = Arc::from("テスト入力");
+        let raw_question = Question::new_noul("キャンセルのテスト判定".to_string());
+        let context = IndexMap::new();
+
+        // 1. キャンセルフラグが true の場合、即座にスキップエラーとなること
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let handle = executor.spawn_inference_task(
+            Arc::clone(&initial_state),
+            &raw_question,
+            &context,
+            cancelled,
+            deadline,
+        );
+
+        let err = InProcessDagExecutor::await_inference_task(handle, "推論タスク待機")
+            .await
+            .expect_err("キャンセル済みタスクはスキップされる必要があります。");
+        assert!(matches!(
+            err,
+            DagError::ExecutionFailed(ref msg) if msg.contains("スキップ")
+        ));
+
+        // 2. デッドラインが過去の場合、即座にスキップエラーとなること
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let past_deadline = Instant::now()
+            .checked_sub(Duration::from_millis(10))
+            .unwrap_or_else(Instant::now);
+        let handle = executor.spawn_inference_task(
+            Arc::clone(&initial_state),
+            &raw_question,
+            &context,
+            cancelled,
+            past_deadline,
+        );
+
+        let err = InProcessDagExecutor::await_inference_task(handle, "推論タスク待機")
+            .await
+            .expect_err("期限切れタスクはスキップされる必要があります。");
+        assert!(matches!(
+            err,
+            DagError::ExecutionFailed(ref msg) if msg.contains("スキップ")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_dag_timeout_returns_timeout_error() {
+        let engine = Arc::new(InferenceEngine::empty_for_test());
+        let tokenizer = Arc::new(JevTokenizer::empty_for_test());
+        let calib = CalibrationConfig::default();
+        let executor = InProcessDagExecutor::new(engine, tokenizer, calib);
+
+        let mut nodes = IndexMap::new();
+        nodes.insert(
+            "step_1".to_string(),
+            DagNode::inference(Question::new_noul("質問 1".to_string()), vec![]),
+        );
+
+        let dag = DagDefinition {
+            dag_id: "timeout_test_dag".to_string(),
+            // 0ms タイムアウトで確実にタイムアウトを発火させる
+            timeout_ms: 0,
+            entry_node: "step_1".to_string(),
+            nodes,
+        };
+
+        let err = executor
+            .execute("テスト入力", &dag)
+            .await
+            .expect_err("タイムアウトにより失敗する必要があります。");
+
+        assert!(matches!(err, DagError::Timeout(0)));
     }
 }

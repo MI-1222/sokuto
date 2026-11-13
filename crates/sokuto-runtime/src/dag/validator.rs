@@ -76,6 +76,11 @@ pub enum DagValidationError {
     },
 }
 
+/// Parallel ノードに指定可能な最大並列タスク数。
+///
+/// セッションプールおよびスレッドプールの枯渇や過負荷を防ぐための静的検証上限。
+pub const MAX_PARALLEL_NODES: usize = 16;
+
 /// DAG 定義の整合性と無閉路性を静的に検証する。
 ///
 /// # 検査項目
@@ -132,6 +137,17 @@ pub fn compile_dag(dag: &DagDefinition) -> Result<CompiledDag, DagValidationErro
                         node_type: node.node_type(),
                         reason: "Parallel ノードには 1 つ以上の parallel_nodes が必要です。"
                             .to_string(),
+                    });
+                }
+                if parallel_nodes.len() > MAX_PARALLEL_NODES {
+                    return Err(DagValidationError::InvalidNodeSpec {
+                        node_id: node_id.clone(),
+                        node_type: node.node_type(),
+                        reason: format!(
+                            "Parallel ノードの parallel_nodes 数 ({}) が最大許容数 ({}) を超過しています。",
+                            parallel_nodes.len(),
+                            MAX_PARALLEL_NODES
+                        ),
                     });
                 }
                 if !dag.nodes.contains_key(join_node) {
@@ -2244,6 +2260,46 @@ mod tests {
                 ref field,
                 ..
             } if node_id == "branch_nan" && field == "score_step.value"
+        ));
+    }
+
+    #[test]
+    fn test_parallel_nodes_exceeds_max_limit_rejected() {
+        let mut nodes = IndexMap::new();
+        let mut p_node_ids = Vec::new();
+
+        for i in 0..=MAX_PARALLEL_NODES {
+            let id = format!("task_{i}");
+            nodes.insert(
+                id.clone(),
+                DagNode::inference(Question::new_noul(format!("タスク {i}")), Vec::new()),
+            );
+            p_node_ids.push(id);
+        }
+
+        nodes.insert(
+            "parallel_root".to_string(),
+            DagNode::parallel(p_node_ids, "term_node".to_string()),
+        );
+        nodes.insert("term_node".to_string(), DagNode::escalate(Some("合流終端")));
+
+        let dag = DagDefinition {
+            dag_id: "parallel_limit_exceeded_dag".to_string(),
+            timeout_ms: 500,
+            entry_node: "parallel_root".to_string(),
+            nodes,
+        };
+
+        let err = validate_dag(&dag).expect_err("最大許容並列数超過により検証失敗。");
+        assert!(matches!(
+            err,
+            DagValidationError::InvalidNodeSpec {
+                ref node_id,
+                ref node_type,
+                ref reason,
+            } if node_id == "parallel_root"
+                && *node_type == DagNodeType::Parallel
+                && reason.contains("最大許容数")
         ));
     }
 }

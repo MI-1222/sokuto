@@ -21,4 +21,4 @@ pub use schema::{
     DagNodeType, EqualityOp, NodeCondition, NodeConditionOp, StepExecutionResult,
     parse_condition_f64,
 };
-pub use validator::{DagValidationError, compile_dag, validate_dag};
+pub use validator::{DagValidationError, MAX_PARALLEL_NODES, compile_dag, validate_dag};

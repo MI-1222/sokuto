@@ -264,27 +264,17 @@ pub enum NodeConditionOp {
 }
 
 impl NodeConditionOp {
-    /// 浮動小数点数比較で用いる許容誤差イプシロン。
-    const FLOAT_EPSILON: f64 = 1e-6;
-
     /// 2 つの有限浮動小数点数を演算子のセマンティクスに従って許容誤差 (`1e-6`) 付きで比較する。
     ///
-    /// 数値比較演算子 (`Eq`, `Neq`, `Gt`, `Gte`, `Lt`, `Lte`) のみを評価対象とし、
-    /// 集合演算子 (`In`) および確信度専用エイリアス (`ConfidenceGte`, `ConfidenceLt`) に対しては `false` を返す。
+    /// 数値比較演算子 (`Eq`, `Neq`, `Gt`, `Gte`, `Lt`, `Lte`) および確信度エイリアス (`ConfidenceGte`, `ConfidenceLt`) を
+    /// `to_comparison()` 経由で評価対象とし、集合演算子 (`In`) 等の数値比較不能な演算子に対しては `false` を返す。
     ///
     /// # 引数
     /// - `lhs`: 左辺値 (評価対象の実測値)。
     /// - `rhs`: 右辺値 (条件の閾値)。
+    #[inline]
     pub fn eval_f64(&self, lhs: f64, rhs: f64) -> bool {
-        match self {
-            Self::Eq => (lhs - rhs).abs() < Self::FLOAT_EPSILON,
-            Self::Neq => (lhs - rhs).abs() >= Self::FLOAT_EPSILON,
-            Self::Gt => lhs > rhs + Self::FLOAT_EPSILON,
-            Self::Gte => lhs >= rhs - Self::FLOAT_EPSILON,
-            Self::Lt => lhs < rhs - Self::FLOAT_EPSILON,
-            Self::Lte => lhs <= rhs + Self::FLOAT_EPSILON,
-            Self::In | Self::ConfidenceGte | Self::ConfidenceLt => false,
-        }
+        self.to_comparison().is_some_and(|op| op.eval_f64(lhs, rhs))
     }
 
     /// 確信度評価用の演算子を正規化する。
@@ -342,9 +332,6 @@ pub enum EqualityOp {
 }
 
 impl EqualityOp {
-    /// 浮動小数点数比較で用いる許容誤差イプシロン。
-    const FLOAT_EPSILON: f64 = 1e-6;
-
     /// 2 つの等価比較可能な値が条件を満たすかを判定する。
     #[inline]
     pub fn matches<T: PartialEq + ?Sized>(self, lhs: &T, rhs: &T) -> bool {
@@ -357,9 +344,16 @@ impl EqualityOp {
     /// 2 つの有限浮動小数点数を許容誤差 (`1e-6`) 付きで等価比較する。
     #[inline]
     pub fn eval_f64(self, lhs: f64, rhs: f64) -> bool {
-        match self {
-            Self::Eq => (lhs - rhs).abs() < Self::FLOAT_EPSILON,
-            Self::Neq => (lhs - rhs).abs() >= Self::FLOAT_EPSILON,
+        ComparisonOp::from(self).eval_f64(lhs, rhs)
+    }
+}
+
+impl From<EqualityOp> for ComparisonOp {
+    #[inline]
+    fn from(op: EqualityOp) -> Self {
+        match op {
+            EqualityOp::Eq => Self::Eq,
+            EqualityOp::Neq => Self::Neq,
         }
     }
 }
@@ -384,7 +378,7 @@ pub enum ComparisonOp {
 
 impl ComparisonOp {
     /// 浮動小数点数比較で用いる許容誤差イプシロン。
-    const FLOAT_EPSILON: f64 = 1e-6;
+    pub const FLOAT_EPSILON: f64 = 1e-6;
 
     /// 2 つの有限浮動小数点数を演算子のセマンティクスに従って許容誤差 (`1e-6`) 付きで比較する。
     #[inline]
@@ -973,8 +967,10 @@ mod tests {
         assert!(NodeConditionOp::Lt.eval_f64(1.0 - 2e-6, 1.0));
         assert!(NodeConditionOp::Lte.eval_f64(1.0 + 5e-7, 1.0));
         assert!(!NodeConditionOp::In.eval_f64(1.0, 1.0));
-        assert!(!NodeConditionOp::ConfidenceGte.eval_f64(1.0, 0.5));
-        assert!(!NodeConditionOp::ConfidenceLt.eval_f64(0.2, 0.5));
+        assert!(NodeConditionOp::ConfidenceGte.eval_f64(1.0, 0.5));
+        assert!(!NodeConditionOp::ConfidenceGte.eval_f64(0.4, 0.5));
+        assert!(NodeConditionOp::ConfidenceLt.eval_f64(0.2, 0.5));
+        assert!(!NodeConditionOp::ConfidenceLt.eval_f64(0.6, 0.5));
     }
 
     #[test]
@@ -1114,5 +1110,7 @@ mod tests {
         assert!(ComparisonOp::Gte.eval_f64(1.0 - 5e-7, 1.0));
         assert!(ComparisonOp::Lt.eval_f64(1.0 - 2e-6, 1.0));
         assert!(ComparisonOp::Lte.eval_f64(1.0 + 5e-7, 1.0));
+        assert_eq!(ComparisonOp::from(EqualityOp::Eq), ComparisonOp::Eq);
+        assert_eq!(ComparisonOp::from(EqualityOp::Neq), ComparisonOp::Neq);
     }
 }

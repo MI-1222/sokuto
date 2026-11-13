@@ -1205,7 +1205,7 @@ impl DualSessionEngine {
     ///
     /// # エラー
     /// - `dims[0] != 1` またはモデル出力のバッチサイズが 1 でない場合は [`RuntimeError::ModelContractViolation`] を返す。
-    /// - `input_ids` や `attention_mask` の長さが `dims` と一致しない場合は [`RuntimeError::InvalidTensorData`] を返す。
+    /// - `input_ids` や `attention_mask` の長さが `dims` と一致しない場合、または出力テンソルに非有限値 (`NaN` / `Inf`) が含まれる場合は [`RuntimeError::InvalidTensorData`] を返す。
     pub fn encode_and_cache_state(
         &self,
         state_text: &str,
@@ -1279,6 +1279,12 @@ impl DualSessionEngine {
         if shape_vec[0] != 1 {
             return Err(RuntimeError::ModelContractViolation(format!(
                 "Stateモデルの出力テンソルは batch_size == 1 である必要があります: shape={shape_vec:?}。"
+            )));
+        }
+
+        if let Some(&val) = flat_data.iter().find(|v| !v.is_finite()) {
+            return Err(RuntimeError::InvalidTensorData(format!(
+                "State特徴量テンソルに非有限値 (NaN または Inf) が検出されました: {val}。"
             )));
         }
 

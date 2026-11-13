@@ -5,7 +5,7 @@
 
 use indexmap::IndexMap;
 use sokuto_core::schema::{Criteria, Question, QuestionType};
-use std::fmt::Write;
+use std::fmt::{self, Write};
 
 /// 単一ノードのコンテキスト情報。
 ///
@@ -57,12 +57,98 @@ pub(crate) struct PromptPlaceholder<'a> {
     pub prop: Option<&'a str>,
 }
 
+impl fmt::Display for PromptPlaceholder<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.prop {
+            Some(p) => write!(f, "{}.{}", self.node_id, p),
+            None => f.write_str(self.node_id),
+        }
+    }
+}
+
 impl<'a> PromptPlaceholder<'a> {
     /// プレースホルダーの文字列表現を返却する。
     pub fn as_str(&self) -> String {
-        match self.prop {
-            Some(p) => format!("{}.{p}", self.node_id),
-            None => self.node_id.to_string(),
+        self.to_string()
+    }
+}
+
+/// テンプレートのパース結果セグメント。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TemplateSegment<'a> {
+    /// 通常のプレーンテキスト。
+    Text(&'a str),
+    /// 抽出されたプレースホルダー。
+    Placeholder(PromptPlaceholder<'a>),
+}
+
+/// テンプレート文字列をゼロアロケーションで走査・分割するイテレータ。
+#[derive(Debug, Clone)]
+pub(crate) struct TemplateParser<'a> {
+    template: &'a str,
+    cursor: usize,
+}
+
+impl<'a> TemplateParser<'a> {
+    /// 新規パーサーを生成する。
+    #[inline]
+    pub(crate) fn new(template: &'a str) -> Self {
+        Self {
+            template,
+            cursor: 0,
+        }
+    }
+}
+
+impl<'a> Iterator for TemplateParser<'a> {
+    type Item = TemplateSegment<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor >= self.template.len() {
+            return None;
+        }
+
+        let remaining = &self.template[self.cursor..];
+        let Some(rel_open) = remaining.find('{') else {
+            let text = remaining;
+            self.cursor = self.template.len();
+            return Some(TemplateSegment::Text(text));
+        };
+
+        if rel_open > 0 {
+            let text = &self.template[self.cursor..self.cursor + rel_open];
+            self.cursor += rel_open;
+            return Some(TemplateSegment::Text(text));
+        }
+
+        let open_idx = self.cursor;
+        let Some(rel_close) = self.template[open_idx + 1..].find('}') else {
+            let text = &self.template[self.cursor..];
+            self.cursor = self.template.len();
+            return Some(TemplateSegment::Text(text));
+        };
+        let close_idx = open_idx + 1 + rel_close;
+
+        if let Some(inner_rel_open) = self.template[open_idx + 1..close_idx].find('{') {
+            let new_open_idx = open_idx + 1 + inner_rel_open;
+            let text = &self.template[self.cursor..new_open_idx];
+            self.cursor = new_open_idx;
+            return Some(TemplateSegment::Text(text));
+        }
+
+        let inner = &self.template[open_idx + 1..close_idx];
+        if let Some(ph) = parse_placeholder(inner) {
+            self.cursor = close_idx + 1;
+            Some(TemplateSegment::Placeholder(ph))
+        } else {
+            let next_open_rel = self.template[self.cursor + 1..].find('{');
+            let end_idx = match next_open_rel {
+                Some(rel) => self.cursor + 1 + rel,
+                None => self.template.len(),
+            };
+            let text = &self.template[self.cursor..end_idx];
+            self.cursor = end_idx;
+            Some(TemplateSegment::Text(text))
         }
     }
 }
@@ -104,38 +190,12 @@ pub(crate) fn parse_placeholder(inner: &str) -> Option<PromptPlaceholder<'_>> {
 /// JSON オブジェクトリテラル内の波括弧 (例: `{"status": {node1.value}}`) が
 /// 含まれる場合でも、外側の波括弧と誤結合せず、内側の有効なプレースホルダーのみを抽出する。
 pub(crate) fn extract_placeholders(template: &str) -> Vec<PromptPlaceholder<'_>> {
-    let mut placeholders = Vec::new();
-    let mut cursor = 0;
-
-    while cursor < template.len() {
-        let Some(rel_open) = template[cursor..].find('{') else {
-            break;
-        };
-        let mut open_idx = cursor + rel_open;
-
-        loop {
-            let Some(rel_close) = template[open_idx + 1..].find('}') else {
-                return placeholders;
-            };
-            let close_idx = open_idx + 1 + rel_close;
-
-            if let Some(inner_rel_open) = template[open_idx + 1..close_idx].find('{') {
-                open_idx = open_idx + 1 + inner_rel_open;
-                continue;
-            }
-
-            let inner = &template[open_idx + 1..close_idx];
-            if let Some(ph) = parse_placeholder(inner) {
-                placeholders.push(ph);
-                cursor = close_idx + 1;
-                break;
-            } else {
-                cursor = open_idx + 1;
-                break;
-            }
-        }
-    }
-    placeholders
+    TemplateParser::new(template)
+        .filter_map(|segment| match segment {
+            TemplateSegment::Placeholder(ph) => Some(ph),
+            TemplateSegment::Text(_) => None,
+        })
+        .collect()
 }
 
 /// テンプレート文字列をスライス走査し、事前確保済みバッファへインプレース展開する。
@@ -156,31 +216,11 @@ pub fn interpolate_prompt(
 ) {
     output.clear();
     output.reserve(template.len() + 64);
-    let mut cursor = 0;
 
-    while cursor < template.len() {
-        let Some(rel_open) = template[cursor..].find('{') else {
-            break;
-        };
-        let mut open_idx = cursor + rel_open;
-        output.push_str(&template[cursor..open_idx]);
-
-        loop {
-            let Some(rel_close) = template[open_idx + 1..].find('}') else {
-                output.push_str(&template[open_idx..]);
-                return;
-            };
-            let close_idx = open_idx + 1 + rel_close;
-
-            if let Some(inner_rel_open) = template[open_idx + 1..close_idx].find('{') {
-                let new_open_idx = open_idx + 1 + inner_rel_open;
-                output.push_str(&template[open_idx..new_open_idx]);
-                open_idx = new_open_idx;
-                continue;
-            }
-
-            let inner = &template[open_idx + 1..close_idx];
-            if let Some(ph) = parse_placeholder(inner) {
+    for segment in TemplateParser::new(template) {
+        match segment {
+            TemplateSegment::Text(text) => output.push_str(text),
+            TemplateSegment::Placeholder(ph) => {
                 if let Some(prop) = ph.prop {
                     if let Some(ctx_val) = context.get(ph.node_id) {
                         match prop {
@@ -192,24 +232,16 @@ pub fn interpolate_prompt(
                         }
                     } else {
                         // 未解決プレースホルダーはそのまま保持する
-                        output.push_str(&template[open_idx..=close_idx]);
+                        let _ = write!(output, "{{{ph}}}");
                     }
                 } else if let Some(ctx_val) = context.get(ph.node_id) {
                     output.push_str(&ctx_val.value);
                 } else {
-                    output.push_str(&template[open_idx..=close_idx]);
+                    let _ = write!(output, "{{{ph}}}");
                 }
-                cursor = close_idx + 1;
-                break;
-            } else {
-                // 有効なプレースホルダーでない波括弧 (JSON リテラル等) はそのまま出力
-                output.push('{');
-                cursor = open_idx + 1;
-                break;
             }
         }
     }
-    output.push_str(&template[cursor..]);
 }
 
 /// コンテキストに基づき、質問定義の Instructions および Criteria を補間した新しい質問を生成する。
@@ -434,6 +466,46 @@ mod tests {
         assert_eq!(
             output,
             r#"先行結果: approved、設定 JSON: {"status": true} です。"#
+        );
+    }
+
+    #[test]
+    fn test_prompt_placeholder_display() {
+        let ph_with_prop = PromptPlaceholder {
+            node_id: "node_1",
+            prop: Some("confidence"),
+        };
+        assert_eq!(ph_with_prop.to_string(), "node_1.confidence");
+        assert_eq!(ph_with_prop.as_str(), "node_1.confidence");
+
+        let ph_without_prop = PromptPlaceholder {
+            node_id: "node_2",
+            prop: None,
+        };
+        assert_eq!(ph_without_prop.to_string(), "node_2");
+        assert_eq!(ph_without_prop.as_str(), "node_2");
+    }
+
+    #[test]
+    fn test_template_parser_segments() {
+        let template = "Prefix {node_a.value} mid {invalid brace} end {node_b}";
+        let segments: Vec<_> = TemplateParser::new(template).collect();
+
+        assert_eq!(
+            segments,
+            vec![
+                TemplateSegment::Text("Prefix "),
+                TemplateSegment::Placeholder(PromptPlaceholder {
+                    node_id: "node_a",
+                    prop: Some("value"),
+                }),
+                TemplateSegment::Text(" mid "),
+                TemplateSegment::Text("{invalid brace} end "),
+                TemplateSegment::Placeholder(PromptPlaceholder {
+                    node_id: "node_b",
+                    prop: None,
+                }),
+            ]
         );
     }
 }

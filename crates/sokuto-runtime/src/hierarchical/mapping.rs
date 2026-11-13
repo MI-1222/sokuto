@@ -13,6 +13,7 @@ use crate::error::{Result, RuntimeError};
 ///
 /// 大分類 (4〜8 クラスタ) と細分類 (各 8〜12 候補) の双方向高速参照を実現する。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "RawHierarchicalMapping")]
 pub struct HierarchicalMapping {
     /// マッピング全体の識別名。
     pub name: String,
@@ -25,13 +26,51 @@ pub struct HierarchicalMapping {
     /// 細分類識別子から所属する大分類識別子への逆引きマッピング。
     pub fine_to_coarse: IndexMap<String, String>,
     /// 事前キャッシュされた全大分類キーの順序保持リスト。
-    #[serde(default)]
     pub all_coarse_keys: Vec<String>,
     /// 事前キャッシュされた全細分類キーの順序保持リスト。
-    #[serde(default)]
     pub all_fine_keys: Vec<String>,
     /// 受け皿 (None / その他) 候補として判定するキー一覧。
     pub negative_keys: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct RawHierarchicalMapping {
+    name: String,
+    coarse_categories: IndexMap<String, String>,
+    fine_criteria: IndexMap<String, String>,
+    coarse_to_fine: IndexMap<String, Vec<String>>,
+    fine_to_coarse: IndexMap<String, String>,
+    #[serde(default)]
+    all_coarse_keys: Vec<String>,
+    #[serde(default)]
+    all_fine_keys: Vec<String>,
+    #[serde(default)]
+    negative_keys: Vec<String>,
+}
+
+impl From<RawHierarchicalMapping> for HierarchicalMapping {
+    fn from(raw: RawHierarchicalMapping) -> Self {
+        let all_coarse_keys = if raw.all_coarse_keys.is_empty() {
+            raw.coarse_categories.keys().cloned().collect()
+        } else {
+            raw.all_coarse_keys
+        };
+        let all_fine_keys = if raw.all_fine_keys.is_empty() {
+            raw.fine_criteria.keys().cloned().collect()
+        } else {
+            raw.all_fine_keys
+        };
+        Self {
+            name: raw.name,
+            coarse_categories: raw.coarse_categories,
+            fine_criteria: raw.fine_criteria,
+            coarse_to_fine: raw.coarse_to_fine,
+            fine_to_coarse: raw.fine_to_coarse,
+            all_coarse_keys,
+            all_fine_keys,
+            negative_keys: raw.negative_keys,
+        }
+    }
 }
 
 impl HierarchicalMapping {
@@ -48,6 +87,8 @@ impl HierarchicalMapping {
     /// - すべての細分類が `fine_criteria` に定義されていること。
     /// - すべての細分類がいずれか 1 つの大分類にのみ重複なく所属していること。
     /// - `coarse_to_fine` と `fine_to_coarse` が厳密に双方向一致していること。
+    /// - 事前キャッシュ `all_coarse_keys` が `coarse_categories` のキー順序および一覧と完全一致していること。
+    /// - 事前キャッシュ `all_fine_keys` が `fine_criteria` のキー順序および一覧と完全一致していること。
     pub fn validate(&self) -> Result<()> {
         if self.coarse_categories.is_empty() {
             return Err(RuntimeError::InvalidQuestion(
@@ -140,7 +181,38 @@ impl HierarchicalMapping {
             )));
         }
 
+        // 3. 事前キャッシュキーの完全一致・整合性検証
+        if self.all_coarse_keys.len() != self.coarse_categories.len()
+            || self
+                .all_coarse_keys
+                .iter()
+                .zip(self.coarse_categories.keys())
+                .any(|(a, b)| a != b)
+        {
+            return Err(RuntimeError::InvalidQuestion(
+                "事前キャッシュ `all_coarse_keys` が `coarse_categories` のキー順序および一覧と一致していません。".to_string(),
+            ));
+        }
+
+        if self.all_fine_keys.len() != self.fine_criteria.len()
+            || self
+                .all_fine_keys
+                .iter()
+                .zip(self.fine_criteria.keys())
+                .any(|(a, b)| a != b)
+        {
+            return Err(RuntimeError::InvalidQuestion(
+                "事前キャッシュ `all_fine_keys` が `fine_criteria` のキー順序および一覧と一致していません。".to_string(),
+            ));
+        }
+
         Ok(())
+    }
+
+    /// 事前キャッシュされた全大分類キーおよび全細分類キーを、マップ定義から再構築する。
+    pub fn rebuild_key_caches(&mut self) {
+        self.all_coarse_keys = self.coarse_categories.keys().cloned().collect();
+        self.all_fine_keys = self.fine_criteria.keys().cloned().collect();
     }
 
     /// 大分類のキーおよび説明文マップを取得する。
@@ -710,5 +782,73 @@ mod tests {
             "上記のいずれにも該当しないその他の問い合わせ。"
         ));
         assert!(!mapping.is_negative_candidate("activate_my_card", "カード有効化。"));
+    }
+
+    #[test]
+    fn test_deserialization_auto_reconstructs_cached_keys() {
+        let json_data = r#"{
+            "name": "MinimalMapping",
+            "coarse_categories": {
+                "cat_a": "カテゴリAの説明。"
+            },
+            "fine_criteria": {
+                "item_1": "アイテム1の説明。"
+            },
+            "coarse_to_fine": {
+                "cat_a": ["item_1"]
+            },
+            "fine_to_coarse": {
+                "item_1": "cat_a"
+            },
+            "negative_keys": []
+        }"#;
+
+        let mapping: HierarchicalMapping =
+            serde_json::from_str(json_data).expect("JSON からのデシリアライズに成功。");
+        assert_eq!(mapping.all_coarse_keys(), &["cat_a".to_string()]);
+        assert_eq!(mapping.all_fine_keys(), &["item_1".to_string()]);
+        assert!(
+            mapping.validate().is_ok(),
+            "自動再構築されたキーキャッシュにより検証に合格。"
+        );
+    }
+
+    #[test]
+    fn test_validation_detects_inconsistent_cached_keys() {
+        let mut mapping = HierarchicalMapping::banking77();
+
+        // 1. all_coarse_keys の欠落
+        let original_coarse = mapping.all_coarse_keys.clone();
+        mapping.all_coarse_keys.pop();
+        let res = mapping.validate();
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("事前キャッシュ `all_coarse_keys`")
+        );
+
+        // 復元
+        mapping.all_coarse_keys = original_coarse;
+        assert!(mapping.validate().is_ok());
+
+        // 2. all_fine_keys の不一致
+        let original_fine = mapping.all_fine_keys.clone();
+        mapping.all_fine_keys[0] = "unknown_fine_key".to_string();
+        let res = mapping.validate();
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("事前キャッシュ `all_fine_keys`")
+        );
+
+        // 3. rebuild_key_caches による修復
+        mapping.rebuild_key_caches();
+        assert_eq!(mapping.all_fine_keys, original_fine);
+        assert!(
+            mapping.validate().is_ok(),
+            "rebuild_key_caches 呼び出し後の検証に成功。"
+        );
     }
 }

@@ -252,11 +252,21 @@ pub fn compress_f32_to_fp16(src: &[f32]) -> Vec<f16> {
 /// # 引数
 /// - `src`: 入力 `half::f16` スライス。
 /// - `dst`: 出力先 `f32` スライス。
-pub fn decompress_fp16_to_f32(src: &[f16], dst: &mut [f32]) {
-    assert_eq!(src.len(), dst.len(), "展開元と先の要素数が一致しません。");
+///
+/// # エラー
+/// - `src` と `dst` の要素数が一致しない場合に [`RuntimeError::InvalidTensorData`] を返す。
+pub fn decompress_fp16_to_f32(src: &[f16], dst: &mut [f32]) -> Result<()> {
+    if src.len() != dst.len() {
+        return Err(RuntimeError::InvalidTensorData(format!(
+            "展開元要素数 ({}) と展開先要素数 ({}) が一致しません。",
+            src.len(),
+            dst.len()
+        )));
+    }
     for (s, d) in src.iter().zip(dst.iter_mut()) {
         *d = s.to_f32();
     }
+    Ok(())
 }
 
 /// `f32` スライスをトークン単位対称 `INT8` へ圧縮する。
@@ -737,21 +747,69 @@ impl CachedStateFeatures {
     ///
     /// 非圧縮時は保持している `Arc<Value>` をそのままゼロコピーで返却し、
     /// 圧縮時はオンザフライで ONNX Runtime のアロケータメモリへ直接デコードを展開してテンソルを生成する。
+    ///
+    /// # エラー
+    /// - キャッシュテンソルが 3 次元でない場合や `self.batch_size() != 1` の場合は [`RuntimeError::ModelContractViolation`] を返す。
+    /// - テンソル要素数のオーバーフローや、実データ長が形状と一致しない場合は [`RuntimeError::InvalidTensorData`] を返す。
     pub fn as_ort_value(&self) -> Result<Arc<Value>> {
+        if self.shape.len() != 3 {
+            return Err(RuntimeError::ModelContractViolation(format!(
+                "State特徴量は3次元テンソルである必要があります: {:?}。",
+                self.shape
+            )));
+        }
+
+        let batch_size = self.batch_size();
+        if batch_size != 1 {
+            return Err(RuntimeError::ModelContractViolation(format!(
+                "キャッシュエントリは batch_size == 1 である必要があります: batch_size={batch_size}。"
+            )));
+        }
+
+        let seq_len = self.seq_len();
+        let hidden_size = self.hidden_size();
+        let single_len = seq_len.checked_mul(hidden_size).ok_or_else(|| {
+            RuntimeError::InvalidTensorData(
+                "テンソル要素数の計算がオーバーフローしました。".to_string(),
+            )
+        })?;
+
         match &self.payload {
-            CachedTensorPayload::Raw(val) => Ok(Arc::clone(val)),
+            CachedTensorPayload::Raw(val) => {
+                let (_, slice) = val.try_extract_tensor::<f32>().map_err(RuntimeError::Ort)?;
+                if slice.len() != single_len {
+                    return Err(RuntimeError::InvalidTensorData(format!(
+                        "Raw キャッシュデータの要素数 ({}) が期待値 ({single_len}) と一致しません。",
+                        slice.len()
+                    )));
+                }
+                Ok(Arc::clone(val))
+            }
             CachedTensorPayload::Fp16(compressed) => {
+                if compressed.len() != single_len {
+                    return Err(RuntimeError::InvalidTensorData(format!(
+                        "FP16 キャッシュデータの要素数 ({}) が期待値 ({single_len}) と一致しません。",
+                        compressed.len()
+                    )));
+                }
                 let allocator = Allocator::default();
                 let mut tensor = Tensor::<f32>::new(&allocator, self.shape.clone())
                     .map_err(RuntimeError::Ort)?;
                 let (_, dst) = tensor
                     .try_extract_tensor_mut::<f32>()
                     .map_err(RuntimeError::Ort)?;
-                decompress_fp16_to_f32(compressed, dst);
+                decompress_fp16_to_f32(compressed, dst)?;
                 Ok(Arc::new(tensor.into_dyn()))
             }
             CachedTensorPayload::Int8Symmetric { quantized, scales } => {
-                let hidden_size = NonZeroUsize::new(self.hidden_size()).ok_or_else(|| {
+                if quantized.len() != single_len || scales.len() != seq_len {
+                    return Err(RuntimeError::InvalidTensorData(format!(
+                        "INT8 キャッシュデータの要素数 (quantized={}, scales={}) が期待値 ({single_len}, {seq_len}) と一致しません。",
+                        quantized.len(),
+                        scales.len()
+                    )));
+                }
+                let non_zero_hidden_size = NonZeroUsize::new(hidden_size).ok_or_else(|| {
                     RuntimeError::InvalidTensorData(
                         "Int8Symmetric キャッシュの hidden_size は 1 以上である必要があります。"
                             .to_string(),
@@ -763,7 +821,7 @@ impl CachedStateFeatures {
                 let (_, dst) = tensor
                     .try_extract_tensor_mut::<f32>()
                     .map_err(RuntimeError::Ort)?;
-                decompress_int8_symmetric_to_f32(quantized, scales, hidden_size, dst)?;
+                decompress_int8_symmetric_to_f32(quantized, scales, non_zero_hidden_size, dst)?;
                 Ok(Arc::new(tensor.into_dyn()))
             }
         }
@@ -855,7 +913,7 @@ impl CachedStateFeatures {
                     )));
                 }
                 let (first_chunk, rest) = dst.split_at_mut(single_len);
-                decompress_fp16_to_f32(compressed, first_chunk);
+                decompress_fp16_to_f32(compressed, first_chunk)?;
                 for chunk in rest.chunks_exact_mut(single_len) {
                     chunk.copy_from_slice(first_chunk);
                 }
@@ -1905,7 +1963,7 @@ mod tests {
         assert_eq!(compressed.len(), original.len());
 
         let mut restored = vec![0.0f32; original.len()];
-        decompress_fp16_to_f32(&compressed, &mut restored);
+        decompress_fp16_to_f32(&compressed, &mut restored).expect("展開に成功。");
 
         let mut max_err = 0.0f32;
         for (&orig, &rest) in original.iter().zip(restored.iter()) {
@@ -1917,6 +1975,26 @@ mod tests {
 
         // `FP16` の最大絶対誤差は 2e-3 未満（正規化範囲内で高精度）。
         assert!(max_err < 2e-3, "FP16 誤差が大きすぎます: {max_err}");
+    }
+
+    #[test]
+    fn test_fp16_decompression_errors() {
+        let original: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let compressed = compress_f32_to_fp16(&original);
+
+        // 展開先バッファ長が不足している場合
+        let mut short_dst = vec![0.0f32; 3];
+        assert!(
+            decompress_fp16_to_f32(&compressed, &mut short_dst).is_err(),
+            "展開先サイズ不足によるエラー返却を確認。"
+        );
+
+        // 展開先バッファ長が超過している場合
+        let mut long_dst = vec![0.0f32; 5];
+        assert!(
+            decompress_fp16_to_f32(&compressed, &mut long_dst).is_err(),
+            "展開先サイズ超過によるエラー返却を確認。"
+        );
     }
 
     #[test]
@@ -2404,5 +2482,78 @@ mod tests {
             vec![],
         );
         assert!(matches!(res, Err(RuntimeError::InvalidTensorData(_))));
+    }
+
+    #[test]
+    fn test_as_ort_value_rejects_corrupted_payloads_without_panic() {
+        let key = StateCacheManager::compute_key("as-ort-value-corrupted-test");
+        let seq_len = 4;
+        let hidden_size = 8;
+        let shape = vec![1, seq_len, hidden_size];
+        let expected_len = seq_len * hidden_size;
+
+        // 1. FP16 ペイロードの長さ不一致時にパニックせず InvalidTensorData が返ること。
+        let corrupt_fp16 = CachedStateFeatures {
+            hash_key: key,
+            shape: shape.clone(),
+            payload: CachedTensorPayload::Fp16(Arc::new(vec![f16::ZERO; expected_len - 1])),
+            byte_size: (expected_len - 1) * std::mem::size_of::<f16>(),
+            state_mask: vec![1i64; seq_len],
+            state_text: None,
+        };
+        assert!(matches!(
+            corrupt_fp16.as_ort_value(),
+            Err(RuntimeError::InvalidTensorData(_))
+        ));
+
+        // 2. Raw ペイロードの長さ不一致時にパニックせず InvalidTensorData が返ること。
+        let corrupt_raw_val = Value::from_array((
+            vec![1usize, seq_len, hidden_size - 1],
+            vec![0.0f32; seq_len * (hidden_size - 1)],
+        ))
+        .expect("Value の作成に成功すること。");
+        let corrupt_raw = CachedStateFeatures {
+            hash_key: key,
+            shape: shape.clone(),
+            payload: CachedTensorPayload::Raw(Arc::new(corrupt_raw_val.into())),
+            byte_size: seq_len * (hidden_size - 1) * std::mem::size_of::<f32>(),
+            state_mask: vec![1i64; seq_len],
+            state_text: None,
+        };
+        assert!(matches!(
+            corrupt_raw.as_ort_value(),
+            Err(RuntimeError::InvalidTensorData(_))
+        ));
+
+        // 3. Int8Symmetric ペイロードの長さ不一致時にパニックせず InvalidTensorData が返ること。
+        let corrupt_int8 = CachedStateFeatures {
+            hash_key: key,
+            shape: shape.clone(),
+            payload: CachedTensorPayload::Int8Symmetric {
+                quantized: Arc::new(vec![0i8; expected_len - 1]),
+                scales: Arc::new(vec![1.0f32; seq_len]),
+            },
+            byte_size: expected_len,
+            state_mask: vec![1i64; seq_len],
+            state_text: None,
+        };
+        assert!(matches!(
+            corrupt_int8.as_ort_value(),
+            Err(RuntimeError::InvalidTensorData(_))
+        ));
+
+        // 4. shape が 3 次元でない場合や batch_size != 1 の場合に ModelContractViolation が返ること。
+        let invalid_shape_entry = CachedStateFeatures {
+            hash_key: key,
+            shape: vec![2, seq_len, hidden_size],
+            payload: CachedTensorPayload::Fp16(Arc::new(vec![f16::ZERO; 2 * expected_len])),
+            byte_size: 2 * expected_len * std::mem::size_of::<f16>(),
+            state_mask: vec![1i64; 2 * seq_len],
+            state_text: None,
+        };
+        assert!(matches!(
+            invalid_shape_entry.as_ort_value(),
+            Err(RuntimeError::ModelContractViolation(_))
+        ));
     }
 }

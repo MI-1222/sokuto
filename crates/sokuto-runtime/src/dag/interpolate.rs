@@ -9,21 +9,41 @@ use std::fmt::Write;
 
 /// 単一ノードのコンテキスト情報。
 ///
-/// 先行ノードの判定値文字列と、確信度(0.0〜1.0)を保持する。
+/// 先行ノードの判定値文字列と、確信度(0.0〜1.0)および数値表現を保持する。
 #[derive(Debug, Clone)]
 pub struct NodeContextValue {
     /// 判定結果の文字列表現 (Choice キー、bool 文字列、数値など)。
     pub value: String,
     /// 予測確信度。
     pub confidence: f64,
+    /// 数値表現 (Score の値、Noul の確率値など)。数値として扱える場合に保持する。
+    pub numeric_value: Option<f64>,
 }
 
 impl NodeContextValue {
     /// 新規コンテキスト値を生成する。
+    ///
+    /// 文字列値が有限浮動小数点数として解釈可能な場合、`numeric_value` も自動設定する。
     pub fn new(value: impl Into<String>, confidence: f64) -> Self {
+        let val = value.into();
+        let num = val.trim().parse::<f64>().ok().filter(|f| f.is_finite());
+        Self {
+            value: val,
+            confidence,
+            numeric_value: num,
+        }
+    }
+
+    /// 生の数値を指定してコンテキスト値を生成する。
+    pub fn with_numeric(
+        value: impl Into<String>,
+        confidence: f64,
+        numeric_value: Option<f64>,
+    ) -> Self {
         Self {
             value: value.into(),
             confidence,
+            numeric_value: numeric_value.filter(|f| f.is_finite()),
         }
     }
 }

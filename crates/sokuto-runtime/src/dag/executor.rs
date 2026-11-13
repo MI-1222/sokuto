@@ -422,10 +422,14 @@ fn answer_to_context_value(answer: &Answer) -> NodeContextValue {
     let conf = answer.effective_confidence();
     match &answer.payload {
         AnswerPayload::Choice { selected, .. } => NodeContextValue::new(selected.clone(), conf),
-        AnswerPayload::Score { value, .. } => NodeContextValue::new(format!("{value}"), conf),
-        AnswerPayload::Noul { probability } => {
-            NodeContextValue::new(if *probability >= 0.5 { "true" } else { "false" }, conf)
+        AnswerPayload::Score { value, .. } => {
+            NodeContextValue::with_numeric(format!("{value}"), conf, Some(*value))
         }
+        AnswerPayload::Noul { probability } => NodeContextValue::with_numeric(
+            if *probability >= 0.5 { "true" } else { "false" },
+            conf,
+            Some(*probability),
+        ),
     }
 }
 
@@ -778,6 +782,129 @@ mod tests {
                 &context,
             ),
             Some("conf_pass".to_string())
+        );
+    }
+
+    #[test]
+    fn test_evaluate_conditions_context_value_score_float_and_ordering() {
+        let mut context = IndexMap::new();
+        // 浮動小数点丸め誤差を含むスコア値 (例: 2.9999999999999996)
+        let raw_score = 3.0 - 1e-15;
+        let score_ans = Answer::score(raw_score, IndexMap::new(), 0.95);
+        let ctx_val = answer_to_context_value(&score_ans);
+        assert_eq!(ctx_val.numeric_value, Some(raw_score));
+        context.insert("step1".to_string(), ctx_val);
+
+        // 1. 浮動小数点丸め誤差があっても eq (許容誤差 1e-6) で 3 と一致すること
+        assert_eq!(
+            evaluate_conditions(
+                &[NodeCondition {
+                    field: "step1.value".to_string(),
+                    op: NodeConditionOp::Eq,
+                    value: Some(serde_json::json!(3)),
+                    target_node: "target_eq".to_string(),
+                }],
+                None,
+                &context,
+            ),
+            Some("target_eq".to_string())
+        );
+
+        // 2. 文字列指定 "3" / "3.0" でも同様に一致すること
+        assert_eq!(
+            evaluate_conditions(
+                &[NodeCondition {
+                    field: "step1.value".to_string(),
+                    op: NodeConditionOp::Eq,
+                    value: Some(serde_json::json!("3.0")),
+                    target_node: "target_str_eq".to_string(),
+                }],
+                None,
+                &context,
+            ),
+            Some("target_str_eq".to_string())
+        );
+
+        // 3. neq 判定で 3 に対して不一致 (None)、4 に対して一致すること
+        assert_eq!(
+            evaluate_conditions(
+                &[NodeCondition {
+                    field: "step1.value".to_string(),
+                    op: NodeConditionOp::Neq,
+                    value: Some(serde_json::json!(3)),
+                    target_node: "target_neq_miss".to_string(),
+                }],
+                None,
+                &context,
+            ),
+            None
+        );
+        assert_eq!(
+            evaluate_conditions(
+                &[NodeCondition {
+                    field: "step1.value".to_string(),
+                    op: NodeConditionOp::Neq,
+                    value: Some(serde_json::json!(4)),
+                    target_node: "target_neq_hit".to_string(),
+                }],
+                None,
+                &context,
+            ),
+            Some("target_neq_hit".to_string())
+        );
+
+        // 4. 大小比較 (Gte, Gt, Lt, Lte) が正しく動作すること
+        assert_eq!(
+            evaluate_conditions(
+                &[NodeCondition {
+                    field: "step1.value".to_string(),
+                    op: NodeConditionOp::Gte,
+                    value: Some(serde_json::json!(3)),
+                    target_node: "target_gte".to_string(),
+                }],
+                None,
+                &context,
+            ),
+            Some("target_gte".to_string())
+        );
+        assert_eq!(
+            evaluate_conditions(
+                &[NodeCondition {
+                    field: "step1.value".to_string(),
+                    op: NodeConditionOp::Gt,
+                    value: Some(serde_json::json!(2.5)),
+                    target_node: "target_gt".to_string(),
+                }],
+                None,
+                &context,
+            ),
+            Some("target_gt".to_string())
+        );
+        assert_eq!(
+            evaluate_conditions(
+                &[NodeCondition {
+                    field: "step1.value".to_string(),
+                    op: NodeConditionOp::Lt,
+                    value: Some(serde_json::json!(3)),
+                    target_node: "target_lt_miss".to_string(),
+                }],
+                None,
+                &context,
+            ),
+            None
+        );
+        assert_eq!(
+            evaluate_conditions(
+                &[NodeCondition {
+                    field: "step1.value".to_string(),
+                    op: NodeConditionOp::Lte,
+                    value: Some(serde_json::json!(3.5)),
+                    target_node: "target_lte".to_string(),
+                }],
+                None,
+                &context,
+            ),
+            Some("target_lte".to_string())
         );
     }
 

@@ -590,11 +590,15 @@ pub enum ConditionPredicate {
         op: EqualityOp,
         expected: DecisionRoute,
     },
-    /// 先行ノードの回答値コンテキスト (`<node_id>.value` / `<node_id>.answer`) に対する等価判定。
+    /// 先行ノードの回答値コンテキスト (`<node_id>.value` / `<node_id>.answer`) に対する判定。
     ContextValue {
         node_id: String,
-        op: EqualityOp,
+        op: ComparisonOp,
         expected: String,
+        /// 条件値が有限数値として解釈可能な場合の事前パース値。
+        as_f64: Option<f64>,
+        /// 条件値が真偽値として解釈可能な場合の事前パース値。
+        as_bool: Option<bool>,
     },
     /// 先行ノードの確信度コンテキスト (`<node_id>.confidence`) に対する数値閾値比較。
     ContextConfidence {
@@ -633,12 +637,29 @@ impl ConditionPredicate {
                     })
                 }
                 ContextProp::Value => {
-                    let op = cond.op.to_equality()?;
+                    let op = cond.op.to_comparison()?;
                     let expected = cond.context_value_as_string()?;
+                    let as_f64 = cond.value_as_f64();
+                    let as_bool = cond.value.as_ref().and_then(|v| v.as_bool()).or_else(|| {
+                        match expected.trim() {
+                            "true" => Some(true),
+                            "false" => Some(false),
+                            _ => None,
+                        }
+                    });
+                    if matches!(
+                        op,
+                        ComparisonOp::Gt | ComparisonOp::Gte | ComparisonOp::Lt | ComparisonOp::Lte
+                    ) && as_f64.is_none()
+                    {
+                        return None;
+                    }
                     Some(Self::ContextValue {
                         node_id: node_id.to_string(),
                         op,
                         expected,
+                        as_f64,
+                        as_bool,
                     })
                 }
             },
@@ -683,9 +704,57 @@ impl CompiledCondition {
                 node_id,
                 op,
                 expected,
-            } => context
-                .get(node_id)
-                .is_some_and(|ctx_val| op.matches(&ctx_val.value, expected)),
+                as_f64,
+                as_bool,
+            } => {
+                let Some(ctx_val) = context.get(node_id) else {
+                    return false;
+                };
+
+                // 1. 数値比較: 条件値が数値として解釈でき、かつコンテキスト値も数値として解釈できる場合
+                let ctx_f64 = ctx_val.numeric_value.or_else(|| {
+                    ctx_val
+                        .value
+                        .trim()
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|f| f.is_finite())
+                });
+                if let (Some(num_cond), Some(num_ctx)) = (as_f64, ctx_f64) {
+                    return op.eval_f64(num_ctx, *num_cond);
+                }
+
+                // 2. 大小比較演算子の場合は、両辺が数値でない限り不一致
+                if matches!(
+                    op,
+                    ComparisonOp::Gt | ComparisonOp::Gte | ComparisonOp::Lt | ComparisonOp::Lte
+                ) {
+                    return false;
+                }
+
+                // 3. 真偽値比較: 条件値が真偽値として解釈でき、かつコンテキスト値も真偽値の場合
+                if let Some(expected_b) = as_bool {
+                    let ctx_b = match ctx_val.value.as_str() {
+                        "true" => Some(true),
+                        "false" => Some(false),
+                        _ => None,
+                    };
+                    if let Some(ctx_b) = ctx_b {
+                        return match op {
+                            ComparisonOp::Eq => ctx_b == *expected_b,
+                            ComparisonOp::Neq => ctx_b != *expected_b,
+                            _ => false,
+                        };
+                    }
+                }
+
+                // 4. 文字列等価比較
+                match op {
+                    ComparisonOp::Eq => &ctx_val.value == expected,
+                    ComparisonOp::Neq => &ctx_val.value != expected,
+                    _ => false,
+                }
+            }
             ConditionPredicate::ContextConfidence {
                 node_id,
                 op,
@@ -954,8 +1023,10 @@ mod tests {
             compiled_ctx.predicate,
             ConditionPredicate::ContextValue {
                 node_id: "prev_node".to_string(),
-                op: EqualityOp::Eq,
+                op: ComparisonOp::Eq,
                 expected: "transfer".to_string(),
+                as_f64: None,
+                as_bool: None,
             }
         );
 

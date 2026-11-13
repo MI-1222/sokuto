@@ -680,19 +680,49 @@ fn validate_single_condition(
                     }
                 }
                 ContextProp::Value => {
-                    if !matches!(cond.op, NodeConditionOp::Eq | NodeConditionOp::Neq) {
-                        return Err(DagValidationError::InvalidCondition {
-                            node_id: node_id.to_string(),
-                            field: cond.field.clone(),
-                            reason: "コンテキスト値プロパティに対しては等価比較 (eq / neq) のみ使用できます。".to_string(),
-                        });
-                    }
-                    if cond.context_value_as_string().is_none() {
-                        return Err(DagValidationError::InvalidCondition {
-                            node_id: node_id.to_string(),
-                            field: cond.field.clone(),
-                            reason: "コンテキスト値プロパティにはスカラー値 (文字列、真偽値、有限数値) を指定する必要があります。".to_string(),
-                        });
+                    let ref_q_type = match ref_node {
+                        DagNode::Inference { question, .. } => Some(question.question_type),
+                        _ => None,
+                    };
+                    match cond.op {
+                        NodeConditionOp::In
+                        | NodeConditionOp::ConfidenceGte
+                        | NodeConditionOp::ConfidenceLt => {
+                            return Err(DagValidationError::InvalidCondition {
+                                node_id: node_id.to_string(),
+                                field: cond.field.clone(),
+                                reason: "コンテキスト値プロパティに対して 'in' 演算子または確信度演算子は使用できません。".to_string(),
+                            });
+                        }
+                        NodeConditionOp::Gt
+                        | NodeConditionOp::Gte
+                        | NodeConditionOp::Lt
+                        | NodeConditionOp::Lte => {
+                            if ref_q_type == Some(QuestionType::Choice) {
+                                return Err(DagValidationError::InvalidCondition {
+                                    node_id: node_id.to_string(),
+                                    field: cond.field.clone(),
+                                    reason: "大小比較演算子は Choice 型判定に対して無効です。"
+                                        .to_string(),
+                                });
+                            }
+                            if cond.value_as_f64().is_none() {
+                                return Err(DagValidationError::InvalidCondition {
+                                    node_id: node_id.to_string(),
+                                    field: cond.field.clone(),
+                                    reason: "コンテキスト値プロパティの大小比較には有限数値 (または数値文字列) を指定する必要があります。".to_string(),
+                                });
+                            }
+                        }
+                        NodeConditionOp::Eq | NodeConditionOp::Neq => {
+                            if cond.context_value_as_string().is_none() {
+                                return Err(DagValidationError::InvalidCondition {
+                                    node_id: node_id.to_string(),
+                                    field: cond.field.clone(),
+                                    reason: "コンテキスト値プロパティにはスカラー値 (文字列、真偽値、有限数値) を指定する必要があります。".to_string(),
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -2082,6 +2112,138 @@ mod tests {
                 node_type: DagNodeType::Inference,
                 ..
             } if node_id == "score_single"
+        ));
+    }
+
+    #[test]
+    fn test_validate_dag_context_value_score_ordering_and_choice_rejection() {
+        // 1. Score ノードに対する context_prop (node.value) の大小比較が検証合格すること
+        let mut nodes_valid = IndexMap::new();
+        nodes_valid.insert(
+            "score_step".to_string(),
+            DagNode::inference(
+                Question::new_score(
+                    "リスクを評価してください。".to_string(),
+                    vec!["低".to_string(), "中".to_string(), "高".to_string()],
+                ),
+                vec![NodeCondition {
+                    field: "answer".to_string(),
+                    op: NodeConditionOp::Gte,
+                    value: Some(serde_json::json!(0.0)),
+                    target_node: "branch_step".to_string(),
+                }],
+            ),
+        );
+        nodes_valid.insert(
+            "branch_step".to_string(),
+            DagNode::branch(vec![NodeCondition {
+                field: "score_step.value".to_string(),
+                op: NodeConditionOp::Gte,
+                value: Some(serde_json::json!(2.5)),
+                target_node: "high_risk".to_string(),
+            }]),
+        );
+        nodes_valid.insert("high_risk".to_string(), DagNode::escalate(Some("高リスク")));
+
+        let dag_valid = DagDefinition {
+            dag_id: "score_ordering_valid_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "score_step".to_string(),
+            nodes: nodes_valid,
+        };
+        assert!(
+            validate_dag(&dag_valid).is_ok(),
+            "Score ノード値に対する大小比較条件は検証に合格すること。"
+        );
+
+        // 2. Choice ノードに対する context_prop (node.value) の大小比較は拒否されること
+        let mut nodes_choice = IndexMap::new();
+        let mut choice_map = IndexMap::new();
+        choice_map.insert("a".to_string(), "選択肢A".to_string());
+        choice_map.insert("b".to_string(), "選択肢B".to_string());
+        nodes_choice.insert(
+            "choice_step".to_string(),
+            DagNode::inference(
+                Question::new_choice("選択してください。".to_string(), choice_map),
+                vec![NodeCondition {
+                    field: "answer".to_string(),
+                    op: NodeConditionOp::Eq,
+                    value: Some(serde_json::json!("a")),
+                    target_node: "branch_choice".to_string(),
+                }],
+            ),
+        );
+        nodes_choice.insert(
+            "branch_choice".to_string(),
+            DagNode::branch(vec![NodeCondition {
+                field: "choice_step.value".to_string(),
+                op: NodeConditionOp::Gt,
+                value: Some(serde_json::json!(1.0)),
+                target_node: "term".to_string(),
+            }]),
+        );
+        nodes_choice.insert("term".to_string(), DagNode::escalate(Some("終端")));
+
+        let dag_choice = DagDefinition {
+            dag_id: "choice_ordering_invalid_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "choice_step".to_string(),
+            nodes: nodes_choice,
+        };
+        let err_choice = validate_dag(&dag_choice)
+            .expect_err("Choice ノードに対する大小比較条件は拒否されること。");
+        assert!(matches!(
+            err_choice,
+            DagValidationError::InvalidCondition {
+                ref node_id,
+                ref field,
+                ..
+            } if node_id == "branch_choice" && field == "choice_step.value"
+        ));
+
+        // 3. Score ノードに対する大小比較に非数値を指定した場合は拒否されること
+        let mut nodes_nan = IndexMap::new();
+        nodes_nan.insert(
+            "score_step".to_string(),
+            DagNode::inference(
+                Question::new_score(
+                    "リスクを評価してください。".to_string(),
+                    vec!["低".to_string(), "中".to_string(), "高".to_string()],
+                ),
+                vec![NodeCondition {
+                    field: "answer".to_string(),
+                    op: NodeConditionOp::Gte,
+                    value: Some(serde_json::json!(0.0)),
+                    target_node: "branch_nan".to_string(),
+                }],
+            ),
+        );
+        nodes_nan.insert(
+            "branch_nan".to_string(),
+            DagNode::branch(vec![NodeCondition {
+                field: "score_step.value".to_string(),
+                op: NodeConditionOp::Gte,
+                value: Some(serde_json::json!("not_a_number")),
+                target_node: "term".to_string(),
+            }]),
+        );
+        nodes_nan.insert("term".to_string(), DagNode::escalate(Some("終端")));
+
+        let dag_nan = DagDefinition {
+            dag_id: "score_nan_invalid_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "score_step".to_string(),
+            nodes: nodes_nan,
+        };
+        let err_nan =
+            validate_dag(&dag_nan).expect_err("大小比較に非数値を指定した場合は拒否されること。");
+        assert!(matches!(
+            err_nan,
+            DagValidationError::InvalidCondition {
+                ref node_id,
+                ref field,
+                ..
+            } if node_id == "branch_nan" && field == "score_step.value"
         ));
     }
 }

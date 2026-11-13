@@ -565,7 +565,7 @@ impl<'a, P: HierarchicalPredictor> CoarseToFineRouter<'a, P> {
         };
 
         let coarse_probs_slice: Vec<f64> = sorted_coarse.iter().map(|(_, p)| *p).collect();
-        let (_, norm_entropy) = compute_normalized_entropy(&coarse_probs_slice);
+        let (_, norm_entropy) = compute_normalized_entropy(&coarse_probs_slice)?;
 
         let coarse_margin: f64 = if let Some(p2) = top2_prob {
             (top1_prob - p2).max(0.0)

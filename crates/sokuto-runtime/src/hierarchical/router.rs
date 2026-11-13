@@ -474,6 +474,8 @@ impl<'a, P: HierarchicalPredictor> CoarseToFineRouter<'a, P> {
             self.mapping.all_fine_keys().to_vec()
         };
 
+        let resolved_gating_config = resolve_gating_config(gating_config, self.calib_config);
+
         // --- Step 1: 第 1 パス (大分類推論 & Dirichlet 較正) ---
         let coarse_probabilities = self.predictor.predict_coarse_probabilities(
             state,
@@ -589,6 +591,7 @@ impl<'a, P: HierarchicalPredictor> CoarseToFineRouter<'a, P> {
                 norm_entropy,
                 composite_confidence,
                 self.config.escalate_confidence_threshold,
+                &resolved_gating_config,
             );
         }
 
@@ -688,7 +691,6 @@ impl<'a, P: HierarchicalPredictor> CoarseToFineRouter<'a, P> {
             self.calib_config,
             gating_config,
         );
-        let resolved_gating_config = resolve_gating_config(gating_config, self.calib_config);
         let final_confidence = compute_final_answer_confidence(
             &full_probabilities,
             catchall_bias_triggered,
@@ -696,7 +698,7 @@ impl<'a, P: HierarchicalPredictor> CoarseToFineRouter<'a, P> {
         )?;
 
         let mut answer = Answer::choice(final_winner, full_probabilities, final_confidence);
-        let gating = build_final_gating_metadata(
+        if let Some(gating) = build_final_gating_metadata(
             self.mapping,
             state,
             question_id,
@@ -704,8 +706,9 @@ impl<'a, P: HierarchicalPredictor> CoarseToFineRouter<'a, P> {
             &answer,
             &resolved_gating_config,
             fine_energy,
-        );
-        answer = answer.with_gating(gating);
+        ) {
+            answer = answer.with_gating(gating);
+        }
 
         let trace = HierarchicalExecutionTrace {
             top1_coarse,
@@ -896,7 +899,8 @@ fn attach_escalation_context(
 
 /// 通常ルーティング終了時 (Step 7) の `GatingMetadata` を構築する。
 ///
-/// コア層の [`evaluate_answer_gating_opts`] へ自由エネルギー `fine_energy` とともに評価を委譲し、
+/// ゲーティングが無効 (`gating_config.enabled == false`) の場合は `None` を返す。
+/// 有効時はコア層の [`evaluate_answer_gating_opts`] へ自由エネルギー `fine_energy` とともに評価を委譲し、
 /// OOD 安全弁・マージンガード・3 系統ルーティング判定・`is_ood` フラグ・監査理由を一貫して算出する。
 /// `route != DecisionRoute::AutoExecute` の場合は、全候補定義を含む `Question` を構築して
 /// [`build_rich_escalation_prompt`] による System 2 委託プロンプト案を `EscalationContext` へ格納する。
@@ -908,7 +912,11 @@ fn build_final_gating_metadata(
     answer: &Answer,
     gating_config: &GatingConfig,
     fine_energy: Option<f64>,
-) -> GatingMetadata {
+) -> Option<GatingMetadata> {
+    if !gating_config.enabled {
+        return None;
+    }
+
     let mut gating =
         evaluate_answer_gating_opts(answer, None, None, gating_config, fine_energy, false);
 
@@ -928,14 +936,17 @@ fn build_final_gating_metadata(
         }
     }
 
-    gating
+    Some(gating)
 }
 
 /// 第 1 パスの複合確信度不足による Early-Exit 時のフォールバック結果を構築する。
 ///
-/// 第 1 パスの Top-1 クラスタ配下にある先頭細分類を `Answer.choice` として選定し、
-/// `DecisionRoute::ConfirmOrEscalate` に対応する `EscalationContext`
-/// (上位候補リストおよび `build_rich_escalation_prompt` によるプロンプト案) を付与する。
+/// 第 1 パスの Top-1 クラスタ配下にある先頭細分類を `Answer.choice` として選定する。
+/// `gating_config.enabled == false` の場合は `answer.gating` を付与せず `None` とする。
+/// ゲーティング有効時は [`evaluate_answer_gating_opts`] により閾値に基づくルーティング判定
+/// (`ConfirmOrEscalate` または `Fallback`) を行い、階層オントロジー固有の上位候補群および
+/// [`build_rich_escalation_prompt`] による System 2 委託プロンプト案を含む
+/// `EscalationContext` を付与する。
 ///
 /// # 引数
 /// - `mapping`: 階層マッピング定義。
@@ -948,6 +959,7 @@ fn build_final_gating_metadata(
 /// - `norm_entropy`: 第 1 パスの正規化エントロピー。
 /// - `composite_confidence`: 第 1 パスの複合確信度スコア。
 /// - `escalate_confidence_threshold`: Early-Exit 判定に用いた閾値。
+/// - `gating_config`: 解決済みのゲーティング設定。
 ///
 /// # 戻り値
 /// Early-Exit 用の `HierarchicalResult`。
@@ -963,6 +975,7 @@ fn build_early_exit_result(
     norm_entropy: f64,
     composite_confidence: f64,
     escalate_confidence_threshold: f64,
+    gating_config: &GatingConfig,
 ) -> Result<HierarchicalResult> {
     let (top1_coarse, top1_prob) = sorted_coarse.first().copied().ok_or_else(|| {
         RuntimeError::InvalidQuestion("第 1 パスの大分類確率分布が空です。".to_string())
@@ -1041,34 +1054,29 @@ fn build_early_exit_result(
         }
     }
 
-    let reason = "Hierarchical Early-Exit: composite confidence below threshold".to_string();
-    let entropy_val = if allowed_fine_keys.len() > 1 {
-        1.0
-    } else {
-        0.0
-    };
-    let mut fallback_gating = GatingMetadata {
-        route: DecisionRoute::ConfirmOrEscalate,
-        confidence: composite_confidence,
-        entropy: Some(entropy_val),
-        margin: Some(0.0),
-        energy: None,
-        is_ood: false,
-        reason,
-        escalation: None,
-    };
+    let mut fallback_answer = Answer::choice(selected_choice, full_probs, composite_confidence);
 
-    attach_escalation_context(
-        mapping,
-        state,
-        question_id,
-        instructions,
-        &mut fallback_gating,
-        top_candidates,
-    );
+    if gating_config.enabled {
+        let mut fallback_gating = evaluate_answer_gating_opts(
+            &fallback_answer,
+            question_id,
+            None,
+            gating_config,
+            None,
+            false,
+        );
 
-    let fallback_answer = Answer::choice(selected_choice, full_probs, composite_confidence)
-        .with_gating(fallback_gating);
+        attach_escalation_context(
+            mapping,
+            state,
+            question_id,
+            instructions,
+            &mut fallback_gating,
+            top_candidates,
+        );
+
+        fallback_answer = fallback_answer.with_gating(fallback_gating);
+    }
 
     let trace = HierarchicalExecutionTrace {
         top1_coarse: top1_coarse.to_string(),
@@ -1120,6 +1128,7 @@ mod tests {
 
         let state = "海外への銀行送金がまだ着金していません。手数料も確認したいです。";
         let instructions = "お客様のお問い合わせ内容に最も適合するカテゴリを選択してください。";
+        let default_gc = GatingConfig::default();
 
         let res = build_early_exit_result(
             &mapping,
@@ -1132,6 +1141,7 @@ mod tests {
             0.96,
             0.0088,
             0.25,
+            &default_gc,
         )
         .expect("Early-Exit 結果の構築に成功すること。");
 
@@ -1165,17 +1175,17 @@ mod tests {
         let sum: f64 = probs.values().sum();
         assert!((sum - 1.0).abs() < 1e-6);
 
-        // 3. Gating 契約 (ConfirmOrEscalate 時は escalation: Some(...)) を満たすこと
+        // 3. Gating 契約 (composite_confidence < low_threshold 時は Fallback) を満たすこと
         let gating = res
             .answer()
             .gating
             .as_ref()
             .expect("Gating が付与されていること。");
-        assert_eq!(gating.route, DecisionRoute::ConfirmOrEscalate);
+        assert_eq!(gating.route, DecisionRoute::Fallback);
         let esc = gating
             .escalation
             .as_ref()
-            .expect("ConfirmOrEscalate 時は EscalationContext が必須であること。");
+            .expect("Fallback 時は EscalationContext が必須であること。");
 
         assert_eq!(esc.top_candidates.len(), 3);
         assert_eq!(esc.top_candidates[0].candidate, *expected_top1_first);
@@ -1195,7 +1205,50 @@ mod tests {
         assert!(prompt.contains(expected_top1_first));
         assert!(prompt.contains("q_early_exit"));
 
-        // 4. トレースの整合性確認
+        // 4. low_threshold を下回らない設定では ConfirmOrEscalate となること
+        let mut confirm_gc = GatingConfig::default();
+        confirm_gc.thresholds.low_threshold = 0.005;
+        let confirm_res = build_early_exit_result(
+            &mapping,
+            state,
+            Some("q_early_exit"),
+            instructions,
+            &sorted_coarse,
+            mapping.all_fine_keys(),
+            0.02,
+            0.96,
+            0.0088,
+            0.25,
+            &confirm_gc,
+        )
+        .expect("Early-Exit 結果の構築に成功すること。");
+        assert_eq!(
+            confirm_res.answer().gating.as_ref().unwrap().route,
+            DecisionRoute::ConfirmOrEscalate
+        );
+
+        // 5. gating.enabled == false 時は gating が None となること
+        let disabled_gc = GatingConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let disabled_res = build_early_exit_result(
+            &mapping,
+            state,
+            Some("q_early_exit"),
+            instructions,
+            &sorted_coarse,
+            mapping.all_fine_keys(),
+            0.02,
+            0.96,
+            0.0088,
+            0.25,
+            &disabled_gc,
+        )
+        .expect("Early-Exit 結果の構築に成功すること。");
+        assert!(disabled_res.answer().gating.is_none());
+
+        // 6. トレースの整合性確認
         assert!(res.trace().early_exit_triggered);
         assert_eq!(res.trace().top1_coarse, "transfers");
         assert_eq!(res.trace().selected_coarse_clusters, vec!["transfers"]);
@@ -1213,6 +1266,7 @@ mod tests {
         let mapping = builder.build().expect("マッピング構築に成功すること。");
 
         let sorted_coarse = vec![("only_cluster", 1.0)];
+        let default_gc = GatingConfig::default();
         let res = build_early_exit_result(
             &mapping,
             "判断対象のテキスト",
@@ -1224,6 +1278,7 @@ mod tests {
             0.0,
             0.1,
             0.25,
+            &default_gc,
         )
         .expect("単一クラスタでも Early-Exit 構築に成功すること。");
 
@@ -1263,7 +1318,8 @@ mod tests {
             &auto_answer,
             &gating_config,
             Some(-2.5),
-        );
+        )
+        .expect("ゲーティング有効時はメタデータが返ること。");
         assert_eq!(auto_meta.route, DecisionRoute::AutoExecute);
         assert!(!auto_meta.is_ood);
         assert!(auto_meta.escalation.is_none());
@@ -1290,7 +1346,8 @@ mod tests {
                 &answer,
                 &gating_config,
                 Some(-1.2),
-            );
+            )
+            .expect("ゲーティング有効時はメタデータが返ること。");
             assert_eq!(meta.route, expected_route);
             assert!(!meta.is_ood);
             assert!((meta.margin.unwrap() - 0.11).abs() < 1e-9);
@@ -1324,6 +1381,22 @@ mod tests {
             assert!(prompt.contains("card_payment_not_recognised"));
             assert!(prompt.contains("q_esc"));
         }
+
+        // 3. enabled == false 時は None が返ること
+        let disabled_gc = GatingConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let none_meta = build_final_gating_metadata(
+            &mapping,
+            state,
+            Some("q_disabled"),
+            instructions,
+            &auto_answer,
+            &disabled_gc,
+            Some(-2.5),
+        );
+        assert!(none_meta.is_none());
     }
 
     #[test]
@@ -1350,7 +1423,8 @@ mod tests {
             &high_conf_answer,
             &default_gc,
             Some(0.25),
-        );
+        )
+        .expect("ゲーティング有効時はメタデータが返ること。");
         assert_eq!(ood_meta.route, DecisionRoute::Fallback);
         assert!(ood_meta.is_ood);
         assert_eq!(ood_meta.energy, Some(0.25));
@@ -1381,7 +1455,8 @@ mod tests {
             &high_conf_answer,
             &disabled_ood_gc,
             Some(0.25),
-        );
+        )
+        .expect("ゲーティング有効時はメタデータが返ること。");
         assert_eq!(non_ood_meta.route, DecisionRoute::AutoExecute);
         assert!(!non_ood_meta.is_ood);
         assert!(non_ood_meta.escalation.is_none());
@@ -1412,7 +1487,8 @@ mod tests {
             &close_answer,
             &hybrid_gc,
             Some(-1.0),
-        );
+        )
+        .expect("ゲーティング有効時はメタデータが返ること。");
         assert_eq!(hybrid_meta.route, DecisionRoute::Fallback);
         assert!(hybrid_meta.is_ood);
     }
@@ -1444,7 +1520,8 @@ mod tests {
             &answer,
             &gating_config,
             Some(-3.0),
-        );
+        )
+        .expect("ゲーティング有効時はメタデータが返ること。");
         assert_eq!(meta.route, DecisionRoute::ConfirmOrEscalate);
         assert!(!meta.is_ood);
         assert!(meta.escalation.is_some());
@@ -1566,7 +1643,8 @@ mod tests {
             &answer,
             &GatingConfig::default(),
             Some(-2.5),
-        );
+        )
+        .expect("ゲーティング有効時はメタデータが返ること。");
         assert_eq!(gating.route, DecisionRoute::ConfirmOrEscalate);
 
         // 2. 単一候補に極端に集中した分布では複合確信度が high_threshold を超え AutoExecute となること
@@ -1593,7 +1671,8 @@ mod tests {
             &peaked_answer,
             &GatingConfig::default(),
             Some(-2.5),
-        );
+        )
+        .expect("ゲーティング有効時はメタデータが返ること。");
         assert_eq!(peaked_gating.route, DecisionRoute::AutoExecute);
 
         // 3. catchall_bias により 2 位以下のネガティブ候補へ切り替わった場合 (final_margin == 0.0) は 0.0 となること
@@ -1732,6 +1811,29 @@ mod tests {
         assert_eq!(beam_res.trace().evaluated_fine_count, 4);
         assert_eq!(beam_res.answer().as_choice(), Some("c2_f1"));
         assert_eq!(beam_predictor.fine_call_count.get(), 1);
+
+        // 3. gating.enabled == false 指定時は通常推論結果の gating が None であること
+        let disabled_predictor = MockRawPredictor {
+            coarse_logits: vec![6.0, 0.0, 0.0, 0.0],
+            fine_logits: vec![0.5, 4.0],
+            coarse_called: std::cell::Cell::new(false),
+            fine_call_count: std::cell::Cell::new(0),
+        };
+        let disabled_router = CoarseToFineRouter::with_predictor(
+            &disabled_predictor,
+            &mapping,
+            &calib,
+            HierarchicalRouterConfig::default(),
+        )
+        .expect("ルーター構築に成功すること。");
+        let disabled_gc = GatingConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let disabled_res = disabled_router
+            .route("入力コンテキスト", "分類してください。", Some(&disabled_gc))
+            .expect("ゲーティング無効推論に成功すること。");
+        assert!(disabled_res.answer().gating.is_none());
     }
 
     #[test]
@@ -1758,12 +1860,49 @@ mod tests {
         )
         .expect("ルーター構築に成功すること。");
 
+        // 1. デフォルト設定: composite_confidence が低いため Fallback に判定されること
         let res = router
             .route("曖昧なコンテキスト", "分類してください。", None)
             .expect("Early-Exit 推論に成功すること。");
         assert!(res.trace().early_exit_triggered);
         assert_eq!(res.trace().evaluated_fine_count, 0);
         assert_eq!(predictor.fine_call_count.get(), 0);
+        let gating = res
+            .answer()
+            .gating
+            .as_ref()
+            .expect("デフォルトでは GatingMetadata が付与されること。");
+        assert_eq!(gating.route, DecisionRoute::Fallback);
+
+        // 2. low_threshold を 0.0 に設定した場合は ConfirmOrEscalate と判定されること
+        let mut confirm_gc = GatingConfig::default();
+        confirm_gc.thresholds.low_threshold = 0.0;
+        let confirm_res = router
+            .route(
+                "曖昧なコンテキスト",
+                "分類してください。",
+                Some(&confirm_gc),
+            )
+            .expect("Early-Exit 推論に成功すること。");
+        assert_eq!(
+            confirm_res.answer().gating.as_ref().unwrap().route,
+            DecisionRoute::ConfirmOrEscalate
+        );
+
+        // 3. gating.enabled == false 指定時は Early-Exit 時も gating が None となること
+        let disabled_gc = GatingConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let disabled_res = router
+            .route(
+                "曖昧なコンテキスト",
+                "分類してください。",
+                Some(&disabled_gc),
+            )
+            .expect("Early-Exit 推論に成功すること。");
+        assert!(disabled_res.trace().early_exit_triggered);
+        assert!(disabled_res.answer().gating.is_none());
     }
 
     #[test]

@@ -64,44 +64,75 @@ pub struct AlignedBuffer64<T: Copy> {
 }
 
 impl<T: Copy> AlignedBuffer64<T> {
-    /// 指定された要素数で64バイトアライメントされたゼロ初期化バッファを生成する。
+    /// 指定された要素数で64バイトアライメントされたゼロ初期化バッファの生成を試みる。
     ///
     /// # 引数
     /// - `len`: 要素数。
-    pub fn with_capacity_zeroed(len: usize) -> Self {
-        assert!(
-            std::mem::size_of::<T>() > 0,
-            "ZST はサポートされていません。"
-        );
+    ///
+    /// # エラー
+    /// - `T` がゼロサイズ型 (ZST) の場合。
+    /// - `len` と型サイズの乗算がオーバーフローした場合。
+    /// - アライメントレイアウトの構築に失敗した場合(サイズ超過など)
+    /// - メモリ確保に失敗した場合。
+    pub fn try_with_capacity_zeroed(len: usize) -> Result<Self> {
+        if std::mem::size_of::<T>() == 0 {
+            return Err(RuntimeError::InvalidTensorData(
+                "ZST はサポートされていません。".to_string(),
+            ));
+        }
 
         let align = std::mem::align_of::<T>().max(64);
-        let size = len
-            .checked_mul(std::mem::size_of::<T>())
-            .expect("メモリ確保サイズがオーバーフローしました。");
-        let layout = Layout::from_size_align(size, align)
-            .expect("64バイトアライメントレイアウトの作成に失敗しました。");
+        let size = len.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
+            RuntimeError::InvalidTensorData(format!(
+                "メモリ確保サイズがオーバーフローしました: 要素数={len}, 型サイズ={}。",
+                std::mem::size_of::<T>()
+            ))
+        })?;
+        let layout = Layout::from_size_align(size, align).map_err(|e| {
+            RuntimeError::InvalidTensorData(format!(
+                "64バイトアライメントレイアウトの作成に失敗しました: {e} (サイズ={size}, アライメント={align})。"
+            ))
+        })?;
 
         if len == 0 {
-            let empty_align =
-                NonZeroUsize::new(align).expect("アライメント値は非ゼロである必要があります。");
-            return Self {
+            let empty_align = NonZeroUsize::new(align).ok_or_else(|| {
+                RuntimeError::InvalidTensorData(
+                    "アライメント値は非ゼロである必要があります。".to_string(),
+                )
+            })?;
+            return Ok(Self {
                 ptr: NonNull::without_provenance(empty_align),
                 len: 0,
                 capacity: 0,
                 layout,
-            };
+            });
         }
 
         // SAFETY: 有効なレイアウトと非ゼロサイズを検証済みであり、直後にゼロ初期化メモリとして確保する。
         let raw_ptr = unsafe { alloc_zeroed(layout) as *mut T };
-        let ptr = NonNull::new(raw_ptr).expect("アライメントメモリの割り当てに失敗しました。");
+        let ptr = NonNull::new(raw_ptr).ok_or_else(|| {
+            RuntimeError::InvalidTensorData(format!(
+                "アライメントメモリの割り当てに失敗しました (サイズ={size})。"
+            ))
+        })?;
 
-        Self {
+        Ok(Self {
             ptr,
             len,
             capacity: len,
             layout,
-        }
+        })
+    }
+
+    /// 指定された要素数で64バイトアライメントされたゼロ初期化バッファを生成する。
+    ///
+    /// # 引数
+    /// - `len`: 要素数。
+    ///
+    /// # パニック
+    /// 不正なサイズやレイアウト、メモリ確保に失敗した場合はパニックする。
+    pub fn with_capacity_zeroed(len: usize) -> Self {
+        Self::try_with_capacity_zeroed(len).unwrap_or_else(|e| panic!("{e}"))
     }
 
     /// スライスから64バイトアライメントされたバッファを複製生成する。
@@ -1786,6 +1817,46 @@ mod tests {
     #[should_panic(expected = "ZST はサポートされていません。")]
     fn test_aligned_buffer64_zst_panic() {
         let _ = AlignedBuffer64::<()>::with_capacity_zeroed(1);
+    }
+
+    #[test]
+    #[should_panic(expected = "メモリ確保サイズがオーバーフローしました")]
+    fn test_aligned_buffer64_overflow_panic() {
+        let _ = AlignedBuffer64::<f32>::with_capacity_zeroed(usize::MAX);
+    }
+
+    #[test]
+    fn test_aligned_buffer64_try_with_capacity_zeroed() {
+        // 正常系
+        let buf = AlignedBuffer64::<f32>::try_with_capacity_zeroed(128);
+        assert!(buf.is_ok());
+        let buf = buf.unwrap();
+        assert_eq!(buf.len(), 128);
+        assert!(buf.is_aligned_64());
+
+        // 空バッファ
+        let empty_buf = AlignedBuffer64::<f32>::try_with_capacity_zeroed(0);
+        assert!(empty_buf.is_ok());
+        assert_eq!(empty_buf.unwrap().len(), 0);
+
+        // ZST
+        let zst_res = AlignedBuffer64::<()>::try_with_capacity_zeroed(1);
+        assert!(matches!(zst_res, Err(RuntimeError::InvalidTensorData(_))));
+
+        // 乗算オーバーフロー
+        let overflow_res = AlignedBuffer64::<f32>::try_with_capacity_zeroed(usize::MAX);
+        assert!(matches!(
+            overflow_res,
+            Err(RuntimeError::InvalidTensorData(_))
+        ));
+
+        // レイアウト作成失敗(isize::MAX 超過)
+        let layout_err_res =
+            AlignedBuffer64::<u8>::try_with_capacity_zeroed(isize::MAX as usize + 1);
+        assert!(matches!(
+            layout_err_res,
+            Err(RuntimeError::InvalidTensorData(_))
+        ));
     }
 
     #[test]

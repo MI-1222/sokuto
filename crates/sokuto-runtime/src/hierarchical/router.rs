@@ -16,7 +16,7 @@ use sokuto_core::schema::{Answer, Criteria, Question, QuestionType};
 use crate::engine::InferenceEngine;
 use crate::engine::cache::{CachedStateFeatures, DualSessionEngine};
 use crate::engine::escalation::build_rich_escalation_prompt;
-use crate::engine::gating::{calculate_choice_energy_with_config, resolve_gating_config};
+use crate::engine::gating::{calculate_choice_energy_with_total_candidates, resolve_gating_config};
 use crate::error::{Result, RuntimeError};
 use crate::hierarchical::calibration::{
     DEFAULT_COARSE_POWER_ALPHA, DEFAULT_ENTROPY_TEMP_GAMMA, DirichletCalibrator,
@@ -681,9 +681,10 @@ impl<'a, P: HierarchicalPredictor> CoarseToFineRouter<'a, P> {
             )?;
 
         // --- Step 7: 全候補空間基準での複合確信度算出・Gating 判定 (OOD 安全弁含む) ---
-        let fine_energy = calculate_choice_energy_with_config(
+        let fine_energy = calculate_choice_energy_with_total_candidates(
             &fine_question,
             &raw_logits,
+            allowed_fine_keys.len(),
             self.calib_config,
             gating_config,
         );
@@ -1857,5 +1858,75 @@ mod tests {
 
         // 4. 許可候補が存在しない大分類 (c3) ではなく、許可候補を持つ大分類 (c1) が Top-1 に選ばれていること
         assert_eq!(res.trace().top1_coarse, "c1");
+    }
+
+    #[test]
+    fn test_route_calculates_energy_with_full_population_shift() {
+        use sokuto_core::gating::GatingThresholds;
+        use sokuto_core::math::free_energy;
+
+        let mapping = build_test_mapping();
+        let calib = CalibrationConfig::default();
+
+        let predictor = MockRawPredictor {
+            coarse_logits: vec![6.0, 0.0, 0.0, 0.0],
+            fine_logits: vec![0.5, 4.0],
+            coarse_called: std::cell::Cell::new(false),
+            fine_call_count: std::cell::Cell::new(0),
+        };
+
+        let gating_cfg = GatingConfig {
+            enabled: true,
+            thresholds: GatingThresholds {
+                energy_temperature: Some(1.0),
+                ood_enabled: true,
+                energy_threshold: 0.0,
+                ..Default::default()
+            },
+        };
+
+        let router = CoarseToFineRouter::with_predictor(
+            &predictor,
+            &mapping,
+            &calib,
+            HierarchicalRouterConfig::default(),
+        )
+        .expect("ルーター構築に成功すること。");
+
+        let res = router
+            .route_with_allowed_candidates_and_id(
+                "コンテキスト",
+                Some("q_energy"),
+                "分類してください。",
+                None,
+                Some(&gating_cfg),
+            )
+            .expect("推論に成功すること。");
+
+        // 全候補数 K = 8 (4 クラスタ × 2 候補), 枝刈り後候補数 M = 2
+        let raw_energy = free_energy(&[0.5, 4.0], 1.0).unwrap();
+        let expected_energy = raw_energy + (8.0f64).ln();
+
+        let actual_energy = res
+            .answer()
+            .gating
+            .as_ref()
+            .expect("ゲーティングメタデータが存在すること。")
+            .energy
+            .expect("自由エネルギーが計算されていること。");
+
+        assert!(
+            (actual_energy - expected_energy).abs() < 1e-10,
+            "全候補数 K=8 のシフト項 (+T ln 8) が正確に反映されていること。actual: {}, expected: {}",
+            actual_energy,
+            expected_energy
+        );
+
+        // 枝刈り後の M=2 のみで計算した場合の誤ったエネルギー (raw_energy + ln 2) とは ln(8) - ln(2) = ln(4) の差が生じること
+        let buggy_energy = raw_energy + (2.0f64).ln();
+        assert!(
+            (actual_energy - buggy_energy - (4.0f64).ln()).abs() < 1e-10,
+            "M=2 のみの誤ったシフトよりも ln(8/2) = ln(4) だけ高エネルギー (安全側/OOD側) に補正されていること。"
+        );
     }
 }

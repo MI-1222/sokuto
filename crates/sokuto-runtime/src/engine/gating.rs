@@ -60,9 +60,9 @@ pub fn calculate_choice_energy(
     calculate_choice_energy_with_config(question, logits, calib_config, None)
 }
 
-/// Choice 型の質問とロジット配列、およびリクエスト固有のゲーティング設定から、正規化ヘルムホルツ自由エネルギーを算出する。
+/// Choice 型の質問とロジット配列、母集団候補数、およびリクエスト固有のゲーティング設定から、正規化ヘルムホルツ自由エネルギーを算出する。
 ///
-/// 粗密探索 (Coarse-to-Fine) 等で $M$ 個に枝刈りされたロジット列と全 $K$ 候補を含む質問定義が渡された場合、
+/// 粗密探索 (Coarse-to-Fine) や階層ルーティング等で $M$ 個に枝刈りされたロジット列と全 $K$ 候補の母集団数 (`total_candidates`) が渡された場合、
 /// 母集団数 $K$ ($K \ge M$) を用いて較正温度を解決し、除外候補を確率 0 (ロジット $-\infty$) とみなした
 /// 全候補空間基準の正規化自由エネルギー $E_{\text{norm}}(x; K) = -T \ln \sum_{m=1}^M \exp(z_m / T) + T \ln K$ を算出する。
 ///
@@ -70,6 +70,46 @@ pub fn calculate_choice_energy(
 /// 1. `gating_config.energy_temperature`: リクエストで明示されたエネルギー温度。
 /// 2. `calib_config.gating_thresholds.energy_temperature`: モデル成果物で事前較正されたエネルギー専用温度。
 /// 3. `calib_config.get_temperature(QuestionType::Choice, K)`: 候補数バケットに基づく Softmax 較正温度。
+///
+/// # 引数
+/// - `question`: 質問定義。
+/// - `logits`: 決定ロジットスライス。
+/// - `total_candidates`: 全候補母集団数 $K$。
+/// - `calib_config`: キャリブレーション設定。
+/// - `gating_config`: リクエスト固有のゲーティング設定 (任意)。
+///
+/// # 戻り値
+/// 正規化ヘルムホルツ自由エネルギー値 (任意)。
+pub fn calculate_choice_energy_with_total_candidates(
+    question: &Question,
+    logits: &[f64],
+    total_candidates: usize,
+    calib_config: &CalibrationConfig,
+    gating_config: Option<&GatingConfig>,
+) -> Option<f64> {
+    if question.question_type != QuestionType::Choice || logits.is_empty() {
+        return None;
+    }
+    let k = total_candidates.max(logits.len());
+    let temp = gating_config
+        .and_then(|cfg| cfg.thresholds.energy_temperature)
+        .or(calib_config.gating_thresholds.energy_temperature)
+        .unwrap_or_else(|| calib_config.get_temperature(QuestionType::Choice, k));
+
+    if k <= 1 {
+        free_energy(logits, temp).ok()
+    } else {
+        let raw_energy = free_energy(logits, temp).ok()?;
+        let effective_tau = temp.max(1e-4);
+        let shift = effective_tau * (k as f64).ln();
+        Some(raw_energy + shift)
+    }
+}
+
+/// Choice 型の質問とロジット配列、およびリクエスト固有のゲーティング設定から、正規化ヘルムホルツ自由エネルギーを算出する。
+///
+/// 質問定義に含まれる criteria の候補数を母集団数 $K$ とみなし、
+/// [`calculate_choice_energy_with_total_candidates`] を呼び出して正規化自由エネルギーを算出する。
 ///
 /// # 引数
 /// - `question`: 質問定義。
@@ -85,27 +125,12 @@ pub fn calculate_choice_energy_with_config(
     calib_config: &CalibrationConfig,
     gating_config: Option<&GatingConfig>,
 ) -> Option<f64> {
-    if question.question_type != QuestionType::Choice || logits.is_empty() {
-        return None;
-    }
     let k = question
         .criteria
         .as_ref()
         .and_then(Criteria::as_map)
         .map_or_else(|| logits.len(), |m| m.len().max(logits.len()));
-    let temp = gating_config
-        .and_then(|cfg| cfg.thresholds.energy_temperature)
-        .or(calib_config.gating_thresholds.energy_temperature)
-        .unwrap_or_else(|| calib_config.get_temperature(QuestionType::Choice, k));
-
-    if k <= 1 {
-        free_energy(logits, temp).ok()
-    } else {
-        let raw_energy = free_energy(logits, temp).ok()?;
-        let effective_tau = temp.max(1e-4);
-        let shift = effective_tau * (k as f64).ln();
-        Some(raw_energy + shift)
-    }
+    calculate_choice_energy_with_total_candidates(question, logits, k, calib_config, gating_config)
 }
 
 /// 単一の判定結果 (`Answer`) に対し、エネルギー値と解決されたゲーティング設定を適用する。
@@ -642,6 +667,12 @@ mod tests {
 
         // 差分は ln(4) - ln(2) = ln(2)
         assert!((energy - sub_energy - (2.0f64).ln()).abs() < 1e-12);
+
+        // calculate_choice_energy_with_total_candidates に明示的に K=4 を渡した場合も同値になること
+        let explicit_energy =
+            calculate_choice_energy_with_total_candidates(&q_sub, &sub_logits, 4, &calib, None)
+                .unwrap();
+        assert!((explicit_energy - energy).abs() < 1e-12);
     }
 
     #[test]

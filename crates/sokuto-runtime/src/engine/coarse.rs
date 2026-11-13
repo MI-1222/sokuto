@@ -4,6 +4,8 @@
 //! State 優先トランケーションによる文脈欠落、およびアテンション分散を抑制するため、
 //! 1 次粗スクリーニング (Coarse) と 2 次精密決定 (Fine) を連携させる機構を提供する。
 
+use std::num::NonZeroUsize;
+
 use indexmap::IndexMap;
 use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_core::contract::model_spec::MAX_NUM_OPTIONS;
@@ -19,7 +21,10 @@ use crate::tokenizer::JevTokenizer;
 pub const DEFAULT_COARSE_THRESHOLD: usize = 30;
 
 /// デフォルトの Fine 段階抽出候補数 ($M$)。
-pub const DEFAULT_TOP_M_CANDIDATES: usize = 20;
+pub const DEFAULT_TOP_M_CANDIDATES: NonZeroUsize = match NonZeroUsize::new(20) {
+    Some(v) => v,
+    None => unreachable!(),
+};
 
 /// 「該当なし」とみなすデフォルトのネガティブ候補識別子セット。
 pub const DEFAULT_NEGATIVE_KEYS: &[&str] = &[
@@ -57,7 +62,8 @@ pub struct CoarseToFineConfig {
     /// 自動トリガー候補数閾値。候補数がこの値を超える場合に 2 段階探索を行う。
     pub threshold: usize,
     /// Fine 段階へ引き渡す最大候補数 ($M$)。通常 16〜24 の範囲を推奨する。
-    pub top_m: usize,
+    /// 0 指定による無効状態を型レベルで防止するため [`NonZeroUsize`] とする。
+    pub top_m: NonZeroUsize,
     /// 「該当なし (None / Other)」候補の自動保護 (Pinning) を有効にするか。
     pub preserve_negative: bool,
     /// ネガティブ候補として判定するキー名のリスト。
@@ -123,12 +129,7 @@ impl CoarseToFineConfig {
 
     /// 設定値の整合性を検証する。
     pub fn validate(&self) -> Result<()> {
-        if self.top_m == 0 {
-            return Err(RuntimeError::InvalidQuestion(
-                "top_m は 1 以上である必要があります。".to_string(),
-            ));
-        }
-        if self.top_m > MAX_NUM_OPTIONS {
+        if self.top_m.get() > MAX_NUM_OPTIONS {
             return Err(RuntimeError::InvalidQuestion(format!(
                 "top_m ({}) はモデル上限 ({}) を超えることはできません。",
                 self.top_m, MAX_NUM_OPTIONS
@@ -583,7 +584,7 @@ pub struct FilteredCandidates {
 /// - `scorer`: 類似度スコアラー。
 ///
 /// # エラー
-/// - `config.validate()` が失敗した場合 (`top_m == 0` または `top_m > MAX_NUM_OPTIONS`)。
+/// - `config.validate()` が失敗した場合 (`top_m > MAX_NUM_OPTIONS`)。
 /// - `scorer.score_candidates` が失敗した場合。
 /// - `scorer.score_candidates` が返却したスコア数と評価対象候補数が一致しない場合は `RuntimeError::InvalidTensorData`。
 pub fn filter_top_candidates(
@@ -597,7 +598,7 @@ pub fn filter_top_candidates(
     let total_candidates = candidates.len();
 
     // 候補数が閾値以下の場合はフィルタリングを行わずそのまま返却
-    if total_candidates <= config.top_m {
+    if total_candidates <= config.top_m.get() {
         return Ok(FilteredCandidates {
             selected: candidates.clone(),
             excluded_keys: Vec::new(),
@@ -627,7 +628,7 @@ pub fn filter_top_candidates(
     }
 
     // ネガティブ保護候補が既に top_m 以上存在する場合のガード
-    let target_top_m = config.top_m;
+    let target_top_m = config.top_m.get();
     if pinned_indices.len() > target_top_m {
         pinned_indices.truncate(target_top_m);
     }
@@ -959,7 +960,7 @@ mod tests {
 
         let config = CoarseToFineConfig {
             threshold: 3,
-            top_m: 3, // 3 件のみ選抜
+            top_m: NonZeroUsize::new(3).expect("3 は非ゼロ。"), // 3 件のみ選抜
             preserve_negative: true,
             negative_keys: vec!["other".to_string()],
             ..Default::default()
@@ -1028,7 +1029,7 @@ mod tests {
         // top_m = 3 の設定 (ネガティブ候補 5 件よりも小さい)
         let config = CoarseToFineConfig {
             threshold: 5,
-            top_m: 3,
+            top_m: NonZeroUsize::new(3).expect("3 は非ゼロ。"),
             preserve_negative: true,
             negative_keys: (0..5).map(|i| format!("none_{i}")).collect(),
             ..Default::default()
@@ -1136,7 +1137,7 @@ mod tests {
     fn test_coarse_config_is_applicable_variants() {
         let config = CoarseToFineConfig {
             threshold: 2,
-            top_m: 2,
+            top_m: NonZeroUsize::new(2).expect("2 は非ゼロ。"),
             preserve_negative: false,
             negative_keys: vec![],
             ..Default::default()
@@ -1193,7 +1194,7 @@ mod tests {
 
         let config = CoarseToFineConfig {
             threshold: 2,
-            top_m: 3,
+            top_m: NonZeroUsize::new(3).expect("3 は非ゼロ。"),
             preserve_negative: false,
             negative_keys: Vec::new(),
             ..Default::default()
@@ -1222,32 +1223,15 @@ mod tests {
     fn test_filter_top_candidates_rejects_invalid_config() {
         let scorer = MockScorer { scores: vec![] };
 
-        // 1. top_m == 0 は候補数が 0 件でもエラーとなること (total <= top_m でのサイレント 0 件返却防止)
-        let empty_candidates = IndexMap::new();
-        let invalid_zero_config = CoarseToFineConfig {
-            top_m: 0,
-            ..Default::default()
-        };
-        let err_empty =
-            filter_top_candidates("クエリ", &empty_candidates, &invalid_zero_config, &scorer)
-                .expect_err(
-                    "top_m == 0 の場合は候補数 0 件でも InvalidQuestion エラーとなること。",
-                );
-        assert!(matches!(err_empty, RuntimeError::InvalidQuestion(_)));
+        // 1. top_m == 0 は NonZeroUsize により型レベルで構築不能
+        assert!(NonZeroUsize::new(0).is_none());
 
-        // 2. top_m == 0 は候補数が 1 件以上でもエラーとなること (silent max(1) 補正の防止)
+        // 2. top_m > MAX_NUM_OPTIONS はエラーとなること
         let mut candidates = IndexMap::new();
         candidates.insert("a".to_string(), "候補 A".to_string());
         candidates.insert("b".to_string(), "候補 B".to_string());
-        let err_non_empty =
-            filter_top_candidates("クエリ", &candidates, &invalid_zero_config, &scorer).expect_err(
-                "top_m == 0 の場合は候補数が存在しても InvalidQuestion エラーとなること。",
-            );
-        assert!(matches!(err_non_empty, RuntimeError::InvalidQuestion(_)));
-
-        // 3. top_m > MAX_NUM_OPTIONS もエラーとなること
         let invalid_large_config = CoarseToFineConfig {
-            top_m: MAX_NUM_OPTIONS + 1,
+            top_m: NonZeroUsize::new(MAX_NUM_OPTIONS + 1).expect("超過値は非ゼロ。"),
             ..Default::default()
         };
         let err_large =

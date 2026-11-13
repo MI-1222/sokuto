@@ -1116,8 +1116,10 @@ fn resolve_batch_answers(
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use super::*;
-    use sokuto_core::contract::model_spec::ModelInputDimensions;
+    use sokuto_core::contract::model_spec::{MAX_NUM_OPTIONS, ModelInputDimensions};
     use sokuto_core::gating::DecisionRoute;
 
     #[test]
@@ -1262,7 +1264,7 @@ mod tests {
 
         let coarse_config = CoarseToFineConfig {
             threshold: 3,
-            top_m: 2,
+            top_m: NonZeroUsize::new(2).expect("2 は非ゼロ。"),
             preserve_negative: false,
             negative_keys: vec![],
             ..Default::default()
@@ -1760,7 +1762,7 @@ mod tests {
         let calib = CalibrationConfig::default();
 
         let invalid_coarse_cfg = CoarseToFineConfig {
-            top_m: 0, // 無効設定 (top_m は 1 以上必須)。
+            top_m: NonZeroUsize::new(MAX_NUM_OPTIONS + 1).expect("モデル上限超過は非ゼロ。"),
             ..Default::default()
         };
 

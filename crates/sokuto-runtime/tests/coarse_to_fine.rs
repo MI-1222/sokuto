@@ -4,6 +4,7 @@
 //! 決定論的タイブレーク、語彙スコアラーと埋め込みキャッシュ、確率空間復元、
 //! ならびに実 ONNX モデルによる単一およびバッチ推論を網羅的に検証する。
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use indexmap::IndexMap;
@@ -127,7 +128,7 @@ fn test_negative_preservation_when_similarity_is_zero() {
 
     let config = CoarseToFineConfig {
         threshold: 30,
-        top_m: 16,
+        top_m: NonZeroUsize::new(16).expect("16 は非ゼロ。"),
         preserve_negative: true,
         negative_keys: vec!["none_of_the_above".to_string()],
         ..Default::default()
@@ -166,7 +167,7 @@ fn test_deterministic_tie_breaking_order() {
 
     let config = CoarseToFineConfig {
         threshold: 30,
-        top_m: 20,
+        top_m: NonZeroUsize::new(20).expect("20 は非ゼロ。"),
         preserve_negative: false,
         ..Default::default()
     };
@@ -197,7 +198,7 @@ fn test_threshold_boundary_bypass_vs_trigger() {
 
     let config = CoarseToFineConfig {
         threshold: 30,
-        top_m: 20,
+        top_m: NonZeroUsize::new(20).expect("20 は非ゼロ。"),
         ..Default::default()
     };
 
@@ -318,7 +319,7 @@ fn test_end_to_end_coarse_to_fine_with_onnx_model() {
     let calib_config = init_default_calibration();
     let coarse_config = CoarseToFineConfig {
         threshold: 30,
-        top_m: 16,
+        top_m: NonZeroUsize::new(16).expect("16 は非ゼロ。"),
         preserve_negative: true,
         ..Default::default()
     };
@@ -388,7 +389,7 @@ fn test_batch_coarse_to_fine_mixed_questions() {
     let calib_config = init_default_calibration();
     let coarse_config = CoarseToFineConfig {
         threshold: 30,
-        top_m: 16,
+        top_m: NonZeroUsize::new(16).expect("16 は非ゼロ。"),
         preserve_negative: true,
         ..Default::default()
     };
@@ -489,7 +490,7 @@ fn test_excessive_negative_candidates_strict_top_m_bound() {
 
     let config = CoarseToFineConfig {
         threshold: 30,
-        top_m: 16,
+        top_m: NonZeroUsize::new(16).expect("16 は非ゼロ。"),
         preserve_negative: true,
         negative_keys: (0..25).map(|i| format!("none_{i:02}")).collect(),
         ..Default::default()
@@ -565,7 +566,7 @@ fn test_general_inquiry_not_pinned_by_default() {
 
     let config = CoarseToFineConfig {
         threshold: 30,
-        top_m: 5,
+        top_m: NonZeroUsize::new(5).expect("5 は非ゼロ。"),
         preserve_negative: true,
         ..Default::default()
     };

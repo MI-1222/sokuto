@@ -3,6 +3,7 @@
 //! 推論エンジン (`InferenceEngine`) における、単一質問推論・プレフィックス共有バッチ推論・
 //! 粗密 2 段階探索推論を通じた実効確信度ゲーティング (3 系統ルーティング) の統合動作を検証する。
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use indexmap::IndexMap;
@@ -256,7 +257,7 @@ fn test_coarse_to_fine_gating_and_reconstruction() {
 
     let coarse_config = CoarseToFineConfig {
         threshold: 5,
-        top_m: 3,
+        top_m: NonZeroUsize::new(3).expect("3 は非ゼロ。"),
         preserve_negative: false,
         negative_keys: Vec::new(),
         ..Default::default()

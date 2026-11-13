@@ -4,6 +4,7 @@
 //! 単一質問、並列バッチ、大規模候補探索 (Coarse-to-Fine)、およびスクラッチパッド再利用時の
 //! 純粋な計算レイテンシとスループットを精密に計測する。
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -424,7 +425,7 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), CliError> {
         let question = Question::new_choice("問い合わせの意図を分類してください。", large_criteria);
         let coarse_config = CoarseToFineConfig {
             threshold: 30,
-            top_m: 16,
+            top_m: NonZeroUsize::new(16).expect("16 は非ゼロ。"),
             ..Default::default()
         };
 

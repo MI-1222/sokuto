@@ -235,20 +235,27 @@ pub fn decompress_fp16_to_f32(src: &[f16], dst: &mut [f32]) {
 ///
 /// # 引数
 /// - `src`: 入力 `f32` スライス。
-/// - `hidden_size`: 隠れ層次元数。
-pub fn compress_f32_to_int8_symmetric(src: &[f32], hidden_size: usize) -> (Vec<i8>, Vec<f32>) {
-    assert!(hidden_size > 0, "hidden_sizeは1以上である必要があります。");
-    assert_eq!(
-        src.len() % hidden_size,
-        0,
-        "データ長はhidden_sizeの倍数である必要があります。"
-    );
+/// - `hidden_size`: 隠れ層次元数。ゼロ以外の値を要求する。
+///
+/// # エラー
+/// - `src` の要素数が `hidden_size` の整数倍でない場合に [`RuntimeError::InvalidTensorData`] を返す。
+pub fn compress_f32_to_int8_symmetric(
+    src: &[f32],
+    hidden_size: NonZeroUsize,
+) -> Result<(Vec<i8>, Vec<f32>)> {
+    let hidden = hidden_size.get();
+    if !src.len().is_multiple_of(hidden) {
+        return Err(RuntimeError::InvalidTensorData(format!(
+            "データ長 ({}) は hidden_size ({hidden}) の倍数である必要があります。",
+            src.len()
+        )));
+    }
 
-    let num_tokens = src.len() / hidden_size;
+    let num_tokens = src.len() / hidden;
     let mut quantized = Vec::with_capacity(src.len());
     let mut scales = Vec::with_capacity(num_tokens);
 
-    for token_slice in src.chunks_exact(hidden_size) {
+    for token_slice in src.chunks_exact(hidden) {
         let mut max_abs = 0.0f32;
         for &val in token_slice {
             let abs_val = val.abs();
@@ -271,7 +278,7 @@ pub fn compress_f32_to_int8_symmetric(src: &[f32], hidden_size: usize) -> (Vec<i
         }
     }
 
-    (quantized, scales)
+    Ok((quantized, scales))
 }
 
 /// トークン単位対称 `INT8` スライスを `f32` スライスへ展開する。
@@ -279,35 +286,51 @@ pub fn compress_f32_to_int8_symmetric(src: &[f32], hidden_size: usize) -> (Vec<i
 /// # 引数
 /// - `src`: 量子化データスライス。
 /// - `scales`: 各トークンのスケールスライス。
-/// - `hidden_size`: 隠れ層次元数。
+/// - `hidden_size`: 隠れ層次元数。ゼロ以外の値を要求する。
 /// - `dst`: 出力先 `f32` スライス。
+///
+/// # エラー
+/// - `src` と `dst` の要素数が一致しない場合、
+/// - `src` の要素数が `hidden_size` の整数倍でない場合、
+/// - またはトークン数と `scales` の要素数が一致しない場合に [`RuntimeError::InvalidTensorData`] を返す。
 pub fn decompress_int8_symmetric_to_f32(
     src: &[i8],
     scales: &[f32],
-    hidden_size: usize,
+    hidden_size: NonZeroUsize,
     dst: &mut [f32],
-) {
-    assert!(hidden_size > 0, "hidden_sizeは1以上である必要があります。");
-    assert_eq!(src.len(), dst.len(), "展開元と先の要素数が一致しません。");
-    assert_eq!(
-        src.len() % hidden_size,
-        0,
-        "データ長はhidden_sizeの倍数である必要があります。"
-    );
-    assert_eq!(
-        src.len() / hidden_size,
-        scales.len(),
-        "トークン数とスケール数が一致しません。"
-    );
+) -> Result<()> {
+    if src.len() != dst.len() {
+        return Err(RuntimeError::InvalidTensorData(format!(
+            "展開元要素数 ({}) と展開先要素数 ({}) が一致しません。",
+            src.len(),
+            dst.len()
+        )));
+    }
+    let hidden = hidden_size.get();
+    if !src.len().is_multiple_of(hidden) {
+        return Err(RuntimeError::InvalidTensorData(format!(
+            "データ長 ({}) は hidden_size ({hidden}) の倍数である必要があります。",
+            src.len()
+        )));
+    }
+    let num_tokens = src.len() / hidden;
+    if num_tokens != scales.len() {
+        return Err(RuntimeError::InvalidTensorData(format!(
+            "トークン数 ({num_tokens}) とスケール数 ({}) が一致しません。",
+            scales.len()
+        )));
+    }
 
     for (q_chunk, (dst_chunk, &scale)) in src
-        .chunks_exact(hidden_size)
-        .zip(dst.chunks_exact_mut(hidden_size).zip(scales.iter()))
+        .chunks_exact(hidden)
+        .zip(dst.chunks_exact_mut(hidden).zip(scales.iter()))
     {
         for (&q, d) in q_chunk.iter().zip(dst_chunk.iter_mut()) {
             *d = (q as f32) * scale;
         }
     }
+
+    Ok(())
 }
 
 /// キャッシュ内に保持されるテンソル実体ペイロード。
@@ -643,7 +666,14 @@ impl CachedStateFeatures {
                 })
             }
             CacheCompressionMode::Int8Symmetric => {
-                let (quantized, scales) = compress_f32_to_int8_symmetric(raw_slice, hidden_size);
+                let non_zero_hidden_size = NonZeroUsize::new(hidden_size).ok_or_else(|| {
+                    RuntimeError::InvalidTensorData(
+                        "Int8Symmetric モードでは hidden_size は 1 以上である必要があります。"
+                            .to_string(),
+                    )
+                })?;
+                let (quantized, scales) =
+                    compress_f32_to_int8_symmetric(raw_slice, non_zero_hidden_size)?;
                 let byte_size = quantized.len() * std::mem::size_of::<i8>()
                     + scales.len() * std::mem::size_of::<f32>();
                 Ok(Self {
@@ -690,14 +720,19 @@ impl CachedStateFeatures {
                 Ok(Arc::new(tensor.into_dyn()))
             }
             CachedTensorPayload::Int8Symmetric { quantized, scales } => {
-                let hidden_size = self.hidden_size();
+                let hidden_size = NonZeroUsize::new(self.hidden_size()).ok_or_else(|| {
+                    RuntimeError::InvalidTensorData(
+                        "Int8Symmetric キャッシュの hidden_size は 1 以上である必要があります。"
+                            .to_string(),
+                    )
+                })?;
                 let allocator = Allocator::default();
                 let mut tensor = Tensor::<f32>::new(&allocator, self.shape.clone())
                     .map_err(RuntimeError::Ort)?;
                 let (_, dst) = tensor
                     .try_extract_tensor_mut::<f32>()
                     .map_err(RuntimeError::Ort)?;
-                decompress_int8_symmetric_to_f32(quantized, scales, hidden_size, dst);
+                decompress_int8_symmetric_to_f32(quantized, scales, hidden_size, dst)?;
                 Ok(Arc::new(tensor.into_dyn()))
             }
         }
@@ -802,8 +837,19 @@ impl CachedStateFeatures {
                         scales.len()
                     )));
                 }
+                let non_zero_hidden_size = NonZeroUsize::new(hidden_size).ok_or_else(|| {
+                    RuntimeError::InvalidTensorData(
+                        "Int8Symmetric キャッシュの hidden_size は 1 以上である必要があります。"
+                            .to_string(),
+                    )
+                })?;
                 let (first_chunk, rest) = dst.split_at_mut(single_len);
-                decompress_int8_symmetric_to_f32(quantized, scales, hidden_size, first_chunk);
+                decompress_int8_symmetric_to_f32(
+                    quantized,
+                    scales,
+                    non_zero_hidden_size,
+                    first_chunk,
+                )?;
                 for chunk in rest.chunks_exact_mut(single_len) {
                     chunk.copy_from_slice(first_chunk);
                 }
@@ -1798,23 +1844,25 @@ mod tests {
 
     #[test]
     fn test_int8_symmetric_compression_roundtrip() {
-        let hidden_size = 64;
+        let hidden_size = NonZeroUsize::new(64).unwrap();
         let num_tokens = 4;
-        let mut original = Vec::with_capacity(num_tokens * hidden_size);
+        let mut original = Vec::with_capacity(num_tokens * hidden_size.get());
 
         for t in 0..num_tokens {
             let scale = (t + 1) as f32 * 0.8;
-            for i in 0..hidden_size {
-                original.push(((i as f32) / (hidden_size as f32) - 0.5) * scale);
+            for i in 0..hidden_size.get() {
+                original.push(((i as f32) / (hidden_size.get() as f32) - 0.5) * scale);
             }
         }
 
-        let (quantized, scales) = compress_f32_to_int8_symmetric(&original, hidden_size);
+        let (quantized, scales) =
+            compress_f32_to_int8_symmetric(&original, hidden_size).expect("圧縮に成功。");
         assert_eq!(quantized.len(), original.len());
         assert_eq!(scales.len(), num_tokens);
 
         let mut restored = vec![0.0f32; original.len()];
-        decompress_int8_symmetric_to_f32(&quantized, &scales, hidden_size, &mut restored);
+        decompress_int8_symmetric_to_f32(&quantized, &scales, hidden_size, &mut restored)
+            .expect("展開に成功。");
 
         let mut max_err = 0.0f32;
         for (&orig, &rest) in original.iter().zip(restored.iter()) {
@@ -1826,6 +1874,40 @@ mod tests {
 
         // `INT8` 対称量子化の量子化ステップ幅は `scale / 127`。最大誤差が 0.05 未満であることを確認。
         assert!(max_err < 0.05, "INT8 誤差が大きすぎます: {max_err}");
+    }
+
+    #[test]
+    fn test_int8_symmetric_compression_errors() {
+        let hidden_size = NonZeroUsize::new(4).unwrap();
+        let invalid_len_src = vec![1.0f32; 7]; // 4の倍数ではない。
+        let result = compress_f32_to_int8_symmetric(&invalid_len_src, hidden_size);
+        assert!(result.is_err(), "倍数不一致によるエラー返却を確認。");
+
+        let valid_src = vec![1.0f32; 8];
+        let (quantized, scales) =
+            compress_f32_to_int8_symmetric(&valid_src, hidden_size).expect("圧縮に成功。");
+
+        // 展開元と展開先の要素数不一致。
+        let mut short_dst = vec![0.0f32; 6];
+        assert!(
+            decompress_int8_symmetric_to_f32(&quantized, &scales, hidden_size, &mut short_dst)
+                .is_err(),
+            "展開先サイズ不一致によるエラー返却を確認。"
+        );
+
+        // スケール数不一致。
+        let mut valid_dst = vec![0.0f32; 8];
+        let invalid_scales = vec![1.0f32; 1]; // 期待は 2。
+        assert!(
+            decompress_int8_symmetric_to_f32(
+                &quantized,
+                &invalid_scales,
+                hidden_size,
+                &mut valid_dst
+            )
+            .is_err(),
+            "スケール数不一致によるエラー返却を確認。"
+        );
     }
 
     #[test]

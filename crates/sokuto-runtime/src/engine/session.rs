@@ -729,6 +729,10 @@ pub(crate) fn create_session_builder(
 /// スロット 0 の Execution Provider を基準値とし、2 番目以降 (`i >= 1`) で異なる
 /// Execution Provider にフォールバックした場合は警告ログを出力する。
 ///
+/// 最適化モデルキャッシュ (`optimized_model_path`) が指定されている場合、複数スロットや複数プロセスによる
+/// 同時書き込み競合を防止するため、スロット 0 のみがプロセス固有の一時ファイルパスへ書き出し、
+/// コミット成功後にアトミックリネーム (`std::fs::rename`) で確定する。スロット 1 以降はキャッシュ書き出しを無効化する。
+///
 /// # 引数
 /// - `config`: セッション構築設定。
 /// - `commit_fn`: 構成済み [`SessionBuilder`] から [`Session`] を確定するクロージャ。
@@ -739,11 +743,77 @@ pub(crate) fn build_session_pool<F>(
 where
     F: FnMut(SessionBuilder) -> ort::Result<Session>,
 {
-    build_session_pool_with(
+    // 最適化モデルキャッシュの同時書き込み競合を防止するアトミック書き込み制御
+    let (slot0_config, tmp_cache_path, target_cache_path) = match &config.optimized_model_path {
+        Some(target_path) => {
+            if target_path.exists() {
+                // すでにキャッシュが存在する場合は再保存・上書きによる競合を防止するため無効化
+                let mut c = config.clone();
+                c.optimized_model_path = None;
+                (c, None, None)
+            } else {
+                // プロセス固有の一時ファイルパスへ書き出してからアトミックリネーム
+                let tmp_path = target_path.with_extension(format!(
+                    "tmp.{}.{}",
+                    std::process::id(),
+                    target_path
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("onnx")
+                ));
+                let mut c = config.clone();
+                c.optimized_model_path = Some(tmp_path.clone());
+                (c, Some(tmp_path), Some(target_path.clone()))
+            }
+        }
+        None => (config.clone(), None, None),
+    };
+
+    // スロット 1 以降はキャッシュ書き込みを行わない設定 (スロット分離)
+    let follower_config = if config.optimized_model_path.is_some() {
+        let mut c = config.clone();
+        c.optimized_model_path = None;
+        c
+    } else {
+        config.clone()
+    };
+
+    let mut slot_index = 0;
+    let res = build_session_pool_with(
         config.pool_size,
-        |pool_size| create_session_builder(config, pool_size),
+        |pool_size| {
+            let active_cfg = if slot_index == 0 {
+                &slot0_config
+            } else {
+                &follower_config
+            };
+            slot_index += 1;
+            create_session_builder(active_cfg, pool_size)
+        },
         |builder| commit_fn(builder).map_err(RuntimeError::Ort),
-    )
+    );
+
+    // スロット 0 の初期化完了後、一時キャッシュファイルをアトミックリネーム
+    if let (Some(tmp), Some(target)) = (tmp_cache_path, target_cache_path) {
+        if res.is_ok() && tmp.exists() {
+            if let Err(e) = std::fs::rename(&tmp, &target) {
+                // 既に別プロセスによってリネームされていた場合は警告にとどめ、一時ファイルを削除
+                if target.exists() {
+                    let _ = std::fs::remove_file(&tmp);
+                } else {
+                    tracing::warn!(
+                        "最適化モデルキャッシュのアトミックリネームに失敗しました: {e} (一時ファイル: {})。",
+                        tmp.display()
+                    );
+                }
+            }
+        } else if tmp.exists() {
+            // セッション構築に失敗した場合は破損の恐れがあるため一時ファイルを破棄
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    res
 }
 
 /// ビルダー生成処理とセッション確定処理を注入してセッションプールを構築する内部補助関数。

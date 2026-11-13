@@ -264,12 +264,60 @@ impl SessionConfig {
         self
     }
 
+    /// モデルファイルおよびセッション設定からグラフキャッシュの識別ハッシュ (XXH3-64) を算出する。
+    ///
+    /// モデルパス、ファイルサイズ、最終更新日時、最適化レベル、優先プロバイダ列、
+    /// 並列実行設定を組み合わせ、モデル差し替え時や設定変更時のキャッシュ陳腐化を防止する。
+    pub(crate) fn compute_graph_cache_hash(&self, model_path: &std::path::Path) -> u64 {
+        use xxhash_rust::xxh3::Xxh3;
+
+        let mut hasher = Xxh3::new();
+
+        // 1. カノニカルパス (解決不能な場合は元のパス)
+        let canonical =
+            std::fs::canonicalize(model_path).unwrap_or_else(|_| model_path.to_path_buf());
+        hasher.update(canonical.to_string_lossy().as_bytes());
+
+        // 2. モデルファイルのメタデータ (サイズ, 最終更新日時)
+        if let Ok(metadata) = std::fs::metadata(&canonical) {
+            hasher.update(&metadata.len().to_le_bytes());
+            if let Some(duration) = metadata
+                .modified()
+                .ok()
+                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            {
+                hasher.update(&duration.as_nanos().to_le_bytes());
+            }
+        }
+
+        // 3. セッション設定パラメータ
+        let opt_level_byte = match self.optimization_level {
+            OptimizationLevel::Disable => 0u8,
+            OptimizationLevel::Basic => 1u8,
+            OptimizationLevel::Extended => 2u8,
+            OptimizationLevel::All => 3u8,
+        };
+        hasher.update(&[opt_level_byte]);
+
+        for provider in &self.preferred_providers {
+            hasher.update(provider.name().as_bytes());
+        }
+
+        hasher.update(&[self.parallel_execution as u8]);
+
+        hasher.digest()
+    }
+
     /// 最適化済みモデルグラフのディスクキャッシュを安全に自動設定するビルダーメソッド。
     ///
     /// `optimized_model_path` が未指定の場合に、書き込み可能な一時ディレクトリ
     /// (`std::env::temp_dir()` 配下)にモデル識別ハッシュ付きのファイルパスを自動生成する。
     /// Docker 等の読み取り専用 (`:ro`) マウント環境でも安全に動作し、ディレクトリ生成に失敗した場合は
     /// キャッシュを有効化せず安全にスキップする。
+    ///
+    /// キャッシュファイル名のハッシュ値には、モデルファイルのパス、ファイルサイズ、
+    /// 最終更新日時、最適化レベル、優先 Execution Provider、並列実行設定が含まれ、
+    /// モデル差し替え時や設定変更時のキャッシュ陳腐化を確実に防止する。
     pub fn with_auto_graph_cache(mut self, model_path: &std::path::Path) -> Self {
         if self.optimized_model_path.is_some() {
             return self;
@@ -279,7 +327,7 @@ impl SessionConfig {
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("model");
-        let path_hash = xxhash_rust::xxh3::xxh3_64(model_path.to_string_lossy().as_bytes());
+        let path_hash = self.compute_graph_cache_hash(model_path);
         let cache_dir = std::env::temp_dir().join("sokuto_graph_cache");
         if std::fs::create_dir_all(&cache_dir).is_ok() {
             let cache_file = cache_dir.join(format!("{file_stem}_{path_hash:016x}.onnx"));
@@ -396,5 +444,45 @@ mod tests {
             .with_optimized_model_path(&custom_path)
             .with_auto_graph_cache(model_path);
         assert_eq!(cfg2.optimized_model_path, Some(custom_path));
+    }
+
+    #[test]
+    fn test_compute_graph_cache_hash_stale_prevention() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sokuto_hash_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let model_file = temp_dir.join("test_model.onnx");
+
+        std::fs::write(&model_file, b"model v1").expect("テスト用ファイル作成に失敗。");
+
+        let cfg = SessionConfig::default();
+        let hash1 = cfg.compute_graph_cache_hash(&model_file);
+
+        // 同一ファイル・同一設定なら同じハッシュになること
+        let hash1_retry = cfg.compute_graph_cache_hash(&model_file);
+        assert_eq!(hash1, hash1_retry);
+
+        // 最適化レベル変更時にハッシュが変わること
+        let cfg_opt = SessionConfig::default().with_optimization_level(OptimizationLevel::Disable);
+        let hash_opt = cfg_opt.compute_graph_cache_hash(&model_file);
+        assert_ne!(hash1, hash_opt);
+
+        // Execution Provider 変更時にハッシュが変わること
+        let cfg_cpu = SessionConfig::cpu_only();
+        let hash_cpu = cfg_cpu.compute_graph_cache_hash(&model_file);
+        // default と cpu_only が異なる EP 構成なら異なるハッシュになること
+        if cfg.preferred_providers != cfg_cpu.preferred_providers {
+            assert_ne!(hash1, hash_cpu);
+        }
+
+        // ファイルサイズ変更時にハッシュが変わること (キャッシュ陳腐化防止)
+        std::fs::write(&model_file, b"model v2 modified content")
+            .expect("テスト用ファイル更新に失敗。");
+        let hash2 = cfg.compute_graph_cache_hash(&model_file);
+        assert_ne!(hash1, hash2);
+
+        // クリーンアップ
+        let _ = std::fs::remove_file(&model_file);
+        let _ = std::fs::remove_dir(&temp_dir);
     }
 }

@@ -534,6 +534,14 @@ impl CoarseScorer for EmbeddingCoarseScorer<'_> {
         _query: &str,
         candidates: &mut dyn ExactSizeIterator<Item = (&str, &str)>,
     ) -> Result<Vec<f32>> {
+        if self.cache.dimension() != 0 && self.query_vector.len() != self.cache.dimension() {
+            return Err(RuntimeError::InvalidTensorData(format!(
+                "埋め込み次元数不一致: 期待値={}, 実際={}。",
+                self.cache.dimension(),
+                self.query_vector.len()
+            )));
+        }
+
         let mut scores = Vec::with_capacity(candidates.len());
 
         for (key, _) in candidates {
@@ -889,6 +897,51 @@ mod tests {
         // コサイン類似度
         let sim = CandidateEmbeddingCache::cosine_similarity(vec, &[0.6, 0.8]);
         assert!((sim - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_embedding_coarse_scorer_dimension_mismatch() {
+        let mut cache = CandidateEmbeddingCache::new();
+        cache
+            .insert("cand1", vec![1.0, 0.0, 0.0])
+            .expect("挿入に成功。");
+        assert_eq!(cache.dimension(), 3);
+
+        let candidates = [("cand1", "候補1"), ("cand2", "候補2")];
+
+        // 1. 次元が一致する場合: 正常にスコアが算出されること
+        let valid_query = [1.0, 0.0, 0.0];
+        let scorer_valid = EmbeddingCoarseScorer::new(&cache, &valid_query);
+        let scores = scorer_valid
+            .score_candidates("クエリ", &candidates)
+            .expect("次元一致時はスコアリングに成功。");
+        assert_eq!(scores.len(), 2);
+        assert!((scores[0] - 1.0).abs() < 1e-6);
+        assert_eq!(scores[1], 0.0);
+
+        // 2. 次元が不一致の場合 (2次元): InvalidTensorData エラーとなること
+        let short_query = [1.0, 0.0];
+        let scorer_short = EmbeddingCoarseScorer::new(&cache, &short_query);
+        let err_short = scorer_short
+            .score_candidates("クエリ", &candidates)
+            .expect_err("次元不一致時は InvalidTensorData エラーとなること。");
+        assert!(matches!(err_short, RuntimeError::InvalidTensorData(_)));
+
+        // 3. 空ベクトルの場合: InvalidTensorData エラーとなること
+        let empty_query: [f32; 0] = [];
+        let scorer_empty = EmbeddingCoarseScorer::new(&cache, &empty_query);
+        let err_empty = scorer_empty
+            .score_candidates("クエリ", &candidates)
+            .expect_err("空ベクトル時は InvalidTensorData エラーとなること。");
+        assert!(matches!(err_empty, RuntimeError::InvalidTensorData(_)));
+
+        // 4. キャッシュが空 (dimension == 0) の場合: エラーにならず全件 0.0 となること
+        let empty_cache = CandidateEmbeddingCache::new();
+        let scorer_empty_cache = EmbeddingCoarseScorer::new(&empty_cache, &valid_query);
+        let scores_empty_cache = scorer_empty_cache
+            .score_candidates("クエリ", &candidates)
+            .expect("キャッシュが空の場合はエラーにならずスコアリングに成功。");
+        assert_eq!(scores_empty_cache, vec![0.0, 0.0]);
     }
 
     #[test]

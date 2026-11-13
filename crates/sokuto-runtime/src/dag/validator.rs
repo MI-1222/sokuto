@@ -109,8 +109,14 @@ pub fn compile_dag(dag: &DagDefinition) -> Result<CompiledDag, DagValidationErro
     // 1. ノード種別整合性および参照先実在チェック
     for (node_id, node) in &dag.nodes {
         match node {
-            DagNode::Inference { .. } => {
-                // question は型レベルで必須定義される。
+            DagNode::Inference { question, .. } => {
+                question.validate(Some(node_id)).map_err(|err| {
+                    DagValidationError::InvalidNodeSpec {
+                        node_id: node_id.clone(),
+                        node_type: node.node_type(),
+                        reason: err.to_string(),
+                    }
+                })?;
             }
             DagNode::Branch { .. } => {
                 // conditions が空の場合は終端ノードとして扱われ、次ノードなしで正常終了する。
@@ -761,9 +767,14 @@ fn validate_single_condition(
                                 });
                             };
                             for (up_id, q) in &upstream_nodes {
-                                if let Some(Criteria::Map(ref map)) = q.criteria
-                                    && !map.contains_key(s)
-                                {
+                                let map = q.validate_choice_map(Some(up_id)).map_err(|err| {
+                                    DagValidationError::InvalidNodeSpec {
+                                        node_id: (*up_id).to_string(),
+                                        node_type: DagNodeType::Inference,
+                                        reason: err.to_string(),
+                                    }
+                                })?;
+                                if !map.contains_key(s) {
                                     return Err(DagValidationError::InvalidCondition {
                                         node_id: node_id.to_string(),
                                         field: cond.field.clone(),
@@ -800,9 +811,15 @@ fn validate_single_condition(
                                     });
                                 };
                                 for (up_id, q) in &upstream_nodes {
-                                    if let Some(Criteria::Map(ref map)) = q.criteria
-                                        && !map.contains_key(s)
-                                    {
+                                    let map =
+                                        q.validate_choice_map(Some(up_id)).map_err(|err| {
+                                            DagValidationError::InvalidNodeSpec {
+                                                node_id: (*up_id).to_string(),
+                                                node_type: DagNodeType::Inference,
+                                                reason: err.to_string(),
+                                            }
+                                        })?;
+                                    if !map.contains_key(s) {
                                         return Err(DagValidationError::InvalidCondition {
                                             node_id: node_id.to_string(),
                                             field: cond.field.clone(),
@@ -1937,5 +1954,134 @@ mod tests {
             validate_dag(&dag).is_ok(),
             "上流に Inference ノードが存在する Branch ノードでの confidence / route 評価は合格すること。"
         );
+    }
+
+    #[test]
+    fn test_validate_dag_rejects_choice_with_missing_or_invalid_criteria() {
+        // 1. criteria が None の Choice 質問は InvalidNodeSpec で早期拒否
+        let mut nodes_none = IndexMap::new();
+        nodes_none.insert(
+            "choice_node".to_string(),
+            DagNode::inference(
+                Question {
+                    question_type: QuestionType::Choice,
+                    instructions: "選択してください。".to_string(),
+                    criteria: None,
+                },
+                vec![NodeCondition {
+                    field: "answer".to_string(),
+                    op: NodeConditionOp::Eq,
+                    value: Some(serde_json::json!("opt_a")),
+                    target_node: "term".to_string(),
+                }],
+            ),
+        );
+        nodes_none.insert("term".to_string(), DagNode::escalate(Some("終端")));
+
+        let dag_none = DagDefinition {
+            dag_id: "choice_none_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "choice_node".to_string(),
+            nodes: nodes_none,
+        };
+        let err_none =
+            validate_dag(&dag_none).expect_err("criteria が None の Choice 質問は拒否されること。");
+        assert!(matches!(
+            err_none,
+            DagValidationError::InvalidNodeSpec {
+                ref node_id,
+                node_type: DagNodeType::Inference,
+                ..
+            } if node_id == "choice_node"
+        ));
+
+        // 2. 候補数 0 件 (空マップ) の Choice 質問は InvalidNodeSpec で拒否
+        let mut nodes_empty = IndexMap::new();
+        let crit_empty = IndexMap::new();
+        nodes_empty.insert(
+            "choice_empty".to_string(),
+            DagNode::inference(
+                Question::new_choice("空選択肢".to_string(), crit_empty),
+                Vec::new(),
+            ),
+        );
+
+        let dag_empty = DagDefinition {
+            dag_id: "choice_empty_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "choice_empty".to_string(),
+            nodes: nodes_empty,
+        };
+        let err_empty =
+            validate_dag(&dag_empty).expect_err("候補数 0 件の Choice 質問は拒否されること。");
+        assert!(matches!(
+            err_empty,
+            DagValidationError::InvalidNodeSpec {
+                ref node_id,
+                node_type: DagNodeType::Inference,
+                ..
+            } if node_id == "choice_empty"
+        ));
+    }
+
+    #[test]
+    fn test_validate_dag_rejects_score_with_missing_or_invalid_criteria() {
+        // 1. criteria が None の Score 質問は InvalidNodeSpec で拒否
+        let mut nodes_none = IndexMap::new();
+        nodes_none.insert(
+            "score_node".to_string(),
+            DagNode::inference(
+                Question {
+                    question_type: QuestionType::Score,
+                    instructions: "評価してください。".to_string(),
+                    criteria: None,
+                },
+                Vec::new(),
+            ),
+        );
+
+        let dag_none = DagDefinition {
+            dag_id: "score_none_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "score_node".to_string(),
+            nodes: nodes_none,
+        };
+        let err_none =
+            validate_dag(&dag_none).expect_err("criteria が None の Score 質問は拒否されること。");
+        assert!(matches!(
+            err_none,
+            DagValidationError::InvalidNodeSpec {
+                ref node_id,
+                node_type: DagNodeType::Inference,
+                ..
+            } if node_id == "score_node"
+        ));
+
+        // 2. 段階数 1 件 (境界値違反) の Score 質問は InvalidNodeSpec で拒否
+        let mut nodes_single = IndexMap::new();
+        nodes_single.insert(
+            "score_single".to_string(),
+            DagNode::inference(
+                Question::new_score("単一段階".to_string(), vec!["低".to_string()]),
+                Vec::new(),
+            ),
+        );
+
+        let dag_single = DagDefinition {
+            dag_id: "score_single_dag".to_string(),
+            timeout_ms: 100,
+            entry_node: "score_single".to_string(),
+            nodes: nodes_single,
+        };
+        let err_single =
+            validate_dag(&dag_single).expect_err("段階数 1 件の Score 質問は拒否されること。");
+        assert!(matches!(
+            err_single,
+            DagValidationError::InvalidNodeSpec {
+                ref node_id,
+                node_type: DagNodeType::Inference,
+                ..
+            } if node_id == "score_single"
+        ));
     }
 }

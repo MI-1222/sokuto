@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use sokuto_runtime::engine::{
     AlignedBuffer64, CacheCompressionMode, CachedStateFeatures, DualSessionEngine, SessionConfig,
-    StateCacheManager, is_aligned_64,
+    StateCacheManager, is_aligned_64, validate_op_indices,
 };
 
 #[test]
@@ -286,18 +286,18 @@ fn test_op_indices_minus_one_padding_semantics() {
     let query_seq_len = 64;
     // -1パディングおよび有効インデックス (0..64) は正常。
     let valid_indices = vec![10i64, 25, 40, -1];
-    for &idx in &valid_indices {
-        assert!(
-            idx == -1 || (idx >= 0 && idx < query_seq_len as i64),
-            "-1または有効なインデックスである必要があります。"
-        );
-    }
+    assert!(
+        validate_op_indices(&valid_indices, query_seq_len).is_ok(),
+        "-1または有効なインデックスの検証に失敗しました。"
+    );
 
     // 範囲外インデックス (-2 や 64 以上) の検出。
     let invalid_indices = vec![-2i64, 64, 100];
     for &idx in &invalid_indices {
-        let is_valid = idx == -1 || (idx >= 0 && idx < query_seq_len as i64);
-        assert!(!is_valid, "無効なインデックスである必要があります: {idx}");
+        assert!(
+            validate_op_indices(&[idx], query_seq_len).is_err(),
+            "無効なインデックスが検出されませんでした: {idx}。"
+        );
     }
 }
 

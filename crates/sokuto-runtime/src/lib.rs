@@ -34,10 +34,12 @@ pub use engine::{
     reconstruct_probabilities,
 };
 pub use error::{Result, RuntimeError};
+#[allow(deprecated)]
+pub use hierarchical::HierarchicalEngine;
 pub use hierarchical::{
     CoarseToFineRouter, DEFAULT_BEAM_MARGIN_THRESHOLD, DEFAULT_CATCHALL_THRESHOLD,
     DEFAULT_COARSE_POWER_ALPHA, DEFAULT_ENTROPY_TEMP_GAMMA, DEFAULT_ESCALATE_CONFIDENCE_THRESHOLD,
-    DirichletCalibrator, HierarchicalEngine, HierarchicalExecutionTrace, HierarchicalMapping,
+    DirichletCalibrator, HierarchicalExecutionTrace, HierarchicalMapping,
     HierarchicalMappingBuilder, HierarchicalPredictor, HierarchicalResult,
     HierarchicalRouterConfig, combine_and_reconstruct_probabilities, compute_fine_temperature,
     compute_normalized_entropy, temperature_scaled_softmax,

@@ -21,8 +21,10 @@ pub use calibration::{
     temperature_scaled_softmax,
 };
 pub use mapping::{HierarchicalMapping, HierarchicalMappingBuilder};
+#[allow(deprecated)]
+pub use router::HierarchicalEngine;
 pub use router::{
     CoarseToFineRouter, DEFAULT_BEAM_MARGIN_THRESHOLD, DEFAULT_CATCHALL_THRESHOLD,
-    DEFAULT_ESCALATE_CONFIDENCE_THRESHOLD, HierarchicalEngine, HierarchicalExecutionTrace,
-    HierarchicalPredictor, HierarchicalResult, HierarchicalRouterConfig,
+    DEFAULT_ESCALATE_CONFIDENCE_THRESHOLD, HierarchicalExecutionTrace, HierarchicalPredictor,
+    HierarchicalResult, HierarchicalRouterConfig,
 };

@@ -172,6 +172,15 @@ impl HierarchicalResult {
 }
 
 /// 粗密階層ルーティングで使用する推論エンジンバックエンド (後方互換用列挙型)。
+///
+/// ゼロコスト抽象化と静的ディスパッチのため、今後は [`HierarchicalPredictor`] トレイトの実装型
+/// (例: `(&InferenceEngine, &JevTokenizer)`, `(&DualSessionEngine, &CachedStateFeatures, &JevTokenizer)`)
+/// を直接 [`CoarseToFineRouter::with_predictor`] または専用コンストラクタ ([`CoarseToFineRouter::new`],
+/// [`CoarseToFineRouter::new_dual`]) へ渡すことが推奨されます。
+#[deprecated(
+    since = "0.4.0",
+    note = "HierarchicalPredictor トレイトによる静的ディスパッチ (CoarseToFineRouter::with_predictor, new, new_dual) を使用してください。"
+)]
 pub enum HierarchicalEngine<'a> {
     /// 単一 ONNX モデルによる通常推論エンジン。
     Single(&'a InferenceEngine),
@@ -259,6 +268,22 @@ impl<P: HierarchicalPredictor + ?Sized> HierarchicalPredictor for &P {
     }
 }
 
+impl<P: HierarchicalPredictor + ?Sized> HierarchicalPredictor for Box<P> {
+    fn predict_coarse_probabilities(
+        &self,
+        state: &str,
+        instructions: &str,
+        categories: &IndexMap<String, String>,
+        calib: &CalibrationConfig,
+    ) -> Result<IndexMap<String, f64>> {
+        (**self).predict_coarse_probabilities(state, instructions, categories, calib)
+    }
+
+    fn forward_fine_raw(&self, state: &str, question: &Question) -> Result<Vec<f64>> {
+        (**self).forward_fine_raw(state, question)
+    }
+}
+
 impl HierarchicalPredictor for (&InferenceEngine, &JevTokenizer) {
     fn forward_fine_raw(&self, state: &str, question: &Question) -> Result<Vec<f64>> {
         self.0.forward_question_raw(self.1, state, question)
@@ -282,6 +307,7 @@ impl HierarchicalPredictor for (&DualSessionEngine, &CachedStateFeatures, &JevTo
     }
 }
 
+#[allow(deprecated)]
 impl HierarchicalPredictor for (HierarchicalEngine<'_>, &JevTokenizer) {
     fn forward_fine_raw(&self, state: &str, question: &Question) -> Result<Vec<f64>> {
         match &self.0 {
@@ -365,8 +391,17 @@ impl<'a>
     }
 }
 
+#[allow(deprecated)]
 impl<'a> CoarseToFineRouter<'a, (HierarchicalEngine<'a>, &'a JevTokenizer)> {
     /// 任意の推論バックエンド (`HierarchicalEngine`) からルーターインスタンスを生成する。
+    ///
+    /// # 非推奨
+    /// ゼロコスト抽象化と静的ディスパッチのため、[`CoarseToFineRouter::with_predictor`]
+    /// または個別コンストラクタ ([`CoarseToFineRouter::new`], [`CoarseToFineRouter::new_dual`]) の利用を推奨します。
+    #[deprecated(
+        since = "0.4.0",
+        note = "HierarchicalPredictor トレイトによる静的ディスパッチ (CoarseToFineRouter::with_predictor, new, new_dual) を使用してください。"
+    )]
     pub fn with_backend(
         backend: HierarchicalEngine<'a>,
         tokenizer: &'a JevTokenizer,
@@ -2067,5 +2102,31 @@ mod tests {
             (actual_energy - buggy_energy - (4.0f64).ln()).abs() < 1e-10,
             "M=2 のみの誤ったシフトよりも ln(8/2) = ln(4) だけ高エネルギー (安全側/OOD側) に補正されていること。"
         );
+    }
+
+    #[test]
+    fn test_boxed_hierarchical_predictor_dynamic_dispatch() {
+        let mapping = build_test_mapping();
+        let calib = CalibrationConfig::default();
+
+        let predictor: Box<dyn HierarchicalPredictor> = Box::new(MockRawPredictor {
+            coarse_logits: vec![6.0, 0.0, 0.0, 0.0],
+            fine_logits: vec![0.5, 4.0],
+            coarse_called: std::cell::Cell::new(false),
+            fine_call_count: std::cell::Cell::new(0),
+        });
+
+        let router = CoarseToFineRouter::with_predictor(
+            predictor,
+            &mapping,
+            &calib,
+            HierarchicalRouterConfig::default(),
+        )
+        .expect("Box<dyn HierarchicalPredictor> によるルーター構築に成功。");
+
+        let res = router
+            .route("テスト用コンテキスト", "分類指示文。", None)
+            .expect("動的ディスパッチ推論に成功。");
+        assert_eq!(res.answer().as_choice(), Some("c1_f2"));
     }
 }

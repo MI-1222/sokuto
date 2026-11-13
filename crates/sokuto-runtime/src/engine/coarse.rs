@@ -473,6 +473,7 @@ pub struct FilteredCandidates {
 /// - `scorer`: 類似度スコアラー。
 ///
 /// # エラー
+/// - `config.validate()` が失敗した場合 (`top_m == 0` または `top_m > MAX_NUM_OPTIONS`)。
 /// - `scorer.score_candidates` が失敗した場合。
 /// - `scorer.score_candidates` が返却したスコア数と評価対象候補数が一致しない場合は `RuntimeError::InvalidTensorData`。
 pub fn filter_top_candidates(
@@ -481,6 +482,8 @@ pub fn filter_top_candidates(
     config: &CoarseToFineConfig,
     scorer: &(impl CoarseScorer + ?Sized),
 ) -> Result<FilteredCandidates> {
+    config.validate()?;
+
     let total_candidates = candidates.len();
 
     // 候補数が閾値以下の場合はフィルタリングを行わずそのまま返却
@@ -513,7 +516,7 @@ pub fn filter_top_candidates(
     }
 
     // ネガティブ保護候補が既に top_m 以上存在する場合のガード
-    let target_top_m = config.top_m.max(1);
+    let target_top_m = config.top_m;
     if pinned_indices.len() > target_top_m {
         pinned_indices.truncate(target_top_m);
     }
@@ -1046,5 +1049,43 @@ mod tests {
         let err_long = filter_top_candidates("クエリ", &candidates, &config, &long_scorer)
             .expect_err("スコア数超過時も InvalidTensorData エラーとなること。");
         assert!(matches!(err_long, RuntimeError::InvalidTensorData(_)));
+    }
+
+    #[test]
+    fn test_filter_top_candidates_rejects_invalid_config() {
+        let scorer = MockScorer { scores: vec![] };
+
+        // 1. top_m == 0 は候補数が 0 件でもエラーとなること (total <= top_m でのサイレント 0 件返却防止)
+        let empty_candidates = IndexMap::new();
+        let invalid_zero_config = CoarseToFineConfig {
+            top_m: 0,
+            ..Default::default()
+        };
+        let err_empty =
+            filter_top_candidates("クエリ", &empty_candidates, &invalid_zero_config, &scorer)
+                .expect_err(
+                    "top_m == 0 の場合は候補数 0 件でも InvalidQuestion エラーとなること。",
+                );
+        assert!(matches!(err_empty, RuntimeError::InvalidQuestion(_)));
+
+        // 2. top_m == 0 は候補数が 1 件以上でもエラーとなること (silent max(1) 補正の防止)
+        let mut candidates = IndexMap::new();
+        candidates.insert("a".to_string(), "候補 A".to_string());
+        candidates.insert("b".to_string(), "候補 B".to_string());
+        let err_non_empty =
+            filter_top_candidates("クエリ", &candidates, &invalid_zero_config, &scorer).expect_err(
+                "top_m == 0 の場合は候補数が存在しても InvalidQuestion エラーとなること。",
+            );
+        assert!(matches!(err_non_empty, RuntimeError::InvalidQuestion(_)));
+
+        // 3. top_m > MAX_NUM_OPTIONS もエラーとなること
+        let invalid_large_config = CoarseToFineConfig {
+            top_m: MAX_NUM_OPTIONS + 1,
+            ..Default::default()
+        };
+        let err_large =
+            filter_top_candidates("クエリ", &candidates, &invalid_large_config, &scorer)
+                .expect_err("top_m 超過時は InvalidQuestion エラーとなること。");
+        assert!(matches!(err_large, RuntimeError::InvalidQuestion(_)));
     }
 }

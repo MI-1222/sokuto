@@ -1028,17 +1028,17 @@ fn build_early_exit_result(
         ));
     }
 
-    let selected_choice = mapping
-        .fine_keys_for_coarse(top1_coarse)
-        .and_then(|keys| keys.iter().find(|fk| allowed_fine_keys.contains(fk)))
-        .cloned()
-        .unwrap_or_else(|| allowed_fine_keys[0].clone());
-
     let uniform_prob = 1.0 / (allowed_fine_keys.len() as f64);
     let mut full_probs = IndexMap::with_capacity(allowed_fine_keys.len());
     for k in allowed_fine_keys {
         full_probs.insert(k.clone(), uniform_prob);
     }
+
+    let selected_choice = mapping
+        .fine_keys_for_coarse(top1_coarse)
+        .and_then(|keys| keys.iter().find(|fk| full_probs.contains_key(fk.as_str())))
+        .cloned()
+        .unwrap_or_else(|| allowed_fine_keys[0].clone());
 
     let mut top_candidates: Vec<CandidateProbability> = Vec::with_capacity(3);
     let mut seen = std::collections::HashSet::with_capacity(3);
@@ -1049,7 +1049,7 @@ fn build_early_exit_result(
         }
         if let Some(first_fine) = mapping
             .fine_keys_for_coarse(coarse_key)
-            .and_then(|keys| keys.iter().find(|fk| allowed_fine_keys.contains(fk)))
+            .and_then(|keys| keys.iter().find(|fk| full_probs.contains_key(fk.as_str())))
             && seen.insert(first_fine.as_str())
         {
             top_candidates.push(CandidateProbability {
@@ -1066,7 +1066,7 @@ fn build_early_exit_result(
             if top_candidates.len() >= 3 {
                 break;
             }
-            if allowed_fine_keys.contains(fk) && seen.insert(fk.as_str()) {
+            if full_probs.contains_key(fk.as_str()) && seen.insert(fk.as_str()) {
                 top_candidates.push(CandidateProbability {
                     candidate: fk.clone(),
                     probability: uniform_prob,

@@ -12,7 +12,7 @@ use indexmap::IndexMap;
 use serde_json::Value;
 use sokuto_core::gating::{SystemRoutingSummary, evaluate_response_routing};
 use sokuto_core::schema::{Answer, QuestionType, SystemOneRequest, Usage};
-use sokuto_runtime::engine::StateCacheManager;
+use sokuto_runtime::engine::{StateCacheManager, StateHash};
 use sokuto_runtime::hierarchical::CoarseToFineRouter;
 
 use crate::error::ServerError;
@@ -36,7 +36,7 @@ pub struct InferenceOutput {
     /// キャッシュがヒットしたかどうかのフラグ。
     pub cache_hit: bool,
     /// 対象 State のキャッシュキー (任意)。
-    pub state_key: Option<u64>,
+    pub state_key: Option<StateHash>,
 }
 
 impl InferenceOutput {
@@ -44,7 +44,7 @@ impl InferenceOutput {
     pub fn to_headers(&self) -> HeaderMap {
         let mut headers = HeaderMap::new();
         if let Some(key) = self.state_key
-            && let Ok(hv) = HeaderValue::from_str(&format!("{:016x}", key))
+            && let Ok(hv) = HeaderValue::from_str(&key.to_string())
         {
             headers.insert("X-State-Hash", hv);
         }
@@ -124,9 +124,9 @@ impl InferenceService {
 
         let (state_key, _state_cache_hit_initial) = if is_state_empty {
             if let Some(ref h_str) = client_hash_str {
-                let key = u64::from_str_radix(h_str.trim().trim_start_matches("0x"), 16).map_err(
-                    |e| ServerError::BadRequest(format!("無効な State ハッシュです: {e}。")),
-                )?;
+                let key = h_str.parse::<StateHash>().map_err(|e| {
+                    ServerError::BadRequest(format!("無効な State ハッシュです: {e}。"))
+                })?;
                 let has_cache = self
                     .state
                     .cache_manager

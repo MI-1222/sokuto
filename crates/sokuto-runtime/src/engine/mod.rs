@@ -15,7 +15,8 @@ pub mod session;
 pub use batch::{BatchInferenceOptions, BatchScratchpad, DEFAULT_MAX_BATCH_CHUNK_SIZE};
 pub use cache::{
     AlignedBuffer64, CacheCompressionMode, CachedStateFeatures, CachedTensorPayload,
-    DEFAULT_DUAL_MAX_BATCH_CHUNK_SIZE, DualSessionEngine, StateCacheManager, is_aligned_64,
+    DEFAULT_DUAL_MAX_BATCH_CHUNK_SIZE, DualSessionEngine, StateCacheManager, StateHash,
+    is_aligned_64,
 };
 pub use coarse::{
     CandidateEmbeddingCache, CoarseScorer, CoarseToFineConfig, DEFAULT_COARSE_THRESHOLD,

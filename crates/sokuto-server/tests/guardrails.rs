@@ -558,7 +558,7 @@ async fn test_guardrail_state_batch_sanitization_and_cache_hash() {
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let resp: StateBatchResponse = serde_json::from_slice(&bytes).unwrap();
 
-    let raw_key_hex = format!("{:016x}", StateCacheManager::compute_key(malicious_state));
+    let raw_key_hex = StateCacheManager::compute_key(malicious_state).to_string();
     assert_ne!(
         header_hash, raw_key_hex,
         "サニタイズ前の未加工 State ハッシュとは異なること。"

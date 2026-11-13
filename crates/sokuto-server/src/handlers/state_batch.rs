@@ -52,7 +52,7 @@ pub async fn state_batch_handler(
     let output = inference_service.execute(req, client_hash_str).await?;
 
     let resp_headers = output.to_headers();
-    let hex_key_opt = output.state_key.map(|k| format!("{:016x}", k));
+    let hex_key_opt = output.state_key.map(|k| k.to_string());
 
     let mut response = StateBatchResponse::new(output.answers, output.usage, output.cache_hit);
     if let Some(summary) = output.routing_summary {

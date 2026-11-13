@@ -351,11 +351,84 @@ impl fmt::Debug for CachedTensorPayload {
     }
 }
 
+/// `State` テキストの中間特徴量キャッシュキーを表す Newtype ラッパー。
+///
+/// `xxHash3` (64-bit) によるハッシュ値を保持し、16進文字列フォーマット(`{:016x}`)やパース処理をカプセル化する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct StateHash(pub u64);
+
+impl StateHash {
+    /// 生の `u64` ハッシュ値からキャッシュキーを構築する。
+    #[inline]
+    pub const fn from_raw(val: u64) -> Self {
+        Self(val)
+    }
+
+    /// 保持している生の `u64` ハッシュ値を取得する。
+    #[inline]
+    pub const fn as_u64(&self) -> u64 {
+        self.0
+    }
+
+    /// 内部の `u64` 値を取り出す。
+    #[inline]
+    pub const fn into_inner(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for StateHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:016x}", self.0)
+    }
+}
+
+impl fmt::LowerHex for StateHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
+impl fmt::UpperHex for StateHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::UpperHex::fmt(&self.0, f)
+    }
+}
+
+impl std::str::FromStr for StateHash {
+    type Err = std::num::ParseIntError;
+
+    /// 16進数文字列(任意で `0x` または `0X` プレフィックス付き)から [`StateHash`] をパースする。
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let trimmed = s.trim();
+        let hex_str = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed);
+        let val = u64::from_str_radix(hex_str, 16)?;
+        Ok(Self(val))
+    }
+}
+
+impl From<u64> for StateHash {
+    #[inline]
+    fn from(val: u64) -> Self {
+        Self(val)
+    }
+}
+
+impl From<StateHash> for u64 {
+    #[inline]
+    fn from(hash: StateHash) -> Self {
+        hash.0
+    }
+}
+
 /// キャッシュに格納される `State` 中間特徴量エントリ。
 #[derive(Debug)]
 pub struct CachedStateFeatures {
     /// `xxHash3` (64-bit) によるキー。
-    pub hash_key: u64,
+    pub hash_key: StateHash,
     /// テンソル形状 (`[batch_size, seq_len, hidden_size]`)。
     pub shape: Vec<usize>,
     /// テンソル実体ペイロード。
@@ -408,7 +481,7 @@ impl CachedStateFeatures {
     /// - `shape` が 3 次元でない場合、または `shape[0] != 1` の場合は [`RuntimeError::ModelContractViolation`] を返す。
     /// - `state_mask` が非空かつ要素数が `shape[0] * shape[1]` と一致しない場合は [`RuntimeError::InvalidTensorData`] を返す。
     pub fn new_raw(
-        hash_key: u64,
+        hash_key: impl Into<StateHash>,
         shape: Vec<usize>,
         ort_value: Value,
         byte_size: usize,
@@ -423,7 +496,7 @@ impl CachedStateFeatures {
     /// - `shape` が 3 次元でない場合、または `shape[0] != 1` の場合は [`RuntimeError::ModelContractViolation`] を返す。
     /// - `state_mask` が非空かつ要素数が `shape[0] * shape[1]` と一致しない場合は [`RuntimeError::InvalidTensorData`] を返す。
     pub fn new_raw_with_text(
-        hash_key: u64,
+        hash_key: impl Into<StateHash>,
         shape: Vec<usize>,
         ort_value: Value,
         byte_size: usize,
@@ -443,6 +516,7 @@ impl CachedStateFeatures {
         }
 
         let state_mask = validate_and_normalize_state_mask(&shape, state_mask)?;
+        let hash_key = hash_key.into();
 
         Ok(Self {
             hash_key,
@@ -476,7 +550,7 @@ impl CachedStateFeatures {
     /// - `raw_slice` の要素数が `shape` の総要素数と一致しない場合、または要素数計算がオーバーフローした場合は [`RuntimeError::InvalidTensorData`] を返す。
     /// - `state_mask` が非空かつ要素数が `shape[0] * shape[1]` と一致しない場合は [`RuntimeError::InvalidTensorData`] を返す。
     pub fn new_compressed(
-        hash_key: u64,
+        hash_key: impl Into<StateHash>,
         shape: Vec<usize>,
         raw_slice: &[f32],
         mode: CacheCompressionMode,
@@ -492,7 +566,7 @@ impl CachedStateFeatures {
     /// - `raw_slice` の要素数が `shape` の総要素数と一致しない場合、または要素数計算がオーバーフローした場合は [`RuntimeError::InvalidTensorData`] を返す。
     /// - `state_mask` が非空かつ要素数が `shape[0] * shape[1]` と一致しない場合は [`RuntimeError::InvalidTensorData`] を返す。
     pub fn new_compressed_with_text(
-        hash_key: u64,
+        hash_key: impl Into<StateHash>,
         shape: Vec<usize>,
         raw_slice: &[f32],
         mode: CacheCompressionMode,
@@ -535,6 +609,7 @@ impl CachedStateFeatures {
         }
 
         let state_mask = validate_and_normalize_state_mask(&shape, state_mask)?;
+        let hash_key = hash_key.into();
 
         match mode {
             CacheCompressionMode::None => {
@@ -795,7 +870,7 @@ impl CachedStateFeatures {
 /// `xxHash3` による高速キー計算と、`moka` の TinyLFU/LRU 並行キャッシュにより、
 /// 複数スレッドからの同時参照をロックフリーに処理し、バイト重み付き退避を行う。
 pub struct StateCacheManager {
-    cache: Cache<u64, Arc<CachedStateFeatures>>,
+    cache: Cache<StateHash, Arc<CachedStateFeatures>>,
     compression_mode: CacheCompressionMode,
 }
 
@@ -833,21 +908,23 @@ impl StateCacheManager {
     ///
     /// # 引数
     /// - `state_text`: `State` 原文テキスト。
-    pub fn compute_key(state_text: &str) -> u64 {
-        match is_nfc_quick(state_text.chars()) {
+    pub fn compute_key(state_text: &str) -> StateHash {
+        let raw = match is_nfc_quick(state_text.chars()) {
             IsNormalized::Yes => xxh3_64(state_text.as_bytes()),
             IsNormalized::No | IsNormalized::Maybe => {
                 let normalized: String = state_text.nfc().collect();
                 xxh3_64(normalized.as_bytes())
             }
-        }
+        };
+        StateHash(raw)
     }
 
     /// 指定されたキーの特徴量を取得する。
     ///
     /// # 引数
     /// - `key`: `xxHash3` キー。
-    pub fn get(&self, key: u64) -> Option<Arc<CachedStateFeatures>> {
+    pub fn get(&self, key: impl Into<StateHash>) -> Option<Arc<CachedStateFeatures>> {
+        let key = key.into();
         self.cache.get(&key)
     }
 
@@ -856,17 +933,20 @@ impl StateCacheManager {
     /// # 引数
     /// - `key`: `xxHash3` キー。
     /// - `features`: キャッシュエントリ。
-    pub fn insert(&self, key: u64, features: Arc<CachedStateFeatures>) {
+    pub fn insert(&self, key: impl Into<StateHash>, features: Arc<CachedStateFeatures>) {
+        let key = key.into();
         self.cache.insert(key, features);
     }
 
     /// 指定されたキーが存在するかを判定する。
-    pub fn contains_key(&self, key: u64) -> bool {
+    pub fn contains_key(&self, key: impl Into<StateHash>) -> bool {
+        let key = key.into();
         self.cache.contains_key(&key)
     }
 
     /// 指定されたキーのエントリを無効化（削除）する。
-    pub fn invalidate(&self, key: u64) {
+    pub fn invalidate(&self, key: impl Into<StateHash>) {
+        let key = key.into();
         self.cache.invalidate(&key);
     }
 
@@ -1537,6 +1617,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_state_hash_formatting_and_parsing() {
+        let raw_val: u64 = 0x0123_4567_89ab_cdef;
+        let hash = StateHash::from_raw(raw_val);
+
+        assert_eq!(hash.as_u64(), raw_val);
+        assert_eq!(hash.into_inner(), raw_val);
+        assert_eq!(StateHash::from(raw_val), hash);
+        assert_eq!(u64::from(hash), raw_val);
+
+        // Display (16桁ゼロ埋め小文字16進)
+        assert_eq!(hash.to_string(), "0123456789abcdef");
+        assert_eq!(format!("{hash}"), "0123456789abcdef");
+
+        // LowerHex / UpperHex
+        assert_eq!(format!("{hash:x}"), "123456789abcdef");
+        assert_eq!(format!("{hash:016x}"), "0123456789abcdef");
+        assert_eq!(format!("{hash:X}"), "123456789ABCDEF");
+        assert_eq!(format!("{hash:016X}"), "0123456789ABCDEF");
+
+        // FromStr パース
+        let parsed: StateHash = "0123456789abcdef".parse().expect("パースに成功。");
+        assert_eq!(parsed, hash);
+
+        let parsed_with_prefix: StateHash = "0x0123456789abcdef"
+            .parse()
+            .expect("0xプレフィックス付きパースに成功。");
+        assert_eq!(parsed_with_prefix, hash);
+
+        let parsed_upper: StateHash = "0X0123456789ABCDEF"
+            .parse()
+            .expect("0Xプレフィックス付き大文字パースに成功。");
+        assert_eq!(parsed_upper, hash);
+
+        let parsed_trimmed: StateHash = "   0x0123456789abcdef  "
+            .parse()
+            .expect("トリム付きパースに成功。");
+        assert_eq!(parsed_trimmed, hash);
+
+        assert!("invalid_hex_string".parse::<StateHash>().is_err());
+    }
+
+    #[test]
     fn test_xxh3_key_computation_deterministic() {
         let text1 = "本契約において、甲は乙に対し対価を支払うものとする。";
         let text2 = "本契約において、甲は乙に対し対価を支払うものとする。";
@@ -1548,7 +1670,7 @@ mod tests {
 
         assert_eq!(key1, key2);
         assert_ne!(key1, key3);
-        assert_ne!(key1, 0);
+        assert_ne!(key1, StateHash(0));
     }
 
     #[test]
@@ -1563,7 +1685,7 @@ mod tests {
         let key_nfd = StateCacheManager::compute_key(nfd_text);
 
         assert_eq!(key_nfc, key_nfd);
-        assert_ne!(key_nfc, 0);
+        assert_ne!(key_nfc, StateHash(0));
     }
 
     #[test]

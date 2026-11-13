@@ -382,25 +382,46 @@ impl JevTokenizer {
 
     /// `State` 文字列を `StateEncoder` 入力用トークン列 (`input_ids`, `attention_mask`) としてエンコードする。
     pub fn encode_state_tensor(&self, state: &str) -> Result<(Vec<i64>, Vec<i64>)> {
-        let text_tokens = self.encode_state(state)?;
-        let mut tokens = Vec::with_capacity(
-            self.leading_special_tokens.len()
-                + self.state_prefix_tokens.len()
-                + text_tokens.len()
-                + self.trailing_special_tokens.len(),
-        );
-        tokens.extend_from_slice(&self.leading_special_tokens);
-        tokens.extend_from_slice(&self.state_prefix_tokens);
-        tokens.extend_from_slice(&text_tokens);
-        tokens.extend_from_slice(&self.trailing_special_tokens);
+        self.encode_state_tensor_with_max_len(state, self.max_sequence_length)
+    }
 
-        if tokens.len() > self.max_sequence_length {
-            tokens.truncate(self.max_sequence_length);
+    /// 系列長制約を指定して、`State` 文字列を `StateEncoder` 入力用トークン列としてエンコードする。
+    ///
+    /// # エラー
+    /// 固定部 (先頭・末尾特殊トークン + Prefix) が `max_length` 以上の場合は `PromptExceedsMaxLength` を返す。
+    pub fn encode_state_tensor_with_max_len(
+        &self,
+        state: &str,
+        max_length: usize,
+    ) -> Result<(Vec<i64>, Vec<i64>)> {
+        let text_tokens = self.encode_state(state)?;
+        let fixed_len = self.leading_special_tokens.len()
+            + self.state_prefix_tokens.len()
+            + self.trailing_special_tokens.len();
+
+        if fixed_len >= max_length {
+            return Err(RuntimeError::PromptExceedsMaxLength {
+                fixed_len,
+                max_len: max_length,
+            });
         }
 
-        let seq_len = tokens.len();
+        let allowed_text_len = max_length - fixed_len;
+        let truncated_text_tokens = if text_tokens.len() > allowed_text_len {
+            &text_tokens[..allowed_text_len]
+        } else {
+            &text_tokens[..]
+        };
+
+        let total_len = fixed_len + truncated_text_tokens.len();
+        let mut tokens = Vec::with_capacity(total_len);
+        tokens.extend_from_slice(&self.leading_special_tokens);
+        tokens.extend_from_slice(&self.state_prefix_tokens);
+        tokens.extend_from_slice(truncated_text_tokens);
+        tokens.extend_from_slice(&self.trailing_special_tokens);
+
         let input_ids: Vec<i64> = tokens.iter().map(|&t| t as i64).collect();
-        let attention_mask = vec![1i64; seq_len];
+        let attention_mask = vec![1i64; total_len];
         Ok((input_ids, attention_mask))
     }
 }
@@ -566,6 +587,58 @@ mod tests {
 
         // 固定部より小さい極端な max_len (例えば 10) を指定
         let res = tokenizer.encode_question_with_max_len("短い状態", &question, 10);
+        assert!(matches!(
+            res,
+            Err(RuntimeError::PromptExceedsMaxLength { .. })
+        ));
+    }
+
+    #[test]
+    fn test_encode_state_tensor_truncation() {
+        let Some(path) = default_tokenizer_path() else {
+            return;
+        };
+
+        let tokenizer = JevTokenizer::from_file(&path).unwrap();
+
+        let long_state =
+            "This is an extremely long transaction log with hundreds of details. ".repeat(50);
+        let max_len = 32;
+
+        let (input_ids, attention_mask) = tokenizer
+            .encode_state_tensor_with_max_len(&long_state, max_len)
+            .unwrap();
+
+        assert_eq!(input_ids.len(), max_len);
+        assert_eq!(attention_mask.len(), max_len);
+
+        // 先頭特殊トークンとプレフィックスが保持されていること。
+        let leading_len = tokenizer.leading_special_tokens().len();
+        for (i, &expected_id) in tokenizer.leading_special_tokens().iter().enumerate() {
+            assert_eq!(input_ids[i], expected_id as i64);
+        }
+        for (i, &expected_id) in tokenizer.state_prefix_tokens().iter().enumerate() {
+            assert_eq!(input_ids[leading_len + i], expected_id as i64);
+        }
+
+        // 末尾特殊トークンが切り落とされずに保持されていること。
+        let trailing = tokenizer.trailing_special_tokens();
+        assert!(!trailing.is_empty());
+        let trailing_start = max_len - trailing.len();
+        for (i, &expected_id) in trailing.iter().enumerate() {
+            assert_eq!(input_ids[trailing_start + i], expected_id as i64);
+        }
+    }
+
+    #[test]
+    fn test_encode_state_tensor_exceeds_max_length_error() {
+        let Some(path) = default_tokenizer_path() else {
+            return;
+        };
+
+        let tokenizer = JevTokenizer::from_file(&path).unwrap();
+        // 固定長未満の極端に小さい max_len を指定。
+        let res = tokenizer.encode_state_tensor_with_max_len("任意のテキスト", 2);
         assert!(matches!(
             res,
             Err(RuntimeError::PromptExceedsMaxLength { .. })

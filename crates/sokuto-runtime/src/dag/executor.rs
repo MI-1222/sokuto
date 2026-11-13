@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
 use sokuto_core::contract::calibration::CalibrationConfig;
+use sokuto_core::gating::GatingMetadata;
 use sokuto_core::schema::{Answer, AnswerPayload, Question};
 
 use crate::dag::interpolate::{NodeContextValue, interpolate_question};
@@ -156,37 +157,25 @@ impl InProcessDagExecutor {
         cancelled: Arc<AtomicBool>,
         deadline: Instant,
     ) -> Result<DagExecutionResult, DagError> {
-        let mut context: IndexMap<String, NodeContextValue> = IndexMap::new();
-        let mut steps: IndexMap<String, StepExecutionResult> = IndexMap::new();
-        let mut execution_path: Vec<String> = Vec::new();
+        let mut state = DagExecutionState::new(dag.entry_node.clone());
 
         // 外部入力である state は変数補間を行わず、Arc<str> で各非同期タスクへゼロコピー共有する
-        let state: Arc<str> = Arc::from(initial_state);
-
-        let mut curr_node_id = dag.entry_node.clone();
-        let mut step_count = 0;
-        let mut final_answer: Option<Answer> = None;
-        let mut last_inference_node_id: Option<String> = None;
-        let mut escalated = false;
-        let mut escalation_reason = None;
-        let mut escalation_node_id = None;
-        let mut escalation_prompt = None;
-        let mut escalation_gating = None;
+        let shared_state: Arc<str> = Arc::from(initial_state);
 
         loop {
             if cancelled.load(Ordering::Relaxed) || Instant::now() >= deadline {
                 return Err(DagError::Timeout(dag.timeout_ms));
             }
-            if step_count >= self.max_steps {
+            if state.step_count >= self.max_steps {
                 return Err(DagError::StepLimitExceeded(self.max_steps));
             }
-            step_count += 1;
+            state.step_count += 1;
             let node = dag
                 .nodes
-                .get(&curr_node_id)
-                .ok_or_else(|| DagError::NodeNotFound(curr_node_id.clone()))?;
+                .get(&state.curr_node_id)
+                .ok_or_else(|| DagError::NodeNotFound(state.curr_node_id.clone()))?;
 
-            execution_path.push(curr_node_id.clone());
+            state.execution_path.push(state.curr_node_id.clone());
             let step_start = Instant::now();
 
             match node {
@@ -196,61 +185,39 @@ impl InProcessDagExecutor {
                     reason,
                 } => {
                     let handle = self.spawn_inference_task(
-                        Arc::clone(&state),
+                        Arc::clone(&shared_state),
                         question,
-                        &context,
+                        &state.context,
                         Arc::clone(&cancelled),
                         deadline,
                     );
                     let answer = Self::await_inference_task(handle, "スレッド結合失敗").await?;
-
-                    // コンテキストに結果を反映
-                    let ctx_val = answer_to_context_value(&answer);
-                    context.insert(curr_node_id.clone(), ctx_val);
-                    final_answer = Some(answer.clone());
-                    last_inference_node_id = Some(curr_node_id.clone());
-
-                    // 条件評価
-                    let next_node =
-                        evaluate_compiled_conditions(conditions, Some(&answer), &context);
                     let duration_ms = step_start.elapsed().as_secs_f64() * 1000.0;
 
-                    steps.insert(
-                        curr_node_id.clone(),
-                        StepExecutionResult {
-                            node_id: curr_node_id.clone(),
-                            node_type: DagNodeType::Inference,
-                            answer: Some(answer),
-                            duration_ms,
-                            next_node: next_node.clone(),
-                            reason: reason.clone(),
-                        },
+                    let next_node = state.record_single_inference(
+                        state.curr_node_id.clone(),
+                        answer,
+                        conditions,
+                        duration_ms,
+                        reason.clone(),
                     );
 
                     match next_node {
-                        Some(nxt) => curr_node_id = nxt,
+                        Some(nxt) => state.curr_node_id = nxt,
                         None => break,
                     }
                 }
                 CompiledDagNode::Branch { conditions, reason } => {
-                    let next_node =
-                        evaluate_compiled_conditions(conditions, final_answer.as_ref(), &context);
                     let duration_ms = step_start.elapsed().as_secs_f64() * 1000.0;
-
-                    steps.insert(
-                        curr_node_id.clone(),
-                        StepExecutionResult {
-                            node_id: curr_node_id.clone(),
-                            node_type: DagNodeType::Branch,
-                            answer: None,
-                            duration_ms,
-                            next_node: next_node.clone(),
-                            reason: reason.clone(),
-                        },
+                    let next_node = state.record_branch(
+                        state.curr_node_id.clone(),
+                        conditions,
+                        duration_ms,
+                        reason.clone(),
                     );
 
                     match next_node {
-                        Some(nxt) => curr_node_id = nxt,
+                        Some(nxt) => state.curr_node_id = nxt,
                         None => break,
                     }
                 }
@@ -278,9 +245,9 @@ impl InProcessDagExecutor {
                         })?;
 
                         let handle = self.spawn_inference_task(
-                            Arc::clone(&state),
+                            Arc::clone(&shared_state),
                             raw_question,
-                            &context,
+                            &state.context,
                             Arc::clone(&cancelled),
                             deadline,
                         );
@@ -301,115 +268,34 @@ impl InProcessDagExecutor {
 
                     let duration_ms = step_start.elapsed().as_secs_f64() * 1000.0;
                     let next_node = Some(join_node.clone());
-                    record_parallel_results(
+                    state.record_parallel_step(
+                        state.curr_node_id.clone(),
                         parallel_answers,
-                        next_node.as_deref(),
+                        join_node.clone(),
                         duration_ms,
-                        &mut context,
-                        &mut steps,
-                        &mut final_answer,
-                        &mut last_inference_node_id,
-                    );
-
-                    steps.insert(
-                        curr_node_id.clone(),
-                        StepExecutionResult {
-                            node_id: curr_node_id.clone(),
-                            node_type: DagNodeType::Parallel,
-                            answer: None,
-                            duration_ms,
-                            next_node: next_node.clone(),
-                            reason: reason.clone(),
-                        },
+                        reason.clone(),
                     );
 
                     match next_node {
-                        Some(nxt) => curr_node_id = nxt,
+                        Some(nxt) => state.curr_node_id = nxt,
                         None => break,
                     }
                 }
                 CompiledDagNode::Escalate { reason } => {
                     let duration_ms = step_start.elapsed().as_secs_f64() * 1000.0;
-                    escalated = true;
-                    escalation_reason = reason.clone();
-
-                    // エスカレーションをトリガーした直前ノードの特定(Inference -> Branch -> Escalate 等の遷移でも直近の推論ノードを捕捉)
-                    let trigger_node_id = last_inference_node_id
-                        .clone()
-                        .or_else(|| execution_path.iter().rev().nth(1).cloned());
-                    escalation_node_id = trigger_node_id.clone();
-
-                    // 最後の Answer から Gating メタデータを抽出
-                    escalation_gating = final_answer.as_ref().and_then(|a| a.gating.clone());
-
-                    // System 2 向けの Guided CoT プロンプト案の導出
-                    if let Some(ref g) = escalation_gating
-                        && let Some(ref esc_ctx) = g.escalation
-                        && let Some(ref tmpl) = esc_ctx.prompt_template
-                    {
-                        escalation_prompt = Some(tmpl.clone());
-                    } else if let Some(ref trig_id) = trigger_node_id
-                        && let Some(trig_node) = dag.nodes.get(trig_id)
-                        && let Some(q) = trig_node.question()
-                        && let Some(ref ans) = final_answer
-                        && let Some(ref g) = escalation_gating
-                    {
-                        use sokuto_core::gating::CandidateProbability;
-                        let candidates: Vec<CandidateProbability> = ans
-                            .probabilities()
-                            .map(|p| {
-                                let mut list: Vec<_> = p
-                                    .iter()
-                                    .map(|(k, &v)| CandidateProbability {
-                                        candidate: k.clone(),
-                                        probability: v,
-                                    })
-                                    .collect();
-                                list.sort_by(|a, b| b.probability.total_cmp(&a.probability));
-                                list
-                            })
-                            .unwrap_or_default();
-
-                        use crate::engine::escalation::build_rich_escalation_prompt;
-                        escalation_prompt = Some(build_rich_escalation_prompt(
-                            Some(initial_state),
-                            Some(trig_id.as_str()),
-                            Some(q),
-                            g,
-                            &candidates,
-                        ));
-                    } else {
-                        escalation_prompt = reason.clone();
-                    }
-
-                    steps.insert(
-                        curr_node_id.clone(),
-                        StepExecutionResult {
-                            node_id: curr_node_id.clone(),
-                            node_type: DagNodeType::Escalate,
-                            answer: None,
-                            duration_ms,
-                            next_node: None,
-                            reason: reason.clone(),
-                        },
+                    state.record_escalation(
+                        state.curr_node_id.clone(),
+                        duration_ms,
+                        reason.clone(),
+                        dag,
+                        initial_state,
                     );
                     break;
                 }
             }
         }
 
-        Ok(DagExecutionResult {
-            dag_id: dag.dag_id.clone(),
-            execution_path,
-            steps,
-            total_duration_ms: 0.0,
-            escalated,
-            escalation_reason,
-            escalation_node_id,
-            escalation_prompt,
-            escalation_gating,
-            final_answer,
-        })
+        Ok(state.into_execution_result(dag.dag_id.clone()))
     }
 
     /// 単一質問に対する推論タスクをバックグラウンドスレッドへオフロードして生成する。
@@ -497,44 +383,246 @@ fn answer_to_context_value(answer: &Answer) -> NodeContextValue {
     }
 }
 
-/// 並行実行されたタスク群の判定結果を `context`・`steps` へ反映し、最後のタスク結果を `final_answer` と `last_inference_node_id` に設定する。
+/// DAG 実行中の内部可変状態をカプセル化する構造体。
 ///
-/// `futures_util::future::join_all` は入力タスク列 (`parallel_nodes`) の順序を保持するため、
-/// 最後のタスクの `Answer` を代表値として `final_answer` を更新し、ノード ID を `last_inference_node_id` に反映する。
-/// これにより後続の `Branch` ノードによる `field: "answer"` / `"confidence"` / `"route"` 参照や、
-/// `Escalate` 遷移時の質問定義・回答の整合性を保つ。
-fn record_parallel_results(
-    parallel_answers: Vec<(String, Answer)>,
-    join_node: Option<&str>,
-    duration_ms: f64,
-    context: &mut IndexMap<String, NodeContextValue>,
-    steps: &mut IndexMap<String, StepExecutionResult>,
-    final_answer: &mut Option<Answer>,
-    last_inference_node_id: &mut Option<String>,
-) {
-    let total = parallel_answers.len();
-    let next_node = join_node.map(str::to_string);
+/// コンテキスト値、ステップ実行結果、実行パス、推論結果 (`final_answer` / `last_inference_node_id`)、
+/// およびエスカレーション診断情報を一元管理し、状態更新漏れや引数の肥大化を防止する。
+#[derive(Debug, Default)]
+pub(crate) struct DagExecutionState {
+    pub(crate) context: IndexMap<String, NodeContextValue>,
+    pub(crate) steps: IndexMap<String, StepExecutionResult>,
+    pub(crate) execution_path: Vec<String>,
+    pub(crate) curr_node_id: String,
+    pub(crate) step_count: usize,
+    pub(crate) final_answer: Option<Answer>,
+    pub(crate) last_inference_node_id: Option<String>,
+    pub(crate) escalated: bool,
+    pub(crate) escalation_reason: Option<String>,
+    pub(crate) escalation_node_id: Option<String>,
+    pub(crate) escalation_prompt: Option<String>,
+    pub(crate) escalation_gating: Option<GatingMetadata>,
+}
 
-    for (idx, (p_id, ans)) in parallel_answers.into_iter().enumerate() {
-        let ctx_val = answer_to_context_value(&ans);
-        context.insert(p_id.clone(), ctx_val);
-
-        if idx + 1 == total {
-            *final_answer = Some(ans.clone());
-            *last_inference_node_id = Some(p_id.clone());
+impl DagExecutionState {
+    /// エントリノードを指定して初期実行状態を生成する。
+    pub(crate) fn new(entry_node: String) -> Self {
+        Self {
+            curr_node_id: entry_node,
+            ..Default::default()
         }
+    }
 
-        steps.insert(
-            p_id.clone(),
+    /// 単一推論タスクの判定結果を記録し、条件評価に基づいて遷移先ノードを決定する。
+    ///
+    /// コンテキストへの結果値格納、`final_answer` および `last_inference_node_id` の更新、
+    /// 条件リストの評価、ステップ実行結果の記録をアトミックに行う。
+    pub(crate) fn record_single_inference(
+        &mut self,
+        node_id: String,
+        answer: Answer,
+        conditions: &[CompiledCondition],
+        duration_ms: f64,
+        reason: Option<String>,
+    ) -> Option<String> {
+        let ctx_val = answer_to_context_value(&answer);
+        self.context.insert(node_id.clone(), ctx_val);
+        self.final_answer = Some(answer.clone());
+        self.last_inference_node_id = Some(node_id.clone());
+
+        let next_node = evaluate_compiled_conditions(conditions, Some(&answer), &self.context);
+
+        self.steps.insert(
+            node_id.clone(),
             StepExecutionResult {
-                node_id: p_id,
+                node_id,
                 node_type: DagNodeType::Inference,
-                answer: Some(ans),
+                answer: Some(answer),
                 duration_ms,
                 next_node: next_node.clone(),
-                reason: None,
+                reason,
             },
         );
+
+        next_node
+    }
+
+    /// 並行実行されたタスク群の判定結果を `context`・`steps` へ反映し、最後のタスク結果を `final_answer` と `last_inference_node_id` に設定する。
+    ///
+    /// `futures_util::future::join_all` は入力タスク列 (`parallel_nodes`) の順序を保持するため、
+    /// 最後のタスクの `Answer` を代表値として `final_answer` を更新し、ノード ID を `last_inference_node_id` に反映する。
+    /// これにより後続の `Branch` ノードによる `field: "answer"` / `"confidence"` / `"route"` 参照や、
+    /// `Escalate` 遷移時の質問定義・回答の整合性を保つ。
+    pub(crate) fn record_parallel_results(
+        &mut self,
+        parallel_answers: Vec<(String, Answer)>,
+        join_node: Option<&str>,
+        duration_ms: f64,
+    ) {
+        let total = parallel_answers.len();
+        let next_node = join_node.map(str::to_string);
+
+        for (idx, (p_id, ans)) in parallel_answers.into_iter().enumerate() {
+            let ctx_val = answer_to_context_value(&ans);
+            self.context.insert(p_id.clone(), ctx_val);
+
+            if idx + 1 == total {
+                self.final_answer = Some(ans.clone());
+                self.last_inference_node_id = Some(p_id.clone());
+            }
+
+            self.steps.insert(
+                p_id.clone(),
+                StepExecutionResult {
+                    node_id: p_id,
+                    node_type: DagNodeType::Inference,
+                    answer: Some(ans),
+                    duration_ms,
+                    next_node: next_node.clone(),
+                    reason: None,
+                },
+            );
+        }
+    }
+
+    /// 並行実行タスク群の結果と、親となる Parallel ノードの実行結果を一括して記録する。
+    pub(crate) fn record_parallel_step(
+        &mut self,
+        node_id: String,
+        parallel_answers: Vec<(String, Answer)>,
+        join_node: String,
+        duration_ms: f64,
+        reason: Option<String>,
+    ) {
+        self.record_parallel_results(parallel_answers, Some(join_node.as_str()), duration_ms);
+
+        self.steps.insert(
+            node_id.clone(),
+            StepExecutionResult {
+                node_id,
+                node_type: DagNodeType::Parallel,
+                answer: None,
+                duration_ms,
+                next_node: Some(join_node),
+                reason,
+            },
+        );
+    }
+
+    /// Branch ノードの条件評価を実行し、ステップ実行結果を記録する。
+    pub(crate) fn record_branch(
+        &mut self,
+        node_id: String,
+        conditions: &[CompiledCondition],
+        duration_ms: f64,
+        reason: Option<String>,
+    ) -> Option<String> {
+        let next_node =
+            evaluate_compiled_conditions(conditions, self.final_answer.as_ref(), &self.context);
+
+        self.steps.insert(
+            node_id.clone(),
+            StepExecutionResult {
+                node_id,
+                node_type: DagNodeType::Branch,
+                answer: None,
+                duration_ms,
+                next_node: next_node.clone(),
+                reason,
+            },
+        );
+
+        next_node
+    }
+
+    /// Escalate ノード到達時のエスカレーション診断情報を集約し、ステップ実行結果を記録する。
+    pub(crate) fn record_escalation(
+        &mut self,
+        node_id: String,
+        duration_ms: f64,
+        reason: Option<String>,
+        dag: &CompiledDag,
+        initial_state: &str,
+    ) {
+        self.escalated = true;
+        self.escalation_reason = reason.clone();
+
+        // エスカレーションをトリガーした直前ノードの特定 (Inference -> Branch -> Escalate 等の遷移でも直近の推論ノードを捕捉)
+        let trigger_node_id = self
+            .last_inference_node_id
+            .clone()
+            .or_else(|| self.execution_path.iter().rev().nth(1).cloned());
+        self.escalation_node_id = trigger_node_id.clone();
+
+        // 最後の Answer から Gating メタデータを抽出
+        self.escalation_gating = self.final_answer.as_ref().and_then(|a| a.gating.clone());
+
+        // System 2 向けの Guided CoT プロンプト案の導出
+        if let Some(ref g) = self.escalation_gating
+            && let Some(ref esc_ctx) = g.escalation
+            && let Some(ref tmpl) = esc_ctx.prompt_template
+        {
+            self.escalation_prompt = Some(tmpl.clone());
+        } else if let Some(ref trig_id) = trigger_node_id
+            && let Some(trig_node) = dag.nodes.get(trig_id)
+            && let Some(q) = trig_node.question()
+            && let Some(ref ans) = self.final_answer
+            && let Some(ref g) = self.escalation_gating
+        {
+            use sokuto_core::gating::CandidateProbability;
+            let candidates: Vec<CandidateProbability> = ans
+                .probabilities()
+                .map(|p| {
+                    let mut list: Vec<_> = p
+                        .iter()
+                        .map(|(k, &v)| CandidateProbability {
+                            candidate: k.clone(),
+                            probability: v,
+                        })
+                        .collect();
+                    list.sort_by(|a, b| b.probability.total_cmp(&a.probability));
+                    list
+                })
+                .unwrap_or_default();
+
+            use crate::engine::escalation::build_rich_escalation_prompt;
+            self.escalation_prompt = Some(build_rich_escalation_prompt(
+                Some(initial_state),
+                Some(trig_id.as_str()),
+                Some(q),
+                g,
+                &candidates,
+            ));
+        } else {
+            self.escalation_prompt = reason.clone();
+        }
+
+        self.steps.insert(
+            node_id.clone(),
+            StepExecutionResult {
+                node_id,
+                node_type: DagNodeType::Escalate,
+                answer: None,
+                duration_ms,
+                next_node: None,
+                reason,
+            },
+        );
+    }
+
+    /// 実行状態を `DagExecutionResult` に変換する。
+    pub(crate) fn into_execution_result(self, dag_id: String) -> DagExecutionResult {
+        DagExecutionResult {
+            dag_id,
+            execution_path: self.execution_path,
+            steps: self.steps,
+            total_duration_ms: 0.0,
+            escalated: self.escalated,
+            escalation_reason: self.escalation_reason,
+            escalation_node_id: self.escalation_node_id,
+            escalation_prompt: self.escalation_prompt,
+            escalation_gating: self.escalation_gating,
+            final_answer: self.final_answer,
+        }
     }
 }
 
@@ -1146,58 +1234,54 @@ mod tests {
 
     #[test]
     fn test_record_parallel_results_updates_final_answer_and_context() {
-        let mut context = IndexMap::new();
-        let mut steps = IndexMap::new();
-
         // Parallel 通過前の古い final_answer と last_inference_node_id が残っているケースも模擬する
         let stale_answer = Answer::noul(0.05);
-        let mut final_answer = Some(stale_answer);
-        let mut last_inference_node_id = Some("stale_node".to_string());
+        let mut state = DagExecutionState {
+            final_answer: Some(stale_answer),
+            last_inference_node_id: Some("stale_node".to_string()),
+            ..Default::default()
+        };
 
         let task_a_ans = Answer::noul(0.92);
         let task_b_ans = Answer::choice("priority_high", IndexMap::new(), 0.88);
 
-        record_parallel_results(
+        state.record_parallel_results(
             vec![
                 ("fraud_check".to_string(), task_a_ans),
                 ("priority_eval".to_string(), task_b_ans.clone()),
             ],
             Some("branch_after_parallel"),
             1.25,
-            &mut context,
-            &mut steps,
-            &mut final_answer,
-            &mut last_inference_node_id,
         );
 
         // 1. final_answer と last_inference_node_id が最後の並行タスク (priority_eval) の結果で上書きされていること
         assert_eq!(
-            final_answer.as_ref().and_then(|a| a.as_choice()),
+            state.final_answer.as_ref().and_then(|a| a.as_choice()),
             Some("priority_high")
         );
-        assert_eq!(final_answer.as_ref(), Some(&task_b_ans));
+        assert_eq!(state.final_answer.as_ref(), Some(&task_b_ans));
         assert_eq!(
-            last_inference_node_id.as_deref(),
+            state.last_inference_node_id.as_deref(),
             Some("priority_eval"),
             "last_inference_node_id が最後の並行タスク ID で更新されている必要があります。"
         );
 
         // 2. 両タスクの結果が context と steps に格納されていること
         assert_eq!(
-            context.get("fraud_check").map(|c| c.value.as_str()),
+            state.context.get("fraud_check").map(|c| c.value.as_str()),
             Some("true")
         );
         assert_eq!(
-            context.get("priority_eval").map(|c| c.value.as_str()),
+            state.context.get("priority_eval").map(|c| c.value.as_str()),
             Some("priority_high")
         );
-        assert_eq!(steps.len(), 2);
+        assert_eq!(state.steps.len(), 2);
         assert_eq!(
-            steps["fraud_check"].next_node.as_deref(),
+            state.steps["fraud_check"].next_node.as_deref(),
             Some("branch_after_parallel")
         );
         assert_eq!(
-            steps["priority_eval"].next_node.as_deref(),
+            state.steps["priority_eval"].next_node.as_deref(),
             Some("branch_after_parallel")
         );
 
@@ -1217,7 +1301,11 @@ mod tests {
             },
         ];
         assert_eq!(
-            evaluate_conditions(&branch_conditions, final_answer.as_ref(), &context),
+            evaluate_conditions(
+                &branch_conditions,
+                state.final_answer.as_ref(),
+                &state.context
+            ),
             Some("handle_priority_high".to_string())
         );
 
@@ -1228,25 +1316,30 @@ mod tests {
             target_node: "escalate_fraud".to_string(),
         }];
         assert_eq!(
-            evaluate_conditions(&context_branch_conditions, final_answer.as_ref(), &context),
+            evaluate_conditions(
+                &context_branch_conditions,
+                state.final_answer.as_ref(),
+                &state.context
+            ),
             Some("escalate_fraud".to_string())
         );
 
         // 4. 空結果時は既存の final_answer と last_inference_node_id を維持すること
-        let mut unchanged = Some(Answer::noul(0.80));
-        let mut unchanged_id = Some("preserved_node".to_string());
-        record_parallel_results(
-            Vec::new(),
-            Some("join"),
-            0.1,
-            &mut context,
-            &mut steps,
-            &mut unchanged,
-            &mut unchanged_id,
-        );
-        assert_eq!(unchanged.as_ref().and_then(|a| a.as_noul()), Some(0.80));
+        let mut unchanged_state = DagExecutionState {
+            final_answer: Some(Answer::noul(0.80)),
+            last_inference_node_id: Some("preserved_node".to_string()),
+            ..Default::default()
+        };
+        unchanged_state.record_parallel_results(Vec::new(), Some("join"), 0.1);
         assert_eq!(
-            unchanged_id.as_deref(),
+            unchanged_state
+                .final_answer
+                .as_ref()
+                .and_then(|a| a.as_noul()),
+            Some(0.80)
+        );
+        assert_eq!(
+            unchanged_state.last_inference_node_id.as_deref(),
             Some("preserved_node"),
             "空結果時は既存の last_inference_node_id が維持されている必要があります。"
         );

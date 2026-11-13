@@ -1,7 +1,11 @@
-//! # ロックフリーセッション借用プールモジュール
+//! # ロックフリー非同期リソース借用プールモジュール
 //!
-//! Tokio 非同期タスクとブロッキング推論スレッド間のセッション借用を
+//! Tokio 非同期タスクとブロッキング推論スレッド間の排他借用を
 //! `crossbeam_queue::ArrayQueue` と `tokio::sync::Semaphore` でロックフリーに制御する。
+//!
+//! 同期推論エンジン(`InferenceEngine` / `DualSessionEngine`)内部の同期ラウンドロビン方式
+//! (`Vec<Mutex<Session>>`)とは異なり、非同期スケジューラ上で待機・タイムアウト・
+//! スレッド間転送を行うタスク向けに特化した汎用リソース管理プリミティブを提供する。
 
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
@@ -140,11 +144,6 @@ impl<T: Send + 'static> Drop for PooledResource<T> {
         }
     }
 }
-
-/// ONNX Runtime セッション専用の低遅延借用プール型エイリアス。
-pub type LowLatencySessionPool = LowLatencyResourcePool<ort::session::Session>;
-/// 借用済み ONNX Runtime セッション型エイリアス。
-pub type PooledSession = PooledResource<ort::session::Session>;
 
 #[cfg(test)]
 mod tests {

@@ -78,7 +78,6 @@ pub async fn dag_handler(
                 | DagError::StepLimitExceeded(_)
                 | DagError::NodeNotFound(_) => 400,
                 DagError::Timeout(_) => 504,
-                DagError::Pool(_) => 503,
                 _ => 500,
             };
             record_http_request("/v1/systemone/dag", status_code);

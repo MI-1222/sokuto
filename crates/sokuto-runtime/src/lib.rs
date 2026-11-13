@@ -18,8 +18,8 @@ pub mod tokenizer;
 pub use dag::{
     ComparisonOp, CompiledCondition, CompiledDag, CompiledDagNode, DagDefinition, DagError,
     DagExecutionResult, DagNode, DagNodeType, EqualityOp, InProcessDagExecutor,
-    LowLatencyResourcePool, LowLatencySessionPool, NodeCondition, NodeConditionOp, PooledResource,
-    PooledSession, StepExecutionResult, compile_dag, validate_dag,
+    LowLatencyResourcePool, NodeCondition, NodeConditionOp, PoolError, PooledResource,
+    StepExecutionResult, compile_dag, validate_dag,
 };
 
 pub use engine::{

@@ -14,9 +14,7 @@ pub use executor::{
     DagError, InProcessDagExecutor, evaluate_compiled_conditions, evaluate_conditions,
 };
 pub use interpolate::{NodeContextValue, interpolate_prompt, interpolate_question};
-pub use pool::{
-    LowLatencyResourcePool, LowLatencySessionPool, PoolError, PooledResource, PooledSession,
-};
+pub use pool::{LowLatencyResourcePool, PoolError, PooledResource};
 pub use schema::{
     ComparisonOp, CompiledAnswerPredicate, CompiledCondition, CompiledDag, CompiledDagNode,
     ConditionField, ConditionPredicate, ContextProp, DagDefinition, DagExecutionResult, DagNode,

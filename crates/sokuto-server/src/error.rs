@@ -145,12 +145,6 @@ impl IntoResponse for ServerError {
                         "dag_validation_error",
                         v.to_string(),
                     ),
-                    DagError::Pool(p) => (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "service_unavailable",
-                        "pool_error",
-                        p.to_string(),
-                    ),
                     DagError::Timeout(ms) => (
                         StatusCode::GATEWAY_TIMEOUT,
                         "gateway_timeout",

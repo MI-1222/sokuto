@@ -981,8 +981,8 @@ impl StateCacheManager {
 /// `state_session` で `State` をエンコードし、得られた隠れ状態をキャッシュした上で、
 /// `query_session` の入力スロットへ `IoBinding` でゼロコピーバインドして超低遅延推論を実行する。
 ///
-/// 内部にセッションプール（`query_sessions`、`state_sessions`）を保持し、
-/// 複数スレッドからの並行評価要求に対してロック競合を回避し、並列推論を実行する。
+/// 内部に同期セッションプール（`query_sessions`、`state_sessions`）を保持し、
+/// 複数スレッドからの並行評価要求に対して非ブロッキングラウンドロビン走査でロック競合を回避し、並列推論を実行する。
 pub struct DualSessionEngine {
     state_sessions: Vec<Mutex<Session>>,
     query_sessions: Vec<Mutex<Session>>,

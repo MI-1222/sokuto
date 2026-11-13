@@ -11,7 +11,6 @@ use sokuto_core::contract::calibration::CalibrationConfig;
 use sokuto_core::schema::{Answer, AnswerPayload, Question};
 
 use crate::dag::interpolate::{NodeContextValue, interpolate_question};
-use crate::dag::pool::PoolError;
 use crate::dag::schema::{
     CompiledCondition, CompiledDag, CompiledDagNode, DagDefinition, DagExecutionResult,
     DagNodeType, NodeCondition, StepExecutionResult,
@@ -27,10 +26,6 @@ pub enum DagError {
     /// 静的検証エラー。
     #[error("DAG 検証エラー: {0}。")]
     Validation(#[from] DagValidationError),
-
-    /// セッションプール借用エラー。
-    #[error("セッションプールエラー: {0}。")]
-    Pool(#[from] PoolError),
 
     /// DAG 全体実行のタイムアウト。
     #[error("DAG 実行がタイムアウトしました ({0}ms)。")]
